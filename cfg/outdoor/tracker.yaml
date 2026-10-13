@@ -15,6 +15,10 @@ tracker_node:
     track_match_iou_weight: 0.15       # 2D IoU (axis-aligned footprint) vs the predicted position
     track_match_prev_pos_weight: 0.25  # distance to the track's own PREVIOUS raw observation
     track_match_prev_iou_weight: 0.10  # 2D IoU vs the previous raw observation
+    track_match_height_weight: 0.5     # score penalty per metre between the candidate box TOP and the track's smoothed top (footprint alone cannot tell a person from a table)
+    track_max_top_diff: 1.0            # [m] hard reject beyond this top-height difference
+    track_height_min_samples: 5        # matched ticks before the track's top is trusted
+    track_height_ema_alpha: 0.3        # smoothing of the track's top height
     track_min_match_score: -2.5        # candidates scoring below this are dropped before the global assignment
 
     # ID-swap guard (v1's own match_yolo_class_consistency_weight/yolo_track_assoc_bonus): a candidate pairing a

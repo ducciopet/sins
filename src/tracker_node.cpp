@@ -428,6 +428,9 @@ struct Track {
     int pending_strong_ticks = 0;  // consecutive pending votes from depth-leaf-direct evidence — see voteClass()
     // Class handover (see handOverClass()): this track was born from a detection that a nearby CLASSIFIED track
     // passed over for another one — if that track turns out to have swapped identity, its class comes here.
+    // Smoothed TOP height (box max z, global frame) of the matched detections — see the association's height term.
+    double top_z = 0.0;
+    int top_samples = 0;
     int heir_of = -1;
     std::string heir_class;
     double heir_stamp = 0.0;
@@ -666,6 +669,13 @@ public:
         // classified track gives the class up or dies.
         class_handover_dist_ = declare_parameter<double>("track_class_handover_dist", 0.5);
         class_handover_window_ = declare_parameter<double>("track_class_handover_window", 3.0);
+        // Height term of the association (see the candidate loop): penalty per metre of difference between the
+        // candidate's box top and the track's smoothed top, hard reject beyond track_max_top_diff, active once the
+        // track has track_height_min_samples matched ticks; the smoothing is an EMA with this alpha.
+        w_height_ = declare_parameter<double>("track_match_height_weight", 0.5);
+        max_top_diff_ = declare_parameter<double>("track_max_top_diff", 1.0);
+        height_min_samples_ = declare_parameter<int>("track_height_min_samples", 5);
+        height_ema_alpha_ = declare_parameter<double>("track_height_ema_alpha", 0.3);
         // Output box completion for "person" tracks (see completePersonBox()).
         person_box_completion_ = declare_parameter<bool>("track_person_box_completion", true);
         floor_frame_ = declare_parameter<std::string>("floor_frame", "base_footprint");
@@ -1532,6 +1542,17 @@ private:
                 if (reqSpeed >= gate_speed) { noteReject(ti, di, "speed"); continue; }
                 const double sizeDiff = relSizeDiff(tr.size, d.bbox.size, min_size_diff_floor_);
                 if (sizeDiff >= gate_size) { noteReject(ti, di, "size"); continue; }
+                // HEIGHT: compare the candidate's TOP (box max z) with the track's smoothed top. Footprint size
+                // alone can't tell a person from a table/cart of similar footprint, which is how a track slid onto
+                // nearby clutter when its object turned or lost its camera points. The TOP, not the height: the
+                // bottom is cut by floor removal and by the LiDAR cone up close (a person's box starts ~0.7 m
+                // above the floor at 1 m), while the top still separates a person (>= ~1.2 m even up close) from
+                // furniture. Soft score term, plus a hard reject only for a gross mismatch, and only once the
+                // track has a settled top (track_height_min_samples matched ticks).
+                const double det_top = c.z + 0.5 * d.bbox.size.z;
+                const bool height_known = tr.top_samples >= height_min_samples_;
+                const double topDiff = height_known ? std::abs(det_top - tr.top_z) : 0.0;
+                if (topDiff > max_top_diff_) { noteReject(ti, di, "height"); continue; }
                 // Classified-track baseline size gate (no v1 equivalent): the check above compares the
                 // candidate against tr.size, the LATEST matched size — which can drift gradually tick-by-tick,
                 // never individually exceeding gate_size, while compounding into a large cumulative change.
@@ -1625,7 +1646,7 @@ private:
 
                 double score = -w_pos_ * (predDist / gate_dist) - w_size_ * sizeDiff + w_iou_ * predIou -
                                w_prev_pos_ * (prevDist / gate_dist) + w_prev_iou_ * prevIou + class_score -
-                               match_veldir_weight_ * velErr;
+                               match_veldir_weight_ * velErr - w_height_ * topDiff;
                 // Generic stability bonus for any already-confirmed track (v1: confirmedTrackAssocBonus_) —
                 // independent of class/FOV, on top of (not instead of) the outside-FOV-specific bonus below.
                 if (tr.confirmed) score += confirmed_track_bonus_;
@@ -1636,9 +1657,9 @@ private:
                 if (lidar_only_outside_fov) score += tr.confirmed ? outside_fov_confirmed_bonus_ : outside_fov_tentative_bonus_;
                 if (debug_lifecycle_ && isDynamicClass(tr.best_class))
                     RCLCPP_INFO(get_logger(), "[lifecycle] cand #%d<-det(%.2f,%.2f) size %.2fx%.2f cls='%s' score=%.3f | "
-                                "pred=%.2f prev=%.2f size=%.2f iou=%.2f prevIou=%.2f class=%.3f velErr=%.2f conf=%d",
+                                "pred=%.2f prev=%.2f size=%.2f iou=%.2f prevIou=%.2f class=%.3f velErr=%.2f topDiff=%.2f conf=%d",
                                 tr.id, c.x, c.y, d.bbox.size.x, d.bbox.size.y, det_class.c_str(), score, predDist, prevDist,
-                                sizeDiff, predIou, prevIou, class_score, velErr, tr.confirmed);
+                                sizeDiff, predIou, prevIou, class_score, velErr, topDiff, tr.confirmed);
                 if (score < min_match_score_) { noteReject(ti, di, "score"); continue; }
                 candidates.push_back({di, ti, score});
             }
@@ -1813,6 +1834,11 @@ private:
             }
             tr.kf.update(Eigen::Vector3d(d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.center.position.z), r_pos_);
             tr.size = d.bbox.size;
+            {
+                const double top = d.bbox.center.position.z + 0.5 * d.bbox.size.z;
+                tr.top_z = tr.top_samples == 0 ? top : (1.0 - height_ema_alpha_) * tr.top_z + height_ema_alpha_ * top;
+                ++tr.top_samples;
+            }
             tr.orientation = d.bbox.center.orientation;
             // Captured BEFORE the overwrite below, for the first-classification diagnostic right after voteClass().
             const geometry_msgs::msg::Point prev_obs = tr.last_obs;
@@ -2007,6 +2033,11 @@ private:
             }
             tr.kf.init(Eigen::Vector3d(d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.center.position.z), p_init_);
             tr.size = d.bbox.size;
+            {
+                const double top = d.bbox.center.position.z + 0.5 * d.bbox.size.z;
+                tr.top_z = tr.top_samples == 0 ? top : (1.0 - height_ema_alpha_) * tr.top_z + height_ema_alpha_ * top;
+                ++tr.top_samples;
+            }
             tr.orientation = d.bbox.center.orientation;
             tr.last_obs = d.bbox.center.position;
             tr.last_obs_stamp = stamp;
@@ -2288,6 +2319,8 @@ private:
     double decay_fov_border_frac_{0.10};
     int max_non_yolo_fov_border_frames_{15};
     double class_handover_dist_{0.5}, class_handover_window_{3.0};
+    double w_height_{0.5}, max_top_diff_{1.0}, height_ema_alpha_{0.3};
+    int height_min_samples_{5};
     bool person_box_completion_{true};
     std::string floor_frame_{"base_footprint"};
     double person_min_height_{1.7}, person_ray_offset_{0.07};
