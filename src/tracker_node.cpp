@@ -540,9 +540,9 @@ public:
         // NOT ported: it needs raw per-object points over time, which this node doesn't receive (only already-
         // fused boxes) — plumbing that through would be a real architecture change, not a classification tweak.
         dynamic_confirm_ticks_ = declare_parameter<int>("track_dynamic_confirm_ticks", 3);
-        // Same debounce for a track with NO semantic evidence of a dynamic class (see publish()): unrecognized
-        // "motion" must persist longer (8 ticks = 0.8 s at 10 Hz) before it is believed. Set equal to
-        // track_dynamic_confirm_ticks to disable.
+        // Same debounce for a track with NO semantic evidence of a dynamic class that is inside a camera's FOV
+        // (see publish()): unrecognized "motion" there must persist longer (8 ticks = 0.8 s at 10 Hz) before it
+        // is believed. Outside every FOV track_dynamic_confirm_ticks applies. Set equal to it to disable.
         dynamic_confirm_ticks_unclassified_ = declare_parameter<int>("track_dynamic_confirm_ticks_unclassified", 8);
 
         // Historical continuity / "sticky dynamic" (v1: forceDynaFrames_/forceDynaCheckRange_, PATH 2) — once a
@@ -1990,11 +1990,14 @@ private:
             if (!matched_ids.count(id)) continue;       // predicted-only this tick (missed) — never published either way, matching v1
             const Eigen::Vector3d v = tr.kf.vel();
             const double speed = planarSpeed(v);        // vz excluded — see planarSpeed's own comment
-            // A track with no semantic evidence of a dynamic class must keep up its motion evidence for longer
-            // before it is labelled dynamic: short "moving" bursts on unrecognized objects (a fragment next to a
-            // person, background revealed behind one, a static object's box jittering) are by far the most
-            // common false dynamic. A real unrecognized mover (a cart) still gets the label, just later.
-            const int confirm_ticks = isDynamicClass(tr.best_class) ? dynamic_confirm_ticks_ : dynamic_confirm_ticks_unclassified_;
+            // A track with no semantic evidence of a dynamic class, INSIDE a camera's FOV, must keep up its motion
+            // evidence for longer before it is labelled dynamic: there the camera would already have recognized
+            // a real person, so short "moving" bursts on unrecognized objects (a fragment next to a person,
+            // background revealed behind one, a static object's box jittering) are by far the most common false
+            // dynamic. Outside every FOV nothing can classify anything, so the longer wait would only delay real
+            // movers (e.g. a person walking behind the robot): the plain debounce applies there.
+            const bool unclassified_in_fov = !isDynamicClass(tr.best_class) && insideAnyCameraFov(tr.kf.pos());
+            const int confirm_ticks = unclassified_in_fov ? dynamic_confirm_ticks_unclassified_ : dynamic_confirm_ticks_;
             const bool debounced_dynamic = tr.dynamic_ticks >= confirm_ticks;
             // Sticky-dynamic shortcut (v1 PATH 2, see the constructor's own comment): once enough of the
             // track's recent history was dynamic, don't require the FULL fresh debounce streak again after one
