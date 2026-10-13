@@ -380,6 +380,8 @@ public:
         // onWallMarkers(), see the file header) is dropped from the
         // published (LiDAR and depth) clouds.
         wall_removal_margin_ = this->declare_parameter("wall_removal_margin", 0.10);
+        // [m] how far past a wall's own in-plane extent (its tracked box) points are still stripped — see isNearAnyWall()
+        wall_removal_extent_margin_ = this->declare_parameter("wall_removal_extent_margin", 0.20);
 
         // Bootstrap floor_planes_global_ with one flat plane at
         // ground_height_ — real, possibly-tilted, per-camera fits arrive
@@ -655,6 +657,7 @@ private:
     double depth_trigger_max_wait_sec_{0.15};
     double depth_processed_voxel_occupied_thresh_{5.0};
     double wall_removal_margin_{0.10};
+    double wall_removal_extent_margin_{0.20};
 
     // A plane n·p + d = 0. Always global frame here (both wall_planes_global_
     // and floor_planes_global_ below) — this file never fits one itself
@@ -685,7 +688,15 @@ private:
     // explains. The crop (floorHeightAboveGround(), below) treats the
     // union of the space below every one of these planes as "the ground" —
     // per explicit request, not a single shared/merged plane.
-    std::vector<PlaneModel> wall_planes_global_;
+    // A tracked wall: its plane PLUS its extent (the wall_bbox CUBE: local x = normal/thickness, y/z = in-plane).
+    // Removal is bounded to the wall's own box — see isNearAnyWall().
+    struct WallModel {
+        PlaneModel plane;
+        Eigen::Vector3d center{Eigen::Vector3d::Zero()};
+        Eigen::Matrix3d R{Eigen::Matrix3d::Identity()};
+        Eigen::Vector3d half_size{Eigen::Vector3d::Zero()};
+    };
+    std::vector<WallModel> wall_planes_global_;
     std::vector<PlaneModel> floor_planes_global_;
 
     // ---- Cached static transform (base_frame -> lidar_frame), see the
@@ -943,9 +954,17 @@ private:
     // below — see the file header for the full architecture.
     // =====================================================================
 
+    // Within wall_removal_margin_ of a wall's plane AND within its in-plane extent (+ wall_removal_extent_margin_).
+    // The plane alone is unbounded: every point within the margin of a wall's infinite EXTENSION was dropped too —
+    // observed on a lab bag: a person standing still 5 m from a 3.6 m wall, on the line of its extension, lost
+    // ~60% of their LiDAR points the moment that wall was registered, and with them their detection.
     bool isNearAnyWall(const Eigen::Vector3d& p_global) const {
-        for (const auto& plane : wall_planes_global_) {
-            if (plane.distance(p_global) < wall_removal_margin_) return true;
+        for (const auto& w : wall_planes_global_) {
+            if (w.plane.distance(p_global) >= wall_removal_margin_) continue;
+            const Eigen::Vector3d local = w.R.transpose() * (p_global - w.center);
+            if (std::abs(local.y()) <= w.half_size.y() + wall_removal_extent_margin_ &&
+                std::abs(local.z()) <= w.half_size.z() + wall_removal_extent_margin_)
+                return true;
         }
         return false;
     }
@@ -980,7 +999,7 @@ private:
     // normal — see that file's own publishMarkers() — position is any
     // point on the plane, so d = -normal·position).
     void onWallMarkers(const visualization_msgs::msg::MarkerArray::ConstSharedPtr& msg) {
-        std::vector<PlaneModel> new_walls;
+        std::vector<WallModel> new_walls;
         new_walls.reserve(msg->markers.size());
         std::vector<PlaneModel> new_floors;
 
@@ -992,10 +1011,13 @@ private:
             const Eigen::Vector3d center(m.pose.position.x, m.pose.position.y, m.pose.position.z);
 
             if (m.ns == "wall_bbox") {
-                PlaneModel plane;
-                plane.normal = R.col(0);  // rotation.col(0) = normal, by convention (see static_structures_node's WallBBox)
-                plane.d = -plane.normal.dot(center);
-                new_walls.push_back(plane);
+                WallModel wall;
+                wall.plane.normal = R.col(0);  // rotation.col(0) = normal, by convention (see static_structures_node's WallBBox)
+                wall.plane.d = -wall.plane.normal.dot(center);
+                wall.center = center;
+                wall.R = R;
+                wall.half_size = 0.5 * Eigen::Vector3d(m.scale.x, m.scale.y, m.scale.z);
+                new_walls.push_back(wall);
             } else if (m.ns == "floor") {
                 // One marker per camera now (id = that camera's index in
                 // static_structures_node's own cameras_) — collect all of them,

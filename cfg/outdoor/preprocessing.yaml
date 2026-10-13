@@ -145,3 +145,4 @@ preprocessing_node:
     downsample_threshold: 30000        # points — leaf size only grows (by 10%, re-filtering) while still above this
 
     wall_removal_margin: 0.15       # [m] points within this distance of a static_structures_node-reported wall/floor plane are dropped
+    wall_removal_extent_margin: 0.20 # [m] ...and only within the wall's own tracked extent plus this (the plane alone is unbounded: points on a wall's far extension were stripped too)
