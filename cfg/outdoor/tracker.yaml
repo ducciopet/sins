@@ -105,6 +105,7 @@ tracker_node:
     # horizontal-only (vz excluded — see planarSpeed's own comment, z is dominated by sensor shadow-cone noise).
     track_dynamic_speed_thresh: 0.25     # [m/s] the DYNAMIC label bar — lowered from v1's own 0.35 so a slower-moving object still earns the label (v1: dynamic_velocity_threshold)
     track_dynamic_confirm_ticks: 3       # consecutive ticks >= the bar above before the label actually flips to "dynamic" (debounce against single-tick noise; v1 PATH 3c anti-flicker check)
+    track_dynamic_confirm_ticks_unclassified: 8  # same, for a track with no semantic evidence of a dynamic class (harder to call dynamic)
     track_stationary_speed_thresh: 0.07  # [m/s] the much lower "not moving at all" bar — below this AND unclassified, a track is suppressed/aged toward death — lowered from v1's own 0.10, same ratio to the bar above (v1: stationarySpeedThresh_)
 
     # Classification robustness (v1's classificationCB PATHs 1-3, see tracker_node.cpp's own header) — three
@@ -174,6 +175,7 @@ tracker_node:
     track_first_class_established_hits: 10            # matched ticks before a still-unclassified track counts as "established"
     track_first_class_established_confirm_ticks: 2    # debounce window (ticks) for an established track — same as the plain one above now, but still with its own NET displacement requirement on top (track_first_class_min_jump). Lowered from 5, then 3: the actual root cause this mechanism was compensating for (preprocessing_node's depth-leaf extraction occasionally bleeding into a nearby static object, see its own yolo_leaf_valley_fraction/yolo_leaf_depth_tolerance comments) is fixed upstream, so this secondary safety net no longer needs to be as conservative — the displacement check, not the tick count, is what actually guards against jitter-vs-real-motion now
     track_first_class_min_jump: 0.08                  # [m] NET raw-observation displacement required across that whole window — reuses track_min_natural_motion_dist's own bar
+    track_first_class_static_confirm_ticks: 10        # ...waived when depth-corroborated (depth-leaf-direct) evidence repeats on this many consecutive votes: a person already standing there when first seen becomes potentially_dynamic without having to walk
 
     # Kalman filter (state per axis x,y,z: position, velocity, acceleration; only position observed) — v1's own
     # REAL defaults (found in dynamicDetector.cpp's parameter loading, not its sample yaml, which never overrides
@@ -200,7 +202,9 @@ tracker_node:
     # (1) Inside any camera's FOV: a classified track with NO fresh YOLO evidence for this many CONSECUTIVE
     # matched ticks has its class cleared outright (vote history too) — it cannot keep "being semantic" on old
     # evidence alone while plainly visible and YOLO keeps not confirming it.
-    track_max_non_yolo_in_fov_frames: 9   # raised from v1's own 5 to keep the class alive through a brief in-FOV occlusion — losing it mid-occlusion also loses the classified-track fast paths (immediate confirmation, ID-swap bonus, static-death exemption, PATH1 motion debounce) right when they'd help most re-acquiring the object — v1: max_non_yolo_in_fov_frames
+    track_max_non_yolo_in_fov_frames: 3   # in camera FOV, clear the class after this many consecutive matched ticks with no fresh YOLO evidence (was 9: kept the class through brief in-FOV occlusions, but also kept it on non-persons) — v1: max_non_yolo_in_fov_frames
+    track_decay_fov_border_frac: 0.10     # ...counting only ticks with the track centre at least this fraction of the image away from its border (partial views at the edge are routinely missed by YOLO)
+    track_max_non_yolo_fov_border_frames: 15  # ...but in that border band the class still clears after this many unconfirmed ticks (a person crosses it in < 1 s; clutter sitting there must not keep a class)
     # (2) Outside every camera's FOV, no 2D re-confirmation is possible at all: watch the box size against the
     # largest size ever seen WITH real YOLO evidence (a high-water mark, never shrunk) and flag GROWTH past it
     # as an ID swap onto a bigger object (wall, vehicle, noisy merged cluster) — modest shrinkage alone is a

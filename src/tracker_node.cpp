@@ -425,6 +425,7 @@ struct Track {
     // contaminated tick can't set best_class outright.
     std::string pending_class;
     int pending_class_ticks = 0;
+    int pending_strong_ticks = 0;  // consecutive pending votes from depth-leaf-direct evidence — see voteClass()
     geometry_msgs::msg::Point pending_class_start_pos;  // raw position when the current streak began — see voteClass()
 
     // FOV-aware semantic decay state (v1: nonYoloInFovStreak_ / yoloXWidth_ / yoloYWidth_ / yoloBaseMismatchStreak_
@@ -539,6 +540,10 @@ public:
         // NOT ported: it needs raw per-object points over time, which this node doesn't receive (only already-
         // fused boxes) — plumbing that through would be a real architecture change, not a classification tweak.
         dynamic_confirm_ticks_ = declare_parameter<int>("track_dynamic_confirm_ticks", 3);
+        // Same debounce for a track with NO semantic evidence of a dynamic class (see publish()): unrecognized
+        // "motion" must persist longer (8 ticks = 0.8 s at 10 Hz) before it is believed. Set equal to
+        // track_dynamic_confirm_ticks to disable.
+        dynamic_confirm_ticks_unclassified_ = declare_parameter<int>("track_dynamic_confirm_ticks_unclassified", 8);
 
         // Historical continuity / "sticky dynamic" (v1: forceDynaFrames_/forceDynaCheckRange_, PATH 2) — once a
         // track has been dynamic for a good fraction of its recent history, re-confirm it immediately on
@@ -640,6 +645,15 @@ public:
         first_class_established_hits_ = declare_parameter<int>("track_first_class_established_hits", 10);
         first_class_established_confirm_ticks_ = declare_parameter<int>("track_first_class_established_confirm_ticks", 2);
         first_class_min_jump_ = declare_parameter<double>("track_first_class_min_jump", 0.08);
+        // ...unless the class comes from depth-corroborated (depth-leaf-direct) evidence on this many CONSECUTIVE
+        // votes (10 = 1 s at 10 Hz): then a standing person can be classified without moving. See voteClass().
+        first_class_static_confirm_ticks_ = declare_parameter<int>("track_first_class_static_confirm_ticks", 10);
+        // In-FOV semantic decay only counts a tick when the track's projected centre is at least this fraction
+        // of the image size away from the border (see decaySemanticEvidence()).
+        decay_fov_border_frac_ = declare_parameter<double>("track_decay_fov_border_frac", 0.10);
+        // ...within that border band the same absence-of-evidence streak clears the class after this many ticks
+        // instead (1.5 s: enough for a person to cross the band, not for clutter sitting in it).
+        max_non_yolo_fov_border_frames_ = declare_parameter<int>("track_max_non_yolo_fov_border_frames", 15);
 
         // Class-conflict guard against ID swaps (v1's own match_yolo_class_consistency_weight /
         // yolo_track_assoc_bonus, brought back specifically for this — see the association loop): a candidate
@@ -901,14 +915,18 @@ private:
     // such limit. Gating decay's own "can this still be reconfirmed" test by the depth camera's range was
     // exactly why a wrongly-tagged, beyond-depth-range track never decayed: this function said "outside FOV" for
     // it, so the inside-FOV absence-of-evidence trigger below never even looked at it.
-    bool insideAnyCameraFov(const Eigen::Vector3d& pos_global) const {
+    // border_frac > 0: the centre must also stay that fraction of the image width/height away from every border
+    // — see decaySemanticEvidence(): near the border YOLO only sees part of the object and cannot be expected to
+    // keep re-confirming it.
+    bool insideAnyCameraFov(const Eigen::Vector3d& pos_global, double border_frac = 0.0) const {
         for (const auto& cam : cams_) {
             if (!cam.has_info || !cam.tf_ok) continue;
             const Eigen::Vector3d p = cam.T_cam_global * pos_global;  // p.z() = depth along the optical axis
             if (p.z() <= 1e-3) continue;  // behind the camera
             const double u = cam.fx * p.x() / p.z() + cam.cx;
             const double v = cam.fy * p.y() / p.z() + cam.cy;
-            if (u >= 0.0 && u < cam.width && v >= 0.0 && v < cam.height) return true;
+            const double mu = border_frac * cam.width, mv = border_frac * cam.height;
+            if (u >= mu && u < cam.width - mu && v >= mv && v < cam.height - mv) return true;
         }
         return false;
     }
@@ -1208,11 +1226,25 @@ private:
             return;
         }
         const bool inside_fov = insideAnyCameraFov(tr.kf.pos());
+        // Absence-of-evidence only counts away from the image border: a person crossing it is only partly
+        // visible and routinely not detected for a few ticks, and with a short max_non_yolo_in_fov_frames_ that
+        // used to strip the class right as they left the FOV. (A border margin on the CENTRE, not the object's
+        // full extent: requiring the whole box inside exempted wrongly-classified static objects that merely sit
+        // near the image edge from ever decaying.)
+        const bool in_reliable_fov = insideAnyCameraFov(tr.kf.pos(), decay_fov_border_frac_);
         const std::string cleared_class = tr.best_class;  // for logging, in case this tick clears it
 
         // (1) inside-FOV: sustained absence of fresh 2D confirmation clears the class outright.
+        if (debug_lifecycle_)
+            RCLCPP_INFO(get_logger(), "[lifecycle] decay #%d cls='%s' pos=(%.2f,%.2f) in_fov=%d reliable=%d det_cls='%s' streak=%d",
+                        id, tr.best_class.c_str(), tr.kf.pos().x(), tr.kf.pos().y(), inside_fov, in_reliable_fov,
+                        det_class_this_tick.c_str(), tr.non_yolo_in_fov_streak);
+        // Near the border the streak still runs, against a longer limit: a person crossing the border band is
+        // through it in well under a second, while an object that SITS there unconfirmed (e.g. a track that slid
+        // onto static clutter at the image edge as the person left) must not keep its class forever.
+        const int decay_limit = in_reliable_fov ? max_non_yolo_in_fov_frames_ : max_non_yolo_fov_border_frames_;
         if (inside_fov && det_class_this_tick.empty()) {
-            if (++tr.non_yolo_in_fov_streak >= max_non_yolo_in_fov_frames_) {
+            if (++tr.non_yolo_in_fov_streak >= decay_limit) {
                 tr.best_class.clear();
                 tr.class_votes.clear();
                 tr.pending_class.clear();
@@ -1224,7 +1256,7 @@ private:
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
                     "track #%d: cleared class '%s' — in camera FOV with no fresh YOLO evidence for %d ticks, "
                     "pos=[%.2f,%.2f,%.2f] size=[%.2f,%.2f,%.2f]",
-                    id, cleared_class.c_str(), max_non_yolo_in_fov_frames_,
+                    id, cleared_class.c_str(), decay_limit,
                     tr.last_obs.x, tr.last_obs.y, tr.last_obs.z, tr.size.x, tr.size.y, tr.size.z);
                 return;  // class just cleared — nothing left to check below this tick
             }
@@ -1275,7 +1307,11 @@ private:
             const double growth_y = (det_size.y - tr.yolo_y_width) / std::max(tr.yolo_y_width, 0.01);
             const bool grew = growth_x > yolo_base_mismatch_thresh_ || growth_y > yolo_base_mismatch_thresh_;
             const bool id_known_same = det_track_id >= 0 && prev_track_id >= 0 && det_track_id == prev_track_id;
-            const bool shrank = !id_known_same &&
+            // Shrink only counts inside the FOV, where YOLO can tell a different object from the same one seen
+            // smaller. Outside it nothing can adjudicate, and a close person's LiDAR box shrinks routinely
+            // (shadow cone, seen from behind) — that cleared "person" off people standing behind the robot.
+            // v1 ignores shrinkage altogether for the same reason ("a physical artifact, not an ID swap").
+            const bool shrank = inside_fov && !id_known_same &&
                                  (growth_x < -yolo_base_shrink_thresh_ || growth_y < -yolo_base_shrink_thresh_);
             if (grew || shrank) {
                 if (++tr.yolo_base_mismatch_streak >= max_yolo_base_mismatch_frames_) {
@@ -1338,28 +1374,42 @@ private:
     // first_class_min_jump — if it hasn't, the window simply restarts from here (not rejected outright: if this
     // IS a real, just-slower-than-usual person, sustained real motion will eventually clear the bar over a
     // later window; a genuinely static object sitting in a contamination hot-spot never will, by construction).
-    void voteClass(Track& tr, const std::string& cls, const geometry_msgs::msg::Point& cur_pos) const {
+    // strong: the class came from dbscan_detector_node's own depth-leaf refinement (YOLO mask corroborated by
+    // the depth points inside it), not from the monocular LiDAR-only pixel fallback.
+    void voteClass(Track& tr, const std::string& cls, const geometry_msgs::msg::Point& cur_pos, bool strong) const {
         if (cls.empty()) return;
         if (tr.best_class.empty()) {
             if (cls != tr.pending_class) {
                 tr.pending_class = cls;
                 tr.pending_class_ticks = 0;
+                tr.pending_strong_ticks = 0;
                 tr.pending_class_start_pos = cur_pos;
             }
             ++tr.pending_class_ticks;
+            tr.pending_strong_ticks = strong ? tr.pending_strong_ticks + 1 : 0;
             const bool established = tr.hits >= first_class_established_hits_;
             const int need_ticks = established ? first_class_established_confirm_ticks_ : first_class_confirm_ticks_;
             if (tr.pending_class_ticks < need_ticks) return;
             if (established) {
                 const double net = std::hypot(cur_pos.x - tr.pending_class_start_pos.x, cur_pos.y - tr.pending_class_start_pos.y);
-                if (net < first_class_min_jump_) {
-                    tr.pending_class_ticks = 0;
-                    tr.pending_class_start_pos = cur_pos;
+                // An established, never-classified track must have MOVED to take its first class (contamination
+                // guard, see above) — except when the evidence is strong and keeps repeating: a person who was
+                // already standing there before YOLO first saw them (robot start-up, or reappearing after an
+                // occlusion long enough to lose the class) would otherwise never become potentially_dynamic
+                // until they walked. A static object can still be painted by a one-off depth-leaf mistake, but
+                // not for track_first_class_static_confirm_ticks consecutive ticks.
+                const bool repeated_strong = tr.pending_strong_ticks >= first_class_static_confirm_ticks_;
+                if (net < first_class_min_jump_ && !repeated_strong) {
+                    if (!strong) {  // weak evidence: restart the displacement window, as before
+                        tr.pending_class_ticks = 0;
+                        tr.pending_class_start_pos = cur_pos;
+                    }
                     return;
                 }
             }
             tr.pending_class.clear();
             tr.pending_class_ticks = 0;
+            tr.pending_strong_ticks = 0;
         }
         const int votes = ++tr.class_votes[cls];
         if (tr.best_class.empty() || votes > tr.class_votes[tr.best_class]) tr.best_class = cls;
@@ -1599,10 +1649,31 @@ private:
                     if (c.iou > best_iou) { best_iou = c.iou; best_key = {c.cam_idx, c.det2d_idx}; }
                 if (best_iou >= 0.0) claimed_by_depth.insert(best_key);
             }
+            // Best IoU each 2D box reaches against any camera-covered (NOT fallback-eligible) detection this tick,
+            // classified or not. A YOLO box is one physical object: if a camera-covered detection's projection
+            // explains it better than a LiDAR-only one does, the box is that object's, not the LiDAR-only
+            // candidate's. Without this, a person whose depth refinement happened not to classify them this tick
+            // left their own box "unclaimed", and a nearby low LiDAR-only object (out of depth coverage) whose
+            // projection merely overlapped the person's large close-range box took the "person" class.
+            std::map<std::pair<int, size_t>, double> covered_best_iou;
+            for (size_t di = 0; di < nd; ++di) {
+                const auto& d = msg->detections[di];
+                if (detectionClass(d).empty() && detectionMask(d) == "L") continue;  // fallback-eligible itself
+                for (const auto& c : pixelCandidates(d.bbox.center.position, d.bbox.center.orientation, d.bbox.size, stamp)) {
+                    auto& b = covered_best_iou[{c.cam_idx, c.det2d_idx}];
+                    b = std::max(b, c.iou);
+                }
+            }
 
             for (size_t di = 0; di < nd; ++di) {
                 const auto& d = msg->detections[di];
                 if (!detectionClass(d).empty() || detectionMask(d) != "L") continue;  // not fallback-eligible
+                // Same reliable image region the semantic decay uses (track_decay_fov_border_frac): at the border
+                // YOLO sees only part of things, so a monocular match there can neither confirm nor (see
+                // decaySemanticEvidence) be un-confirmed — a class given there would never decay.
+                if (!insideAnyCameraFov(Eigen::Vector3d(d.bbox.center.position.x, d.bbox.center.position.y,
+                                                        d.bbox.center.position.z), decay_fov_border_frac_))
+                    continue;
                 for (const auto& c : pixelCandidates(d.bbox.center.position, d.bbox.center.orientation, d.bbox.size, stamp)) {
                     const auto key = std::make_pair(c.cam_idx, c.det2d_idx);
                     if (claimed_by_depth.count(key)) {
@@ -1612,12 +1683,25 @@ private:
                             camera_names_[static_cast<size_t>(c.cam_idx)].c_str(), c.det2d_idx, c.iou, c.cls.c_str());
                         continue;
                     }
+                    if (const auto cv = covered_best_iou.find(key); cv != covered_best_iou.end() && cv->second >= c.iou)
+                        continue;  // a camera-covered detection explains this box at least as well
                     const auto it = best_per_box.find(key);
                     if (it == best_per_box.end() || c.iou > it->second.iou)
                         best_per_box[key] = {di, c.iou, c.cls};
                 }
             }
-            for (const auto& [key, claim] : best_per_box) fallback_class[claim.di] = claim.cls;
+            for (const auto& [key, claim] : best_per_box) {
+                fallback_class[claim.di] = claim.cls;
+                if (debug_lifecycle_) {
+                    const auto& c = msg->detections[claim.di].bbox.center.position;
+                    const auto cv = covered_best_iou.find(key);
+                    RCLCPP_INFO(get_logger(), "[lifecycle] fallback '%s' -> det at (%.2f,%.2f,%.2f) size %.2fx%.2fx%.2f iou=%.2f "
+                                "covered_best=%.2f", claim.cls.c_str(), c.x, c.y, c.z,
+                                msg->detections[claim.di].bbox.size.x, msg->detections[claim.di].bbox.size.y,
+                                msg->detections[claim.di].bbox.size.z, claim.iou,
+                                cv != covered_best_iou.end() ? cv->second : -1.0);
+                }
+            }
         }
 
         std::vector<char> det_used(nd, 0);
@@ -1713,7 +1797,7 @@ private:
             // below now (voteClass() itself tracks NET displacement across its own debounce window internally,
             // from the raw position passed in here).
             const double jump = std::hypot(tr.last_obs.x - prev_obs.x, tr.last_obs.y - prev_obs.y);
-            voteClass(tr, eff_class, tr.last_obs);
+            voteClass(tr, eff_class, tr.last_obs, had_depth_class);
             // First-classification diagnostic (see voteClass()'s own comment on the debounce this feeds into):
             // logs the exact moment a track accepts its very first class, with enough context to tell an ID
             // SWAP (the track's own position just jumped onto a different physical object — "jump" large,
@@ -1872,7 +1956,7 @@ private:
             }
             // hits == 1 is always well below first_class_established_hits_, so voteClass()'s motion gate never
             // engages for a just-spawned track regardless.
-            voteClass(tr, eff_class, tr.last_obs);
+            voteClass(tr, eff_class, tr.last_obs, !detectionClass(d).empty());
             tracks_.emplace(tr.id, std::move(tr));
         }
 
@@ -1906,7 +1990,12 @@ private:
             if (!matched_ids.count(id)) continue;       // predicted-only this tick (missed) — never published either way, matching v1
             const Eigen::Vector3d v = tr.kf.vel();
             const double speed = planarSpeed(v);        // vz excluded — see planarSpeed's own comment
-            const bool debounced_dynamic = tr.dynamic_ticks >= dynamic_confirm_ticks_;
+            // A track with no semantic evidence of a dynamic class must keep up its motion evidence for longer
+            // before it is labelled dynamic: short "moving" bursts on unrecognized objects (a fragment next to a
+            // person, background revealed behind one, a static object's box jittering) are by far the most
+            // common false dynamic. A real unrecognized mover (a cart) still gets the label, just later.
+            const int confirm_ticks = isDynamicClass(tr.best_class) ? dynamic_confirm_ticks_ : dynamic_confirm_ticks_unclassified_;
+            const bool debounced_dynamic = tr.dynamic_ticks >= confirm_ticks;
             // Sticky-dynamic shortcut (v1 PATH 2, see the constructor's own comment): once enough of the
             // track's recent history was dynamic, don't require the FULL fresh debounce streak again after one
             // noisy dip — a single tick's instantaneous speed still has to clear the bar, though.
@@ -2091,6 +2180,10 @@ private:
     double dynamic_speed_thresh_{0.35};
     double stationary_speed_thresh_{0.10};
     int dynamic_confirm_ticks_{3};
+    int dynamic_confirm_ticks_unclassified_{8};
+    int first_class_static_confirm_ticks_{10};
+    double decay_fov_border_frac_{0.10};
+    int max_non_yolo_fov_border_frames_{15};
     int first_class_confirm_ticks_{2};
     int first_class_established_hits_{10};
     int first_class_established_confirm_ticks_{2};

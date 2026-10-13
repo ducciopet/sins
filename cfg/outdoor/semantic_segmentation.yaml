@@ -27,7 +27,7 @@ yolo_semantic_seg_detector:
     semantic_color_topic_template: 'yolo_semantic_seg/{camera}/semantic_color'
     inference_time_topic_template: 'yolo_semantic_seg/{camera}/inference_time'
 
-    enable_semantic: true    # runs the semantic model too (full-res decode + a second inference pass at inference_size, on top of the detection+tracking block below) — needed for preprocessing_node's semantic_ground_points (enable_semantic_ground_points, run_detector.launch.py) to have a real mask to deproject; was off "for now" with no consumer, now there is one (tracks_only.rviz's "Ground Segmentation — Semantic" displays)
+    enable_semantic: false   # floor semantic segmentation off: its only consumer is semantic_ground_points (RViz); floor removal uses the RANSAC planes. Saves a full-res decode + a second inference pass per camera
     weights_path: weights/yolo26s-sem.pt
     class_names_path: cfg/cityscapes.names
     segmentation_classes: ["road", "sidewalk", "terrain"]

@@ -726,7 +726,7 @@ def generate_launch_description():
                      'yet another concurrent GPU consumer on the same 8GB laptop GPU) — test it on its own '
                      'first before enabling alongside enable_semantic_segmentation.')
     enable_semantic_ground_points_arg = DeclareLaunchArgument(
-        'enable_semantic_ground_points', default_value='true',
+        'enable_semantic_ground_points', default_value='false',
         description='Whether preprocessing_node also builds semantic_ground_points: the depth points that '
                      'enable_semantic_segmentation\'s segmentation_mask marks as ground. On by default — '
                      'tracks_only.rviz shows it for both cameras as a direct visual comparison against the '
