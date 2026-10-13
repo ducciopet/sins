@@ -89,6 +89,12 @@ def _launch_setup(context, *args, **kwargs):
     # default.
     preprocessing_params = _load_node_params(preprocessing_config, 'preprocessing_node')
     camera_names = list(preprocessing_params.get('camera_names', ['front_camera']))
+    # Optional launch-time override (e.g. camera_names:=front_camera for a bag
+    # recorded with a single camera), forwarded below to every node that takes
+    # the list, so no node falls back to its own YAML default.
+    camera_names_override = LaunchConfiguration('camera_names').perform(context).strip()
+    if camera_names_override:
+        camera_names = [n.strip() for n in camera_names_override.split(',') if n.strip()]
 
     camera_frame_initial_guess_template = LaunchConfiguration('camera_frame_initial_guess_template').perform(context)
     camera_depth_intrinsics = _parse_camera_intrinsics_map(
@@ -310,6 +316,7 @@ def _launch_setup(context, *args, **kwargs):
                 'aligned_depth_transport': LaunchConfiguration('aligned_depth_transport'),
                 'calibration_enabled': enable_calibration,
                 'yolo_leaf_method': yolo_leaf_method,
+                'camera_names': camera_names,
                 **preprocessing_camera_params,
             },
         ],
@@ -387,7 +394,7 @@ def _launch_setup(context, *args, **kwargs):
             output='screen',
             parameters=[
                 ParameterFile(os.path.join(pkg_dir, 'cfg', env_str, 'tracker.yaml'), allow_substs=True),
-                {'use_sim_time': use_sim_time},
+                {'use_sim_time': use_sim_time, 'camera_names': camera_names},
             ],
         ))
 
@@ -578,6 +585,10 @@ def generate_launch_description():
     env_arg = DeclareLaunchArgument(
         'env', default_value='indoor',
         description="Which cfg/<env>/ profile to use for every node in this launch: 'outdoor' or 'indoor'")
+    camera_names_arg = DeclareLaunchArgument(
+        'camera_names', default_value='',
+        description="Comma-separated camera list overriding cfg/<env>/preprocessing.yaml's camera_names "
+                    "(empty = use the YAML list)")
     use_sim_time_arg = DeclareLaunchArgument(
         'use_sim_time', default_value='true',
         description='Use /clock — set true when replaying bags with --clock')
@@ -728,6 +739,7 @@ def generate_launch_description():
 
     return LaunchDescription([
         env_arg,
+        camera_names_arg,
         use_sim_time_arg,
         rviz_arg,
         enable_calibration_arg,
