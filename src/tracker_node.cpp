@@ -542,8 +542,10 @@ public:
         dynamic_confirm_ticks_ = declare_parameter<int>("track_dynamic_confirm_ticks", 3);
         // Same debounce for a track with NO semantic evidence of a dynamic class that is inside a camera's FOV
         // (see publish()): unrecognized "motion" there must persist longer (8 ticks = 0.8 s at 10 Hz) before it
-        // is believed. Outside every FOV track_dynamic_confirm_ticks applies. Set equal to it to disable.
+        // is believed. Set equal to track_dynamic_confirm_ticks to disable.
         dynamic_confirm_ticks_unclassified_ = declare_parameter<int>("track_dynamic_confirm_ticks_unclassified", 8);
+        // ...and outside every camera FOV, where nothing can be classified and a long wait only delays real movers.
+        dynamic_confirm_ticks_unclassified_out_fov_ = declare_parameter<int>("track_dynamic_confirm_ticks_unclassified_out_fov", 5);
 
         // Historical continuity / "sticky dynamic" (v1: forceDynaFrames_/forceDynaCheckRange_, PATH 2) — once a
         // track has been dynamic for a good fraction of its recent history, re-confirm it immediately on
@@ -1995,9 +1997,10 @@ private:
             // a real person, so short "moving" bursts on unrecognized objects (a fragment next to a person,
             // background revealed behind one, a static object's box jittering) are by far the most common false
             // dynamic. Outside every FOV nothing can classify anything, so the longer wait would only delay real
-            // movers (e.g. a person walking behind the robot): the plain debounce applies there.
-            const bool unclassified_in_fov = !isDynamicClass(tr.best_class) && insideAnyCameraFov(tr.kf.pos());
-            const int confirm_ticks = unclassified_in_fov ? dynamic_confirm_ticks_unclassified_ : dynamic_confirm_ticks_;
+            // movers (e.g. a person walking behind the robot): a shorter, separate debounce applies there.
+            const int confirm_ticks = isDynamicClass(tr.best_class) ? dynamic_confirm_ticks_
+                                    : insideAnyCameraFov(tr.kf.pos()) ? dynamic_confirm_ticks_unclassified_
+                                    : dynamic_confirm_ticks_unclassified_out_fov_;
             const bool debounced_dynamic = tr.dynamic_ticks >= confirm_ticks;
             // Sticky-dynamic shortcut (v1 PATH 2, see the constructor's own comment): once enough of the
             // track's recent history was dynamic, don't require the FULL fresh debounce streak again after one
@@ -2184,6 +2187,7 @@ private:
     double stationary_speed_thresh_{0.10};
     int dynamic_confirm_ticks_{3};
     int dynamic_confirm_ticks_unclassified_{8};
+    int dynamic_confirm_ticks_unclassified_out_fov_{5};
     int first_class_static_confirm_ticks_{10};
     double decay_fov_border_frac_{0.10};
     int max_non_yolo_fov_border_frames_{15};
