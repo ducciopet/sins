@@ -176,7 +176,7 @@ tracker_node:
     track_first_class_established_hits: 10            # matched ticks before a still-unclassified track counts as "established"
     track_first_class_established_confirm_ticks: 2    # debounce window (ticks) for an established track — same as the plain one above now, but still with its own NET displacement requirement on top (track_first_class_min_jump). Lowered from 5, then 3: the actual root cause this mechanism was compensating for (preprocessing_node's depth-leaf extraction occasionally bleeding into a nearby static object, see its own yolo_leaf_valley_fraction/yolo_leaf_depth_tolerance comments) is fixed upstream, so this secondary safety net no longer needs to be as conservative — the displacement check, not the tick count, is what actually guards against jitter-vs-real-motion now
     track_first_class_min_jump: 0.08                  # [m] NET raw-observation displacement required across that whole window — reuses track_min_natural_motion_dist's own bar
-    track_first_class_static_confirm_ticks: 10        # ...waived when depth-corroborated (depth-leaf-direct) evidence repeats on this many consecutive votes: a person already standing there when first seen becomes potentially_dynamic without having to walk
+    track_first_class_static_confirm_ticks: 5         # ...waived when depth-corroborated (depth-leaf-direct) evidence repeats on this many consecutive votes: a person already standing there when first seen becomes potentially_dynamic without having to walk
 
     # Kalman filter (state per axis x,y,z: position, velocity, acceleration; only position observed) — v1's own
     # REAL defaults (found in dynamicDetector.cpp's parameter loading, not its sample yaml, which never overrides

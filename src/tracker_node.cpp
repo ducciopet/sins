@@ -653,8 +653,8 @@ public:
         first_class_established_confirm_ticks_ = declare_parameter<int>("track_first_class_established_confirm_ticks", 2);
         first_class_min_jump_ = declare_parameter<double>("track_first_class_min_jump", 0.08);
         // ...unless the class comes from depth-corroborated (depth-leaf-direct) evidence on this many CONSECUTIVE
-        // votes (10 = 1 s at 10 Hz): then a standing person can be classified without moving. See voteClass().
-        first_class_static_confirm_ticks_ = declare_parameter<int>("track_first_class_static_confirm_ticks", 10);
+        // votes (5 = 0.5 s at 10 Hz): then a standing person can be classified without moving. See voteClass().
+        first_class_static_confirm_ticks_ = declare_parameter<int>("track_first_class_static_confirm_ticks", 5);
         // In-FOV semantic decay only counts a tick when the track's projected centre is at least this fraction
         // of the image size away from the border (see decaySemanticEvidence()).
         decay_fov_border_frac_ = declare_parameter<double>("track_decay_fov_border_frac", 0.10);
@@ -2284,7 +2284,7 @@ private:
     int dynamic_confirm_ticks_{3};
     int dynamic_confirm_ticks_unclassified_{8};
     int dynamic_confirm_ticks_unclassified_out_fov_{5};
-    int first_class_static_confirm_ticks_{10};
+    int first_class_static_confirm_ticks_{5};
     double decay_fov_border_frac_{0.10};
     int max_non_yolo_fov_border_frames_{15};
     double class_handover_dist_{0.5}, class_handover_window_{3.0};
