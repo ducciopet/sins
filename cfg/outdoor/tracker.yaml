@@ -206,6 +206,12 @@ tracker_node:
     track_max_non_yolo_in_fov_frames: 3   # in camera FOV, clear the class after this many consecutive matched ticks with no fresh YOLO evidence (was 9: kept the class through brief in-FOV occlusions, but also kept it on non-persons) — v1: max_non_yolo_in_fov_frames
     track_decay_fov_border_frac: 0.10     # ...counting only ticks with the track centre at least this fraction of the image away from its border (partial views at the edge are routinely missed by YOLO)
     track_max_non_yolo_fov_border_frames: 15  # ...but in that border band the class still clears after this many unconfirmed ticks (a person crosses it in < 1 s; clutter sitting there must not keep a class)
+    track_class_handover_dist: 0.5          # [m] class handover: a track born this close to a classified track's prediction, from a detection that track passed over...
+    track_class_handover_window: 3.0        # [s] ...inherits the class if the classified track gives it up (identity swap) or dies within this time
+    track_person_box_completion: true       # published box of a "person" track: stood on the floor, at least track_person_min_height tall, centre pushed along the LiDAR ray (sensors only see the near surface; the VLP-16 cone cuts legs and head up close)
+    floor_frame: base_footprint            # its z in global_frame is the floor height used above
+    track_person_min_height: 1.7            # [m] adult prior (conservative for navigation)
+    track_person_ray_offset: 0.07           # [m] mean visible-surface bias measured vs motion capture on the lab bags (7-12 cm far, ~1 cm at 1-1.5 m)
     # (2) Outside every camera's FOV, no 2D re-confirmation is possible at all: watch the box size against the
     # largest size ever seen WITH real YOLO evidence (a high-water mark, never shrunk) and flag GROWTH past it
     # as an ID swap onto a bigger object (wall, vehicle, noisy merged cluster) — modest shrinkage alone is a

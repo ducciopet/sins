@@ -426,6 +426,11 @@ struct Track {
     std::string pending_class;
     int pending_class_ticks = 0;
     int pending_strong_ticks = 0;  // consecutive pending votes from depth-leaf-direct evidence — see voteClass()
+    // Class handover (see handOverClass()): this track was born from a detection that a nearby CLASSIFIED track
+    // passed over for another one — if that track turns out to have swapped identity, its class comes here.
+    int heir_of = -1;
+    std::string heir_class;
+    double heir_stamp = 0.0;
     geometry_msgs::msg::Point pending_class_start_pos;  // raw position when the current streak began — see voteClass()
 
     // FOV-aware semantic decay state (v1: nonYoloInFovStreak_ / yoloXWidth_ / yoloYWidth_ / yoloBaseMismatchStreak_
@@ -656,6 +661,16 @@ public:
         // ...within that border band the same absence-of-evidence streak clears the class after this many ticks
         // instead (1.5 s: enough for a person to cross the band, not for clutter sitting in it).
         max_non_yolo_fov_border_frames_ = declare_parameter<int>("track_max_non_yolo_fov_border_frames", 15);
+        // Class handover (see handOverClass()): a new track born within this distance [m] of a classified track's
+        // prediction, from a detection that track passed over, inherits its class if within this window [s] the
+        // classified track gives the class up or dies.
+        class_handover_dist_ = declare_parameter<double>("track_class_handover_dist", 0.5);
+        class_handover_window_ = declare_parameter<double>("track_class_handover_window", 3.0);
+        // Output box completion for "person" tracks (see completePersonBox()).
+        person_box_completion_ = declare_parameter<bool>("track_person_box_completion", true);
+        floor_frame_ = declare_parameter<std::string>("floor_frame", "base_footprint");
+        person_min_height_ = declare_parameter<double>("track_person_min_height", 1.7);   // [m]
+        person_ray_offset_ = declare_parameter<double>("track_person_ray_offset", 0.07);  // [m]
 
         // Class-conflict guard against ID swaps (v1's own match_yolo_class_consistency_weight /
         // yolo_track_assoc_bonus, brought back specifically for this — see the association loop): a candidate
@@ -906,6 +921,12 @@ private:
             lidar_tf_ok_ = true;
         } catch (const tf2::TransformException&) {
             // not yet available — skip this tick
+        }
+        floor_ok_ = false;
+        try {
+            floor_z_ = tf_buffer_.lookupTransform(global_frame_, floor_frame_, tf2::TimePointZero).transform.translation.z;
+            floor_ok_ = true;
+        } catch (const tf2::TransformException&) {
         }
     }
 
@@ -1219,6 +1240,30 @@ private:
 
     // SEMANTIC DECAY — see the file header's own section for the full rationale. Only called for a track that
     // was MATCHED this tick (a missed tick leaves semantic state untouched, like everything else in this file).
+    // CLASS HANDOVER (no v1 equivalent). When a classified track passes over a detection right next to its own
+    // prediction for a different one, and that detection then starts a new track, one of the two is the real
+    // object. If within track_class_handover_window the classified track gives its class up (ID-swap evidence or
+    // decay) or dies, the evidence was that it swapped identity: the class belongs to the newborn track, which
+    // inherits it instead of the semantic information being lost. Observed on a lab bag: a person leaving the
+    // camera FOV sideways lost their (fused) camera points, their centroid jumped, and the "person" track slid
+    // onto static clutter at the image border while the person continued — unclassified — behind the robot.
+    void handOverClass(int from_id, const std::string& cls) {
+        if (!isDynamicClass(cls)) return;
+        Track* heir = nullptr;
+        for (auto& [id, t] : tracks_) {
+            if (id == from_id || t.heir_of != from_id || !t.best_class.empty() || t.hits < min_hits_) continue;
+            if (last_stamp_ - t.heir_stamp > class_handover_window_) continue;
+            if (!heir || t.heir_stamp > heir->heir_stamp) heir = &t;
+        }
+        if (!heir) return;
+        heir->best_class = cls;
+        heir->class_votes[cls] = 1;
+        heir->confirmed = true;  // a classified track confirms on its first classified hit anyway
+        heir->heir_of = -1;
+        RCLCPP_INFO(get_logger(), "track #%d: inherited class '%s' from track #%d (identity swap: #%d gave the class up)",
+                    heir->id, cls.c_str(), from_id, from_id);
+    }
+
     void decaySemanticEvidence(int id, Track& tr, const std::string& det_class_this_tick,
                                const vision_msgs::msg::BoundingBox3D::_size_type& det_size, int det_track_id) {
         if (tr.best_class.empty()) {
@@ -1260,6 +1305,7 @@ private:
                     "pos=[%.2f,%.2f,%.2f] size=[%.2f,%.2f,%.2f]",
                     id, cleared_class.c_str(), decay_limit,
                     tr.last_obs.x, tr.last_obs.y, tr.last_obs.z, tr.size.x, tr.size.y, tr.size.z);
+                handOverClass(id, cleared_class);
                 return;  // class just cleared — nothing left to check below this tick
             }
         } else {
@@ -1330,6 +1376,7 @@ private:
                         id, cleared_class.c_str(), grew ? "grew" : "shrank", growth_x * 100.0, growth_y * 100.0,
                         max_yolo_base_mismatch_frames_, inside_fov ? "inside" : "outside",
                         prev_track_id, det_track_id);
+                    handOverClass(id, cleared_class);
                 }
             } else {
                 tr.yolo_base_mismatch_streak = 0;
@@ -1587,6 +1634,11 @@ private:
                 // confirmed track's ordinary centroid jitter out there can lose to a nearby false competitor
                 // at a similar (now much wider) gate.
                 if (lidar_only_outside_fov) score += tr.confirmed ? outside_fov_confirmed_bonus_ : outside_fov_tentative_bonus_;
+                if (debug_lifecycle_ && isDynamicClass(tr.best_class))
+                    RCLCPP_INFO(get_logger(), "[lifecycle] cand #%d<-det(%.2f,%.2f) size %.2fx%.2f cls='%s' score=%.3f | "
+                                "pred=%.2f prev=%.2f size=%.2f iou=%.2f prevIou=%.2f class=%.3f velErr=%.2f conf=%d",
+                                tr.id, c.x, c.y, d.bbox.size.x, d.bbox.size.y, det_class.c_str(), score, predDist, prevDist,
+                                sizeDiff, predIou, prevIou, class_score, velErr, tr.confirmed);
                 if (score < min_match_score_) { noteReject(ti, di, "score"); continue; }
                 candidates.push_back({di, ti, score});
             }
@@ -1925,6 +1977,16 @@ private:
             if (isDuplicateOfExistingTrack(d, track_ids, predicted_pos)) continue;
             Track tr;
             tr.id = next_id_++;
+            {   // potential heir of a nearby classified track that passed this detection over (see handOverClass())
+                const auto& c = d.bbox.center.position;
+                double best = class_handover_dist_;
+                for (size_t ti = 0; ti < nt; ++ti) {
+                    const Track& o = tracks_.at(track_ids[ti]);
+                    if (!isDynamicClass(o.best_class) || track_to_det[ti] < 0) continue;
+                    const double dist = std::hypot(predicted_pos[ti].x() - c.x, predicted_pos[ti].y() - c.y);
+                    if (dist < best) { best = dist; tr.heir_of = o.id; tr.heir_class = o.best_class; tr.heir_stamp = stamp; }
+                }
+            }
             if (debug_lifecycle_) {
                 const auto& c = d.bbox.center.position;
                 std::string near;
@@ -1972,10 +2034,41 @@ private:
                 RCLCPP_INFO(get_logger(), "[lifecycle] delete #%d cls='%s' hits=%d missed=%d/%d stationary=%d/%d", it->first,
                             it->second.best_class.c_str(), it->second.hits, it->second.missed_in_a_row, effective_max_missed,
                             it->second.stationary_ticks, track_stationary_max_ticks_);
+            if (dead && isDynamicClass(it->second.best_class)) {
+                const int dead_id = it->first;
+                const std::string dead_class = it->second.best_class;
+                it = tracks_.erase(it);
+                handOverClass(dead_id, dead_class);
+                continue;
+            }
             it = dead ? tracks_.erase(it) : std::next(it);
         }
 
         publish(msg->header, matched_ids);
+    }
+
+    // OUTPUT BOX COMPLETION for person tracks (published box only — association keeps using the observed box).
+    // The LiDAR/depth points only cover what the sensors see: up close the VLP-16's +-15 deg cone cuts a person's
+    // legs AND head (box bottom ~0.7 m and top ~1.3 m above the floor at 1 m, behind the robot), and only the
+    // surface facing the sensor is seen, so the box centre sits ~7-12 cm short of the person's real centre along
+    // the sensor ray (measured against motion capture on the lab bags). For a "person" track the published box is
+    // therefore stood on the floor (floor_frame's height, the robot's own footprint), given at least
+    // track_person_min_height, and its centre pushed track_person_ray_offset further along the LiDAR ray.
+    void completePersonBox(const Track& tr, Eigen::Vector3d& center, vision_msgs::msg::BoundingBox3D::_size_type& size) const {
+        if (!person_box_completion_ || tr.best_class != "person") return;
+        if (lidar_tf_ok_ && person_ray_offset_ > 0.0) {
+            Eigen::Vector2d ray(center.x() - lidar_origin_.x(), center.y() - lidar_origin_.y());
+            if (ray.norm() > 1e-3) {
+                ray.normalize();
+                center.x() += person_ray_offset_ * ray.x();
+                center.y() += person_ray_offset_ * ray.y();
+            }
+        }
+        if (floor_ok_) {
+            const double top = std::max(center.z() + 0.5 * size.z, floor_z_ + person_min_height_);
+            center.z() = 0.5 * (floor_z_ + top);
+            size.z = top - floor_z_;
+        }
     }
 
     void publish(const std_msgs::msg::Header& header, const std::set<int>& matched_ids) {
@@ -2040,11 +2133,14 @@ private:
             vision_msgs::msg::Detection3D d;
             d.header = arr.header;
             d.id = "track_" + std::to_string(id);
-            d.bbox.center.position.x = tr.kf.x_(0);
-            d.bbox.center.position.y = tr.kf.x_(1);
-            d.bbox.center.position.z = tr.kf.x_(2);
+            Eigen::Vector3d box_center = tr.kf.pos();
+            auto box_size = tr.size;
+            completePersonBox(tr, box_center, box_size);
+            d.bbox.center.position.x = box_center.x();
+            d.bbox.center.position.y = box_center.y();
+            d.bbox.center.position.z = box_center.z();
             d.bbox.center.orientation = tr.orientation;
-            d.bbox.size = tr.size;
+            d.bbox.size = box_size;
             vision_msgs::msg::ObjectHypothesisWithPose h;
             h.hypothesis.class_id = status;
             h.hypothesis.score = speed;
@@ -2072,14 +2168,14 @@ private:
                 obs.status = dynamic ? jo_msgs::msg::Obstacle::STATUS_DYNAMIC : jo_msgs::msg::Obstacle::STATUS_POTENTIALLY_DYNAMIC;
                 obs.pose.position = d.bbox.center.position;
                 obs.pose.orientation = tr.orientation;
-                obs.size.x = tr.size.x; obs.size.y = tr.size.y; obs.size.z = tr.size.z;
+                obs.size.x = box_size.x; obs.size.y = box_size.y; obs.size.z = box_size.z;
                 obs.twist.linear.x = v.x(); obs.twist.linear.y = v.y(); obs.twist.linear.z = v.z();
                 const Eigen::Vector3d a = tr.kf.acc();
                 obs.accel.linear.x = a.x(); obs.accel.linear.y = a.y(); obs.accel.linear.z = a.z();
                 obstacles.obstacles.push_back(obs);
             }
 
-            appendTrackMarkers(markers, id, tr, dynamic, potentially_dynamic, speed, v, header);
+            appendTrackMarkers(markers, id, tr, box_center, box_size, dynamic, potentially_dynamic, speed, v, header);
         }
         for (int old : last_published_ids_)
             if (!now_ids.count(old)) {
@@ -2100,7 +2196,8 @@ private:
         pub_obstacles_->publish(obstacles);
     }
 
-    void appendTrackMarkers(visualization_msgs::msg::MarkerArray& out, int id, const Track& tr, bool dynamic,
+    void appendTrackMarkers(visualization_msgs::msg::MarkerArray& out, int id, const Track& tr,
+                            const Eigen::Vector3d& c, const vision_msgs::msg::BoundingBox3D::_size_type& bsize, bool dynamic,
                             bool potentially_dynamic, double speed, const Eigen::Vector3d& vel,
                             const std_msgs::msg::Header& header) const {
         // Box/label color encodes the three-way dynamic/potentially_dynamic/static status (v1 parity — see
@@ -2110,7 +2207,6 @@ private:
         if (dynamic)                   { r = 0.1f; g = 0.3f; b_col = 1.0f; }   // blue
         else if (potentially_dynamic)  { r = 0.15f; g = 0.85f; b_col = 0.15f; } // green
         else                            { r = 0.8f; g = 0.8f; b_col = 0.8f; }   // neutral grey
-        const Eigen::Vector3d c = tr.kf.pos();
         const Eigen::Quaterniond q(tr.orientation.w, tr.orientation.x, tr.orientation.y, tr.orientation.z);
         const Eigen::Matrix3d R = q.normalized().toRotationMatrix();
 
@@ -2129,8 +2225,8 @@ private:
         box.lifetime = rclcpp::Duration::from_seconds(marker_lifetime_sec_);
         for (const auto& e : edges)
             for (int v : {e[0], e[1]}) {
-                const Eigen::Vector3d local(((v & 1) ? 0.5 : -0.5) * tr.size.x, ((v & 2) ? 0.5 : -0.5) * tr.size.y,
-                                            ((v & 4) ? 0.5 : -0.5) * tr.size.z);
+                const Eigen::Vector3d local(((v & 1) ? 0.5 : -0.5) * bsize.x, ((v & 2) ? 0.5 : -0.5) * bsize.y,
+                                            ((v & 4) ? 0.5 : -0.5) * bsize.z);
                 const Eigen::Vector3d p = c + R * local;
                 geometry_msgs::msg::Point pt;
                 pt.x = p.x(); pt.y = p.y(); pt.z = p.z();
@@ -2150,7 +2246,7 @@ private:
             arrow.color.r = 1.f; arrow.color.g = 0.f; arrow.color.b = 0.f; arrow.color.a = 0.9f;
             arrow.lifetime = rclcpp::Duration::from_seconds(marker_lifetime_sec_);
             geometry_msgs::msg::Point p0, p1;
-            p0.x = c.x(); p0.y = c.y(); p0.z = c.z() + tr.size.z * 0.5 + 0.1;
+            p0.x = c.x(); p0.y = c.y(); p0.z = c.z() + bsize.z * 0.5 + 0.1;
             p1.x = c.x() + vel.x(); p1.y = c.y() + vel.y(); p1.z = p0.z + vel.z();
             arrow.points.push_back(p0);
             arrow.points.push_back(p1);
@@ -2164,7 +2260,7 @@ private:
         label.id = id;
         label.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
         label.action = visualization_msgs::msg::Marker::ADD;
-        label.pose.position.x = c.x(); label.pose.position.y = c.y(); label.pose.position.z = c.z() + tr.size.z * 0.5 + 0.25;
+        label.pose.position.x = c.x(); label.pose.position.y = c.y(); label.pose.position.z = c.z() + bsize.z * 0.5 + 0.25;
         label.scale.z = 0.25;
         label.color.r = r; label.color.g = g; label.color.b = b_col; label.color.a = 1.f;
         label.lifetime = rclcpp::Duration::from_seconds(marker_lifetime_sec_);
@@ -2191,6 +2287,12 @@ private:
     int first_class_static_confirm_ticks_{10};
     double decay_fov_border_frac_{0.10};
     int max_non_yolo_fov_border_frames_{15};
+    double class_handover_dist_{0.5}, class_handover_window_{3.0};
+    bool person_box_completion_{true};
+    std::string floor_frame_{"base_footprint"};
+    double person_min_height_{1.7}, person_ray_offset_{0.07};
+    double floor_z_{0.0};
+    bool floor_ok_{false};
     int first_class_confirm_ticks_{2};
     int first_class_established_hits_{10};
     int first_class_established_confirm_ticks_{2};
