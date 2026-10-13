@@ -439,6 +439,11 @@ struct Track {
     // FOV-aware semantic decay state (v1: nonYoloInFovStreak_ / yoloXWidth_ / yoloYWidth_ / yoloBaseMismatchStreak_
     // — see decaySemanticEvidence()'s own comment and the file header's SEMANTIC DECAY section).
     int non_yolo_in_fov_streak = 0;
+    // MOTION-EARNED PD: published-dynamic ticks of a track that never had a class, and whether that history has
+    // earned it the potentially_dynamic label once it stops (see publish()). Revoked like a class (decay below).
+    int motion_dynamic_ticks = 0;
+    bool motion_pd = false;
+    int motion_pd_fov_streak = 0;
     double yolo_x_width = 0.0, yolo_y_width = 0.0;  // high-water mark: largest size seen WITH fresh YOLO evidence
     int yolo_base_mismatch_streak = 0;
     int last_yolo_track_id = -1;  // the YOLO 2D track id active when yolo_x_width/yolo_y_width were last updated — see decaySemanticEvidence()'s own comment
@@ -473,6 +478,54 @@ bool tryAugment(size_t det, const std::vector<std::vector<size_t>>& candidates_b
         }
     }
     return false;
+}
+
+// Weighted bipartite matching (Kuhn-Munkres/Hungarian, O(n^3)) — ablation alternative to tryAugment's
+// max-CARDINALITY heuristic above (see track_assignment_method and its call site's own comment). Minimizes
+// total cost over a SQUARE matrix; the caller pads a rectangular (nt x nd) problem to n = max(nt, nd) and
+// marks non-candidate pairs with a sentinel the real -score costs never reach, so the solver only uses one
+// when truly forced to (never, once padding rows/columns give it a free zero-cost way to leave a real
+// track/detection unmatched instead). Standard textbook formulation (see e.g. cp-algorithms.com/graph/hungarian-algorithm.html) — not
+// specific to this codebase, reproduced here instead of adding a dependency for one O(n^3) routine over
+// a handful of tracks/detections.
+std::vector<int> hungarianMinCost(const std::vector<std::vector<double>>& cost) {
+    const int n = static_cast<int>(cost.size());
+    const double INF = std::numeric_limits<double>::max() / 4;
+    std::vector<double> u(n + 1, 0.0), v(n + 1, 0.0);
+    std::vector<int> p(n + 1, 0), way(n + 1, 0);
+    for (int i = 1; i <= n; ++i) {
+        p[0] = i;
+        int j0 = 0;
+        std::vector<double> minv(n + 1, INF);
+        std::vector<bool> used(n + 1, false);
+        do {
+            used[j0] = true;
+            const int i0 = p[j0];
+            int j1 = -1;
+            double delta = INF;
+            for (int j = 1; j <= n; ++j) {
+                if (used[j]) continue;
+                const double cur = cost[i0 - 1][j - 1] - u[i0] - v[j];
+                if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
+                if (minv[j] < delta) { delta = minv[j]; j1 = j; }
+            }
+            for (int j = 0; j <= n; ++j) {
+                if (used[j]) { u[p[j]] += delta; v[j] -= delta; }
+                else { minv[j] -= delta; }
+            }
+            j0 = j1;
+        } while (p[j0] != 0);
+        do {
+            const int j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+        } while (j0);
+    }
+    std::vector<int> row_to_col(n, -1);
+    for (int j = 1; j <= n; ++j) {
+        if (p[j] > 0) row_to_col[p[j] - 1] = j - 1;
+    }
+    return row_to_col;
 }
 
 }  // namespace
@@ -554,6 +607,12 @@ public:
         dynamic_confirm_ticks_unclassified_ = declare_parameter<int>("track_dynamic_confirm_ticks_unclassified", 8);
         // ...and outside every camera FOV, where nothing can be classified and a long wait only delays real movers.
         dynamic_confirm_ticks_unclassified_out_fov_ = declare_parameter<int>("track_dynamic_confirm_ticks_unclassified_out_fov", 5);
+        // MOTION-EARNED PD: an unclassified track that has been published dynamic for this many ticks is
+        // potentially_dynamic when it stops, instead of static — the camera never saw it (e.g. a person walking
+        // behind a robot with no rear camera), but it has shown it moves. Kept while the track lives; revoked,
+        // like a class, after track_max_non_yolo_in_fov_frames ticks in the reliable FOV with no YOLO class.
+        // 0 disables.
+        motion_pd_min_dynamic_ticks_ = declare_parameter<int>("track_motion_pd_min_dynamic_ticks", 20);
 
         // Historical continuity / "sticky dynamic" (v1: forceDynaFrames_/forceDynaCheckRange_, PATH 2) — once a
         // track has been dynamic for a good fraction of its recent history, re-confirm it immediately on
@@ -853,6 +912,12 @@ public:
         // Diagnostics only: log every track birth (with nearby tracks and why each did not take the detection)
         // and every deletion (with the reason). Off by default.
         debug_lifecycle_ = declare_parameter<bool>("track_debug_lifecycle", false);
+        // "greedy_kuhn" (default): v1-compatible max-CARDINALITY augmenting-path heuristic (tryAugment).
+        // "hungarian": ablation — true max-weight bipartite matching (hungarianMinCost) over the SAME
+        // per-pair scores/gates above; isolates whether global weight-optimality in the assignment alone
+        // (nothing else in the tracker changes) moves MOTA/IDF1, independent of the occlusion-reasoning
+        // contribution. See this file's header and hungarianMinCost's own comment.
+        assignment_method_ = declare_parameter<std::string>("track_assignment_method", "greedy_kuhn");
         pub_obstacles_ = create_publisher<jo_msgs::msg::ObstacleArray>(obstacles_topic_, rclcpp::QoS(10));
         // Point-cloud motion voting's own input (see the constructor's own comment above) — just the latest
         // message cached, matched against each tick's own detections by stamp (see parsePointsByDetection()).
@@ -1274,12 +1339,28 @@ private:
                     heir->id, cls.c_str(), from_id, from_id);
     }
 
+    // A track that may move even when still: semantic evidence of a dynamic class, or motion-earned PD.
+    bool potentiallyDynamic(const Track& tr) const { return isDynamicClass(tr.best_class) || tr.motion_pd; }
+
     void decaySemanticEvidence(int id, Track& tr, const std::string& det_class_this_tick,
-                               const vision_msgs::msg::BoundingBox3D::_size_type& det_size, int det_track_id) {
+                               const vision_msgs::msg::BoundingBox3D::_size_type& det_size, int det_track_id,
+                               bool camera_covered) {
         if (tr.best_class.empty()) {
             tr.non_yolo_in_fov_streak = 0;
             tr.yolo_base_mismatch_streak = 0;
             tr.last_yolo_track_id = -1;
+            // motion-earned PD: in the reliable FOV YOLO is trusted, so a "mover" it does not recognize loses it
+            if (tr.motion_pd && det_class_this_tick.empty() &&
+                insideAnyCameraFov(tr.kf.pos(), decay_fov_border_frac_)) {
+                if (++tr.motion_pd_fov_streak >= max_non_yolo_in_fov_frames_) {
+                    tr.motion_pd = false;
+                    tr.motion_pd_fov_streak = 0;
+                    if (debug_lifecycle_)
+                        RCLCPP_INFO(get_logger(), "[lifecycle] track #%d: motion-earned PD revoked (in FOV, no YOLO)", id);
+                }
+            } else {
+                tr.motion_pd_fov_streak = 0;
+            }
             return;
         }
         const bool inside_fov = insideAnyCameraFov(tr.kf.pos());
@@ -1369,7 +1450,11 @@ private:
             // smaller. Outside it nothing can adjudicate, and a close person's LiDAR box shrinks routinely
             // (shadow cone, seen from behind) — that cleared "person" off people standing behind the robot.
             // v1 ignores shrinkage altogether for the same reason ("a physical artifact, not an ID swap").
-            const bool shrank = inside_fov && !id_known_same &&
+            // ...and only for a box that has camera points this tick: the baseline is built on camera-covered
+            // (L+camera) boxes, and the LiDAR-only box of the same person is far narrower. On the benchmark bags
+            // the depth stream drops frames for up to 0.6 s; each gap made the person's box "LiDAR-only", the
+            // shrink fired and stripped "person" off a person standing in front of the camera.
+            const bool shrank = inside_fov && camera_covered && !id_known_same &&
                                  (growth_x < -yolo_base_shrink_thresh_ || growth_y < -yolo_base_shrink_thresh_);
             if (grew || shrank) {
                 if (++tr.yolo_base_mismatch_streak >= max_yolo_base_mismatch_frames_) {
@@ -1666,31 +1751,58 @@ private:
         }
         std::sort(candidates.begin(), candidates.end(), [](const Cand& a, const Cand& b) { return a.score > b.score; });
 
-        // Global assignment: Kuhn's augmenting-path matching over the best-first candidate list (v1's own
-        // assignMatchesGlobally/tryAugmentDetectionMatch).
-        std::vector<std::vector<size_t>> candidates_by_det(nd);
-        for (const auto& c : candidates) candidates_by_det[c.det].push_back(c.track);
-        std::vector<int> track_to_det(nt, -1), det_to_track(nd, -1), visited(nt, -1);
-        // Detections are given their turn to claim/steal a track in order of their OWN best candidate's score,
-        // strongest first — not raw array index order (no v1 equivalent to compare against; a general
-        // weighted-bipartite-matching concern independent of it). tryAugment's "steal" semantics make this an
-        // augmenting-path heuristic for maximum-CARDINALITY matching, not a true maximum-weight one — the
-        // actual assignment it converges to depends on which detection gets to claim first. With raw index
-        // order, a detection with only a mediocre, borderline-score match could claim a track before a
-        // DIFFERENT detection with a far stronger, more confident match for that SAME track ever gets a turn —
-        // the strong match then has to settle for stealing (if tryAugment's recursion finds a free alternative
-        // for the mediocre one) or its own second-best. Processing strongest-match-first means the most
-        // confident pairing anywhere is locked in before any weaker, more ambiguous one gets to contest it.
-        std::vector<double> det_best_score(nd, -std::numeric_limits<double>::infinity());
-        for (const auto& c : candidates) det_best_score[c.det] = std::max(det_best_score[c.det], c.score);
-        std::vector<size_t> det_order(nd);
-        std::iota(det_order.begin(), det_order.end(), 0);
-        std::stable_sort(det_order.begin(), det_order.end(),
-            [&](size_t a, size_t b) { return det_best_score[a] > det_best_score[b]; });
-        int token = 0;
-        for (size_t di : det_order) {
-            ++token;
-            tryAugment(di, candidates_by_det, track_to_det, det_to_track, visited, token);
+        // Global assignment (v1's own assignMatchesGlobally/tryAugmentDetectionMatch) — see
+        // track_assignment_method's own comment in the constructor for the two methods below.
+        std::vector<int> track_to_det(nt, -1), det_to_track(nd, -1);
+        if (assignment_method_ == "hungarian") {
+            // Ablation: TRUE max-weight bipartite matching over the same candidates (hungarianMinCost,
+            // see its own comment). Build an (n x n) cost matrix, n = max(nt, nd): a real candidate pair
+            // gets -score (Hungarian minimizes); every OTHER real-track/real-detection pair gets FORBIDDEN
+            // (it never passed the gates above, so it must never be used); padding rows/columns (the
+            // rectangular slack when nt != nd) get cost 0, so the solver can always leave a real
+            // track/detection unmatched for free instead of ever being forced onto a FORBIDDEN pair.
+            const size_t n = std::max(nt, nd);
+            const double FORBIDDEN = 1e6;
+            std::vector<std::vector<double>> cost(n, std::vector<double>(n, 0.0));
+            for (size_t ti = 0; ti < nt; ++ti)
+                for (size_t di = 0; di < nd; ++di) cost[ti][di] = FORBIDDEN;
+            for (const auto& c : candidates) cost[c.track][c.det] = -c.score;
+            const std::vector<int> row_to_col = hungarianMinCost(cost);
+            for (size_t ti = 0; ti < nt; ++ti) {
+                const int di = row_to_col[ti];
+                if (di < 0 || static_cast<size_t>(di) >= nd) continue;  // unmatched, or matched to padding
+                if (cost[ti][static_cast<size_t>(di)] >= FORBIDDEN) continue;  // forced onto a non-candidate pair
+                track_to_det[ti] = di;
+                det_to_track[static_cast<size_t>(di)] = static_cast<int>(ti);
+            }
+        } else {
+            // Default: Kuhn's augmenting-path matching over the best-first candidate list.
+            std::vector<std::vector<size_t>> candidates_by_det(nd);
+            for (const auto& c : candidates) candidates_by_det[c.det].push_back(c.track);
+            std::vector<int> visited(nt, -1);
+            // Detections are given their turn to claim/steal a track in order of their OWN best candidate's
+            // score, strongest first — not raw array index order (no v1 equivalent to compare against, a
+            // general weighted-bipartite-matching concern independent of it). tryAugment's "steal" semantics
+            // make this an augmenting-path heuristic for maximum-CARDINALITY matching, not a true
+            // maximum-weight one (see track_assignment_method's "hungarian" option above for that) — the
+            // actual assignment it converges to depends on which detection gets to claim first. With raw
+            // index order, a detection with only a mediocre, borderline-score match could claim a track
+            // before a DIFFERENT detection with a far stronger, more confident match for that SAME track
+            // ever gets a turn — the strong match then has to settle for stealing (if tryAugment's recursion
+            // finds a free alternative for the mediocre one) or its own second-best. Processing
+            // strongest-match-first means the most confident pairing anywhere is locked in before any
+            // weaker, more ambiguous one gets to contest it.
+            std::vector<double> det_best_score(nd, -std::numeric_limits<double>::infinity());
+            for (const auto& c : candidates) det_best_score[c.det] = std::max(det_best_score[c.det], c.score);
+            std::vector<size_t> det_order(nd);
+            std::iota(det_order.begin(), det_order.end(), 0);
+            std::stable_sort(det_order.begin(), det_order.end(),
+                [&](size_t a, size_t b) { return det_best_score[a] > det_best_score[b]; });
+            int token = 0;
+            for (size_t di : det_order) {
+                ++token;
+                tryAugment(di, candidates_by_det, track_to_det, det_to_track, visited, token);
+            }
         }
 
         // LiDAR-only semantic fallback — GLOBAL resolution (see pixelCandidates()'s own comment on why: a YOLO
@@ -1902,7 +2014,7 @@ private:
                     tr.stationary_ticks, tr.confirmed ? 1 : 0, jump,
                     tr.last_obs.x, tr.last_obs.y, tr.last_obs.z, tr.size.x, tr.size.y, tr.size.z);
             }
-            decaySemanticEvidence(track_ids[ti], tr, eff_class, d.bbox.size, det_track_id);
+            decaySemanticEvidence(track_ids[ti], tr, eff_class, d.bbox.size, det_track_id, detectionMask(d) != "L");
             matched_ids.insert(track_ids[ti]);
 
             // Static-track aging (see this class's own constructor comment): counts consecutive ticks this track
@@ -1911,7 +2023,7 @@ private:
             // one slow tick after a burst. Uses stationary_speed_thresh_ (0.10), not the dynamic label's own,
             // higher bar (0.35) — a track creeping at 0.2 m/s is neither "dynamic" nor "truly stopped".
             const double speed = planarSpeed(tr.kf.vel());
-            const bool exempt = isDynamicClass(tr.best_class) || track_publish_stationary_;
+            const bool exempt = potentiallyDynamic(tr) || track_publish_stationary_;
             tr.stationary_ticks = (!exempt && speed < stationary_speed_thresh_) ? tr.stationary_ticks + 1 : 0;
 
             // KF-velocity confidence (v1 PATH 3a, see the constructor's own comment): rolling mean/std of this
@@ -2143,7 +2255,15 @@ private:
                                     std::abs(tr.size.z - dynamic_target_size_.z()) < dynamic_size_tolerance_.z();
                 if (!sizeOk) dynamic = false;
             }
-            const bool exempt = isDynamicClass(tr.best_class) || track_publish_stationary_;
+            // motion-earned PD (see track_motion_pd_min_dynamic_ticks): counts only the unclassified history
+            if (!tr.best_class.empty()) {
+                tr.motion_dynamic_ticks = 0;
+                tr.motion_pd = false;
+            } else if (dynamic && motion_pd_min_dynamic_ticks_ > 0 &&
+                       ++tr.motion_dynamic_ticks >= motion_pd_min_dynamic_ticks_) {
+                tr.motion_pd = true;
+            }
+            const bool exempt = potentiallyDynamic(tr) || track_publish_stationary_;
             // Suppress only truly-stationary (below the LOWER bar), unclassified tracks — a track above that bar
             // but below the dynamic-label bar (e.g. 0.2 m/s) still publishes, it just isn't "dynamic".
             if (!exempt && speed < stationary_speed_thresh_) continue;
@@ -2158,7 +2278,7 @@ private:
             // of collapsing into "static"; "static" is everything else, INCLUDING a track classified as a
             // non-whitelisted class (e.g. "chair") — that class still shows in the text label, it just doesn't
             // grant the potentially_dynamic exemption, same as v1.
-            const bool potentially_dynamic = !dynamic && isDynamicClass(tr.best_class);
+            const bool potentially_dynamic = !dynamic && potentiallyDynamic(tr);
             const char* status = dynamic ? "dynamic" : (potentially_dynamic ? "potentially_dynamic" : "static");
 
             vision_msgs::msg::Detection3D d;
@@ -2305,6 +2425,7 @@ private:
 
     std::string global_frame_;
     bool debug_lifecycle_{false};
+    std::string assignment_method_{"greedy_kuhn"};
     double veldir_gate_min_innovation_{0.30};
     double max_match_dist_{2.0}, max_match_speed_{8.0}, max_size_diff_{0.8}, min_size_diff_floor_{0.15};
     double w_pos_{1.0}, w_size_{0.35}, w_iou_{0.15}, w_prev_pos_{0.25}, w_prev_iou_{0.10}, min_match_score_{-2.5};
@@ -2315,6 +2436,7 @@ private:
     int dynamic_confirm_ticks_{3};
     int dynamic_confirm_ticks_unclassified_{8};
     int dynamic_confirm_ticks_unclassified_out_fov_{5};
+    int motion_pd_min_dynamic_ticks_{20};
     int first_class_static_confirm_ticks_{5};
     double decay_fov_border_frac_{0.10};
     int max_non_yolo_fov_border_frames_{15};

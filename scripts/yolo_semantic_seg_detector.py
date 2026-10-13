@@ -485,6 +485,15 @@ class YoloSemanticSegDetector(Node):
                     CompressedImage, det_img_topic + '/compressed', self.queue_size)
                 ctx.det_time_pub = self.create_publisher(
                     Float64, self.detection_time_topic_template.format(camera=name), 1)
+                # Warm-up: the first inference pays CUDA/cuDNN initialization (~2 s measured on the
+                # benchmark bags), which used to delay every class by that much at start-up. predict(),
+                # not track(), so ByteTrack's state stays clean.
+                t_warm = time.time()
+                ctx.det_model.predict(
+                    np.zeros((720, 1280, 3), dtype=np.uint8), classes=self.det_target_class_ids,
+                    conf=self.detection_score_threshold, imgsz=self.detection_inference_size, device=device,
+                    quantize=16 if self.use_half else None, verbose=False)
+                self.get_logger().info(f"[{name}] detection model warm-up: {(time.time() - t_warm) * 1000:.0f} ms")
 
             self.cameras[name] = ctx
 
