@@ -394,7 +394,8 @@ def _launch_setup(context, *args, **kwargs):
             output='screen',
             parameters=[
                 ParameterFile(os.path.join(pkg_dir, 'cfg', env_str, 'tracker.yaml'), allow_substs=True),
-                {'use_sim_time': use_sim_time, 'camera_names': camera_names},
+                {'use_sim_time': use_sim_time, 'camera_names': camera_names,
+                 'track_debug_lifecycle': LaunchConfiguration('tracker_debug_lifecycle').perform(context) == 'true'},
             ],
         ))
 
@@ -585,6 +586,9 @@ def generate_launch_description():
     env_arg = DeclareLaunchArgument(
         'env', default_value='indoor',
         description="Which cfg/<env>/ profile to use for every node in this launch: 'outdoor' or 'indoor'")
+    tracker_debug_lifecycle_arg = DeclareLaunchArgument(
+        'tracker_debug_lifecycle', default_value='false',
+        description="tracker_node diagnostics: log every track birth/deletion and why nearby tracks didn't match")
     camera_names_arg = DeclareLaunchArgument(
         'camera_names', default_value='',
         description="Comma-separated camera list overriding cfg/<env>/preprocessing.yaml's camera_names "
@@ -740,6 +744,7 @@ def generate_launch_description():
     return LaunchDescription([
         env_arg,
         camera_names_arg,
+        tracker_debug_lifecycle_arg,
         use_sim_time_arg,
         rviz_arg,
         enable_calibration_arg,

@@ -48,6 +48,7 @@ tracker_node:
     track_max_veldir_error_unconfirmed: 1.20   # v1: maxVelocityDirectionErrorConfirm_
     track_max_veldir_error_confirmed: 2.50     # v1: maxVelocityDirectionErrorTracked_
     track_max_veldir_error_relaxed: 3.00       # v1: the "Dynamic"/outside-FOV tiers, collapsed into one
+    track_veldir_gate_min_innovation: 0.30     # [m] no hard veldir rejection this close to the KF prediction (box-centroid jitter, not motion)
 
     # LiDAR-only-outside-FOV relaxation (v1: isLidarOnlyOutsideFovAssociation) — when BOTH the predicted and
     # current position are outside every camera's FOV AND neither side is classified (pure LiDAR, nothing to

@@ -400,6 +400,7 @@ struct Track {
     vision_msgs::msg::BoundingBox3D::_size_type size;   // latest matched detection's own size (no smoothing)
     geometry_msgs::msg::Quaternion orientation;          // latest matched detection's own orientation (unfiltered)
     geometry_msgs::msg::Point last_obs;                  // last matched detection's RAW position (v1's "previous observation" reference)
+    double last_obs_stamp = 0.0;                         // [s] stamp of last_obs — see velocityDirectionError()
     int hits = 0;               // total matches since creation (never reset by a miss)
     int missed_in_a_row = 0;
     bool confirmed = false;
@@ -669,6 +670,10 @@ public:
         max_veldir_error_unconfirmed_ = declare_parameter<double>("track_max_veldir_error_unconfirmed", 1.20);  // v1: maxVelocityDirectionErrorConfirm_
         max_veldir_error_confirmed_ = declare_parameter<double>("track_max_veldir_error_confirmed", 2.50);      // v1: maxVelocityDirectionErrorTracked_
         max_veldir_error_relaxed_ = declare_parameter<double>("track_max_veldir_error_relaxed", 3.00);          // v1: the "Dynamic"/outside-FOV tiers, collapsed
+        // [m] no hard velocity-direction rejection for a candidate this close to the KF prediction (see the
+        // association loop): ~half a person's width, the centroid shift between a partial and a full box of
+        // the same object.
+        veldir_gate_min_innovation_ = declare_parameter<double>("track_veldir_gate_min_innovation", 0.30);
 
         // LiDAR-only-outside-FOV association relaxation (v1: isLidarOnlyOutsideFovAssociation + the
         // outside-FOV-specific gates/bonuses) — ported per explicit request. When BOTH the predicted and the
@@ -804,6 +809,9 @@ public:
         // glim_ros2's BBOX dynamic-rejection mode already subscribes to (its own bbox_topic config, default
         // matches this default exactly) to strip dynamic/potentially-dynamic points out of its own map.
         obstacles_topic_ = declare_parameter<std::string>("track_obstacles_topic", "/perception/tracked_dynamic_obstacles");
+        // Diagnostics only: log every track birth (with nearby tracks and why each did not take the detection)
+        // and every deletion (with the reason). Off by default.
+        debug_lifecycle_ = declare_parameter<bool>("track_debug_lifecycle", false);
         pub_obstacles_ = create_publisher<jo_msgs::msg::ObstacleArray>(obstacles_topic_, rclcpp::QoS(10));
         // Point-cloud motion voting's own input (see the constructor's own comment above) — just the latest
         // message cached, matched against each tick's own detections by stamp (see parsePointsByDetection()).
@@ -913,8 +921,12 @@ private:
     // never an error (0.0) — direction is undefined for a near-zero vector, and small jitter around standing
     // still shouldn't look like a direction mismatch; one side stationary and the other not still contributes
     // the magnitude-difference term, just no direction term.
-    double velocityDirectionError(const Track& tr, const Eigen::Vector3d& obs_pos, double dt) const {
-        const double idt = 1.0 / std::max(dt, 1e-3);
+    // The implied ("observed") velocity is the displacement from last_obs over the time ELAPSED SINCE last_obs,
+    // not over this tick's dt: after k missed ticks the displacement spans k+1 ticks, and dividing it by one dt
+    // inflated the implied speed k+1-fold, so a briefly-occluded track rejected its own object on reappearance.
+    double velocityDirectionError(const Track& tr, const Eigen::Vector3d& obs_pos, double now, double dt) const {
+        const double elapsed = tr.last_obs_stamp > 0.0 ? now - tr.last_obs_stamp : dt;
+        const double idt = 1.0 / std::max(elapsed > 0.0 ? elapsed : dt, 1e-3);
         const double obs_vx = (obs_pos.x() - tr.last_obs.x) * idt, obs_vy = (obs_pos.y() - tr.last_obs.y) * idt;
         const double pred_vx = tr.kf.vel().x(), pred_vy = tr.kf.vel().y();
         const double obs_speed = std::hypot(obs_vx, obs_vy), pred_speed = std::hypot(pred_vx, pred_vy);
@@ -1383,6 +1395,11 @@ private:
 
         const size_t nt = track_ids.size(), nd = msg->detections.size();
         struct Cand { size_t det, track; double score; };
+        // track_debug_lifecycle: why each (track, detection) pair was NOT a candidate this tick
+        std::map<std::pair<size_t, size_t>, const char*> reject_reason;
+        auto noteReject = [&](size_t ti, size_t di, const char* why) {
+            if (debug_lifecycle_) reject_reason[{ti, di}] = why;
+        };
         std::vector<Cand> candidates;
         for (size_t ti = 0; ti < nt; ++ti) {
             Track& tr = tracks_.at(track_ids[ti]);
@@ -1411,11 +1428,11 @@ private:
                 const double gate_size = lidar_only_outside_fov ? outside_fov_max_size_diff_ : max_size_diff_;
 
                 const double predDist = std::hypot(c.x - predicted_pos[ti].x(), c.y - predicted_pos[ti].y());
-                if (predDist >= gate_dist) continue;
+                if (predDist >= gate_dist) { noteReject(ti, di, "dist"); continue; }
                 const double reqSpeed = predDist / std::max(dt, 1e-3);
-                if (reqSpeed >= gate_speed) continue;
+                if (reqSpeed >= gate_speed) { noteReject(ti, di, "speed"); continue; }
                 const double sizeDiff = relSizeDiff(tr.size, d.bbox.size, min_size_diff_floor_);
-                if (sizeDiff >= gate_size) continue;
+                if (sizeDiff >= gate_size) { noteReject(ti, di, "size"); continue; }
                 // Classified-track baseline size gate (no v1 equivalent): the check above compares the
                 // candidate against tr.size, the LATEST matched size — which can drift gradually tick-by-tick,
                 // never individually exceeding gate_size, while compounding into a large cumulative change.
@@ -1438,8 +1455,10 @@ private:
                 if (isDynamicClass(tr.best_class) && det_class.empty() && tr.yolo_x_width > 0.0 && tr.yolo_y_width > 0.0) {
                     const double bx = (d.bbox.size.x - tr.yolo_x_width) / std::max(tr.yolo_x_width, 0.01);
                     const double by = (d.bbox.size.y - tr.yolo_y_width) / std::max(tr.yolo_y_width, 0.01);
-                    if (bx > yolo_base_mismatch_thresh_ || by > yolo_base_mismatch_thresh_)
+                    if (bx > yolo_base_mismatch_thresh_ || by > yolo_base_mismatch_thresh_) {
+                        noteReject(ti, di, "yolo_base_growth");
                         continue;
+                    }
                 }
 
                 const Footprint curFp = footprintOf(c, d.bbox.center.orientation, d.bbox.size);
@@ -1449,17 +1468,28 @@ private:
 
                 // Velocity-direction gate + soft penalty (v1: computeVelocityDirectionError /
                 // passesVelocityDirectionGate — see this constructor's own comment on the three tiers).
-                const double velErr = velocityDirectionError(tr, Eigen::Vector3d(c.x, c.y, c.z), dt);
+                const double velErr = velocityDirectionError(tr, Eigen::Vector3d(c.x, c.y, c.z), stamp, dt);
                 const bool yolo_exempt = !det_class.empty() || !tr.best_class.empty();
                 double veldir_gate = tr.confirmed ? max_veldir_error_confirmed_ : max_veldir_error_unconfirmed_;
                 if (!inside_fov_pred || yolo_exempt) veldir_gate = std::max(veldir_gate, max_veldir_error_relaxed_);
-                if (velErr > veldir_gate) continue;
+                // Hard gate only for a candidate that is NOT already where the KF predicts the object to be: within
+                // track_veldir_gate_min_innovation of the prediction the implied velocity is dominated by centroid
+                // jitter (the same standing person alternates between a partial LiDAR-only box and the full fused
+                // box, whose centres differ by ~0.2-0.3 m = 2-3 m/s over one LiDAR tick), not by real motion, and
+                // rejecting it there spawned a duplicate track next to the real one. The soft velErr penalty in
+                // the score below still applies.
+                if (velErr > veldir_gate && predDist > veldir_gate_min_innovation_) {
+                    noteReject(ti, di, "veldir");
+                    continue;
+                }
 
                 // Natural-motion gate (v1: isNaturalMotion — see its own comment) — only for a track with no
                 // identity evidence of its own yet: not confirmed, not classified either side.
                 if (!tr.confirmed && !yolo_exempt &&
-                    !isNaturalMotion(tr, Eigen::Vector3d(c.x, c.y, c.z), predicted_pos[ti], inside_fov_curr))
+                    !isNaturalMotion(tr, Eigen::Vector3d(c.x, c.y, c.z), predicted_pos[ti], inside_fov_curr)) {
+                    noteReject(ti, di, "natural_motion");
                     continue;
+                }
 
                 // ID-swap guard (v1's own match_yolo_class_consistency_weight/yolo_track_assoc_bonus), two parts:
                 //  1) When BOTH sides carry semantic evidence this tick and it DISAGREES, this is almost certainly
@@ -1488,7 +1518,7 @@ private:
                 //     suspicious and this penalty simply does not apply.
                 double class_score = 0.0;
                 if (!det_class.empty() && !tr.best_class.empty()) {
-                    if (det_class != tr.best_class) continue;  // hard reject: conflicting semantic evidence
+                    if (det_class != tr.best_class) { noteReject(ti, di, "class"); continue; }  // hard reject: conflicting semantic evidence
                     class_score = class_match_bonus_;
                 } else if (det_class.empty() != tr.best_class.empty() && inside_fov_pred) {
                     class_score = -class_continuity_weight_ * (prevDist / gate_dist);
@@ -1505,7 +1535,7 @@ private:
                 // confirmed track's ordinary centroid jitter out there can lose to a nearby false competitor
                 // at a similar (now much wider) gate.
                 if (lidar_only_outside_fov) score += tr.confirmed ? outside_fov_confirmed_bonus_ : outside_fov_tentative_bonus_;
-                if (score < min_match_score_) continue;
+                if (score < min_match_score_) { noteReject(ti, di, "score"); continue; }
                 candidates.push_back({di, ti, score});
             }
         }
@@ -1650,6 +1680,7 @@ private:
             const geometry_msgs::msg::Point prev_obs = tr.last_obs;
             const bool was_unclassified = tr.best_class.empty();
             tr.last_obs = d.bbox.center.position;
+            tr.last_obs_stamp = stamp;
             // LiDAR-only semantic fallback — already resolved GLOBALLY above (one YOLO box -> one detection, not
             // one per track), just look this detection's own result up.
             const bool had_depth_class = !detectionClass(d).empty();
@@ -1808,10 +1839,29 @@ private:
             if (isDuplicateOfExistingTrack(d, track_ids, predicted_pos)) continue;
             Track tr;
             tr.id = next_id_++;
+            if (debug_lifecycle_) {
+                const auto& c = d.bbox.center.position;
+                std::string near;
+                for (size_t ti = 0; ti < nt; ++ti) {
+                    const double dist = std::hypot(predicted_pos[ti].x() - c.x, predicted_pos[ti].y() - c.y);
+                    if (dist > 1.5) continue;
+                    const Track& o = tracks_.at(track_ids[ti]);
+                    const auto r = reject_reason.find({ti, di});
+                    const bool matched_other = track_to_det[ti] >= 0;
+                    near += " | #" + std::to_string(o.id) + " d=" + std::to_string(dist).substr(0, 4) +
+                            " cls='" + o.best_class + "' size=" + std::to_string(o.size.x).substr(0, 4) + "x" +
+                            std::to_string(o.size.y).substr(0, 4) + " base=" + std::to_string(o.yolo_x_width).substr(0, 4) +
+                            "x" + std::to_string(o.yolo_y_width).substr(0, 4) + " why=" +
+                            (r != reject_reason.end() ? r->second : (matched_other ? "matched_other" : "candidate_unassigned"));
+                }
+                RCLCPP_INFO(get_logger(), "[lifecycle] spawn #%d det_class='%s' size=%.2fx%.2f at (%.2f,%.2f)%s", tr.id,
+                            detectionClass(d).c_str(), d.bbox.size.x, d.bbox.size.y, c.x, c.y, near.c_str());
+            }
             tr.kf.init(Eigen::Vector3d(d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.center.position.z), p_init_);
             tr.size = d.bbox.size;
             tr.orientation = d.bbox.center.orientation;
             tr.last_obs = d.bbox.center.position;
+            tr.last_obs_stamp = stamp;
             tr.hits = 1;
             // Same LiDAR-only fallback as the matched branch above (already resolved GLOBALLY) — a brand-new
             // track beyond the depth camera's range should be able to pick up its YOLO class immediately too,
@@ -1832,6 +1882,10 @@ private:
             const int effective_max_missed = isDynamicClass(it->second.best_class) ? max_missed_classified_ : max_missed_;
             const bool dead = it->second.missed_in_a_row > effective_max_missed ||
                               it->second.stationary_ticks > track_stationary_max_ticks_;
+            if (dead && debug_lifecycle_)
+                RCLCPP_INFO(get_logger(), "[lifecycle] delete #%d cls='%s' hits=%d missed=%d/%d stationary=%d/%d", it->first,
+                            it->second.best_class.c_str(), it->second.hits, it->second.missed_in_a_row, effective_max_missed,
+                            it->second.stationary_ticks, track_stationary_max_ticks_);
             it = dead ? tracks_.erase(it) : std::next(it);
         }
 
@@ -2028,6 +2082,8 @@ private:
     }
 
     std::string global_frame_;
+    bool debug_lifecycle_{false};
+    double veldir_gate_min_innovation_{0.30};
     double max_match_dist_{2.0}, max_match_speed_{8.0}, max_size_diff_{0.8}, min_size_diff_floor_{0.15};
     double w_pos_{1.0}, w_size_{0.35}, w_iou_{0.15}, w_prev_pos_{0.25}, w_prev_iou_{0.10}, min_match_score_{-2.5};
     int min_hits_{4}, max_missed_{5};
