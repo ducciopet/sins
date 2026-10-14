@@ -21,8 +21,9 @@
         max_match_range/max_match_speed/max_relative_size_diff_match). IoU2D uses each OBB's AXIS-ALIGNED
         world-frame footprint (the bounding rectangle of its rotated corners) — the natural generalization of
         v1's own x_width/y_width formula, which was already axis-aligned since v1's boxes carried no orientation.
-        Global assignment is v1's own augmenting-path bipartite matching (Kuhn's algorithm) over candidates sorted
-        best-score-first — see assignCandidates() — not just a greedy nearest-neighbour pick.
+        Global assignment is a max-weight bipartite matching (Hungarian, hungarianMinCost) over the scored
+        candidates; v1's own augmenting-path matching (Kuhn's algorithm, best-score-first) stays available as
+        track_assignment_method: greedy_kuhn — not just a greedy nearest-neighbour pick either way.
 
       - LIFECYCLE: hits accumulate on every match (never reset by a miss, matching v1's own hitStreak_ handling);
         a track is CONFIRMED once hits >= track_min_hits AND (found during the broader v1 review that produced
@@ -480,7 +481,7 @@ bool tryAugment(size_t det, const std::vector<std::vector<size_t>>& candidates_b
     return false;
 }
 
-// Weighted bipartite matching (Kuhn-Munkres/Hungarian, O(n^3)) — ablation alternative to tryAugment's
+// Weighted bipartite matching (Kuhn-Munkres/Hungarian, O(n^3)) — the default assignment; alternative to tryAugment's
 // max-CARDINALITY heuristic above (see track_assignment_method and its call site's own comment). Minimizes
 // total cost over a SQUARE matrix; the caller pads a rectangular (nt x nd) problem to n = max(nt, nd) and
 // marks non-candidate pairs with a sentinel the real -score costs never reach, so the solver only uses one
@@ -912,12 +913,12 @@ public:
         // Diagnostics only: log every track birth (with nearby tracks and why each did not take the detection)
         // and every deletion (with the reason). Off by default.
         debug_lifecycle_ = declare_parameter<bool>("track_debug_lifecycle", false);
-        // "greedy_kuhn" (default): v1-compatible max-CARDINALITY augmenting-path heuristic (tryAugment).
-        // "hungarian": ablation — true max-weight bipartite matching (hungarianMinCost) over the SAME
-        // per-pair scores/gates above; isolates whether global weight-optimality in the assignment alone
-        // (nothing else in the tracker changes) moves MOTA/IDF1, independent of the occlusion-reasoning
-        // contribution. See this file's header and hungarianMinCost's own comment.
-        assignment_method_ = declare_parameter<std::string>("track_assignment_method", "greedy_kuhn");
+        // "hungarian" (default): true max-weight bipartite matching (hungarianMinCost) over the SAME
+        // per-pair scores/gates above. On the mocap benchmark it matches greedy_kuhn's MOTA/IDF1 within
+        // replay noise and has 2 fewer ID switches in every comparison (eval/STATUS.md, 2026-10-14).
+        // "greedy_kuhn": v1-compatible max-CARDINALITY augmenting-path heuristic (tryAugment), kept for
+        // the ablation. See this file's header and hungarianMinCost's own comment.
+        assignment_method_ = declare_parameter<std::string>("track_assignment_method", "hungarian");
         pub_obstacles_ = create_publisher<jo_msgs::msg::ObstacleArray>(obstacles_topic_, rclcpp::QoS(10));
         // Point-cloud motion voting's own input (see the constructor's own comment above) — just the latest
         // message cached, matched against each tick's own detections by stamp (see parsePointsByDetection()).
@@ -1755,7 +1756,7 @@ private:
         // track_assignment_method's own comment in the constructor for the two methods below.
         std::vector<int> track_to_det(nt, -1), det_to_track(nd, -1);
         if (assignment_method_ == "hungarian") {
-            // Ablation: TRUE max-weight bipartite matching over the same candidates (hungarianMinCost,
+            // Default: TRUE max-weight bipartite matching over the same candidates (hungarianMinCost,
             // see its own comment). Build an (n x n) cost matrix, n = max(nt, nd): a real candidate pair
             // gets -score (Hungarian minimizes); every OTHER real-track/real-detection pair gets FORBIDDEN
             // (it never passed the gates above, so it must never be used); padding rows/columns (the
@@ -1776,7 +1777,7 @@ private:
                 det_to_track[static_cast<size_t>(di)] = static_cast<int>(ti);
             }
         } else {
-            // Default: Kuhn's augmenting-path matching over the best-first candidate list.
+            // Ablation (greedy_kuhn): Kuhn's augmenting-path matching over the best-first candidate list.
             std::vector<std::vector<size_t>> candidates_by_det(nd);
             for (const auto& c : candidates) candidates_by_det[c.det].push_back(c.track);
             std::vector<int> visited(nt, -1);
@@ -2425,7 +2426,7 @@ private:
 
     std::string global_frame_;
     bool debug_lifecycle_{false};
-    std::string assignment_method_{"greedy_kuhn"};
+    std::string assignment_method_{"hungarian"};
     double veldir_gate_min_innovation_{0.30};
     double max_match_dist_{2.0}, max_match_speed_{8.0}, max_size_diff_{0.8}, min_size_diff_floor_{0.15};
     double w_pos_{1.0}, w_size_{0.35}, w_iou_{0.15}, w_prev_pos_{0.25}, w_prev_iou_{0.10}, min_match_score_{-2.5};
