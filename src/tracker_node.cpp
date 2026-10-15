@@ -754,6 +754,11 @@ public:
         // inside the camera FOV — outside it, YOLO cannot confirm anything anyway, so absence of evidence isn't
         // suspicious there and this term is simply not applied, see the association loop).
         class_continuity_weight_ = declare_parameter<double>("track_class_continuity_weight", 0.5);
+        // Camera-only fragment guard (see the association loop): a candidate with NO LiDAR point (provenance mask
+        // without "L") is dropped for a track that also has a LiDAR-backed candidate within this distance [m] of
+        // it this tick — the two are one object split by the fusion, and the camera-only half is YOLO-mask depth
+        // that landed on the background. 0 disables.
+        camera_fragment_dist_ = declare_parameter<double>("track_camera_fragment_dist", 0.6);
 
         // Velocity-direction gate + soft penalty (v1: computeVelocityDirectionError/passesVelocityDirectionGate),
         // ported per explicit request — a candidate whose IMPLIED motion (from the track's last raw observation
@@ -1750,6 +1755,30 @@ private:
                 candidates.push_back({di, ti, score});
             }
         }
+        // Camera-only fragment guard (track_camera_fragment_dist). Seen on a person leaving the camera FOV
+        // sideways: the fusion split her into a LiDAR-only box on her and a camera-only box 0.4 m away on the
+        // background, which carried this tick's YOLO class. The class bonus (and the class-continuity penalty on
+        // the unclassified LiDAR box) made the track take the fragment, slide onto the furniture behind it and
+        // lose the person, who was reborn as a new track. A person in LiDAR range is always hit by the LiDAR, so
+        // when the same track also has a LiDAR-backed candidate right next to the camera-only one, the
+        // camera-only one is not the object.
+        if (camera_fragment_dist_ > 0.0) {
+            auto hasLidar = [&](size_t di) { const std::string m = detectionMask(msg->detections[di]); return !m.empty() && m[0] == 'L'; };
+            std::vector<char> drop(candidates.size(), 0);
+            for (size_t a = 0; a < candidates.size(); ++a) {
+                if (hasLidar(candidates[a].det)) continue;
+                const auto& ca = msg->detections[candidates[a].det].bbox.center.position;
+                for (const auto& b : candidates) {
+                    if (b.track != candidates[a].track || !hasLidar(b.det)) continue;
+                    const auto& cb = msg->detections[b.det].bbox.center.position;
+                    if (std::hypot(ca.x - cb.x, ca.y - cb.y) < camera_fragment_dist_) { drop[a] = 1; break; }
+                }
+                if (drop[a]) noteReject(candidates[a].track, candidates[a].det, "camera_fragment");
+            }
+            size_t k = 0;
+            for (size_t a = 0; a < candidates.size(); ++a) if (!drop[a]) candidates[k++] = candidates[a];
+            candidates.resize(k);
+        }
         std::sort(candidates.begin(), candidates.end(), [](const Cand& a, const Cand& b) { return a.score > b.score; });
 
         // Global assignment (v1's own assignMatchesGlobally/tryAugmentDetectionMatch) — see
@@ -2455,6 +2484,7 @@ private:
     double first_class_min_jump_{0.08};
     double class_match_bonus_{0.25};
     double class_continuity_weight_{0.5};
+    double camera_fragment_dist_{0.6};
     double match_veldir_weight_{0.12};
     double max_veldir_error_unconfirmed_{1.20}, max_veldir_error_confirmed_{2.50}, max_veldir_error_relaxed_{3.00};
     double outside_fov_max_match_dist_{3.5}, outside_fov_max_match_speed_{4.0}, outside_fov_max_size_diff_{1.2};
