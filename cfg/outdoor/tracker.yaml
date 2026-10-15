@@ -39,6 +39,7 @@ tracker_node:
     # degrades gracefully.
     track_class_continuity_weight: 0.5
     track_camera_fragment_dist: 0.6    # [m] drop a camera-only candidate when the same track has a LiDAR-backed one this close (fusion split, YOLO-mask depth on the background); 0 disables
+    track_class_ownership: true        # a detection carrying a class is kept from any unclassified track that scores it lower than the best track of that class
     # FOV-gated: only applied when the TRACK's predicted position is inside a camera's FOV — outside it, YOLO
     # could not have confirmed anything anyway, so absence of fresh evidence there isn't suspicious (v1: this
     # is exactly when match_yolo_class_consistency_weight applies too, see tracker_node.cpp).

@@ -759,6 +759,9 @@ public:
         // it this tick — the two are one object split by the fusion, and the camera-only half is YOLO-mask depth
         // that landed on the background. 0 disables.
         camera_fragment_dist_ = declare_parameter<double>("track_camera_fragment_dist", 0.6);
+        // Class ownership guard (see the association loop): a detection carrying a class is kept from any
+        // unclassified track that scores it lower than the best track already classified with that class.
+        class_ownership_ = declare_parameter<bool>("track_class_ownership", true);
 
         // Velocity-direction gate + soft penalty (v1: computeVelocityDirectionError/passesVelocityDirectionGate),
         // ported per explicit request — a candidate whose IMPLIED motion (from the track's last raw observation
@@ -1779,6 +1782,32 @@ private:
             for (size_t a = 0; a < candidates.size(); ++a) if (!drop[a]) candidates[k++] = candidates[a];
             candidates.resize(k);
         }
+        // Class ownership guard (track_class_ownership). The assignment maximises the number of pairs first,
+        // so a classified track can be pushed onto a poor leftover when an unclassified rival has only one
+        // candidate: the detection carrying the class. Seen with a person walking past a static object: the
+        // object's track, dragged towards her by merged person+object boxes, took her "person" box (score
+        // -0.47) while her own track, which scored that box +0.35, got a fragment (-0.72) and died. A detection
+        // carrying class X is therefore kept from every unclassified track that scores it lower than the best
+        // X-classified track does. A new person's own unclassified track keeps her box: it scores it higher.
+        if (class_ownership_) {
+            std::map<size_t, double> best_owner;  // det -> best score among tracks of the det's class
+            for (const auto& c : candidates) {
+                const std::string dc = detectionClass(msg->detections[c.det]);
+                if (dc.empty() || tracks_.at(track_ids[c.track]).best_class != dc) continue;
+                auto it = best_owner.find(c.det);
+                if (it == best_owner.end() || c.score > it->second) best_owner[c.det] = c.score;
+            }
+            size_t k = 0;
+            for (const auto& c : candidates) {
+                const auto it = best_owner.find(c.det);
+                if (it != best_owner.end() && tracks_.at(track_ids[c.track]).best_class.empty() && c.score < it->second) {
+                    noteReject(c.track, c.det, "class_owner");
+                    continue;
+                }
+                candidates[k++] = c;
+            }
+            candidates.resize(k);
+        }
         std::sort(candidates.begin(), candidates.end(), [](const Cand& a, const Cand& b) { return a.score > b.score; });
 
         // Global assignment (v1's own assignMatchesGlobally/tryAugmentDetectionMatch) — see
@@ -2485,6 +2514,7 @@ private:
     double class_match_bonus_{0.25};
     double class_continuity_weight_{0.5};
     double camera_fragment_dist_{0.6};
+    bool class_ownership_{true};
     double match_veldir_weight_{0.12};
     double max_veldir_error_unconfirmed_{1.20}, max_veldir_error_confirmed_{2.50}, max_veldir_error_relaxed_{3.00};
     double outside_fov_max_match_dist_{3.5}, outside_fov_max_match_speed_{4.0}, outside_fov_max_size_diff_{1.2};
