@@ -63,7 +63,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /jo_detector_v2/static_structures/wall_markers
+        Value: /sins/static_structures/wall_markers
       Value: true
 
     # Terna del robot: assi di base_link (X rosso = avanti, Y verde = sinistra, Z blu = su), lunghi 2 m, piu' i nomi dei
@@ -107,7 +107,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /jo_detector_v2/dbscan_detector/fused/boxes_markers
+        Value: /sins/dbscan_detector/fused/boxes_markers
       Value: true
 
     - Alpha: 1
@@ -138,7 +138,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /jo_detector_v2/dbscan_detector/fused/clusters
+        Value: /sins/dbscan_detector/fused/clusters
       Use Fixed Frame: true
       Use rainbow: true
       Value: false
@@ -154,7 +154,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /jo_detector_v2/tracker/tracks_markers
+        Value: /sins/tracker/tracks_markers
       Value: true
 
     # Punti (inlier RANSAC) da cui nascono i muri LiDAR, in odom: servono a capire perche' un muro e' lungo quanto e'.
@@ -186,7 +186,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /jo_detector_v2/static_structures/wall_points
+        Value: /sins/static_structures/wall_points
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
@@ -255,7 +255,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /jo_detector_v2/front_camera/depth_calibrated
+        Value: /sins/front_camera/depth_calibrated
       Use Fixed Frame: true
       Use rainbow: true
       Value: false
@@ -288,7 +288,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /jo_detector_v2/back_camera/depth_calibrated
+        Value: /sins/back_camera/depth_calibrated
       Use Fixed Frame: true
       Use rainbow: true
       Value: false
@@ -322,7 +322,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /jo_detector_v2/lidar/processed
+        Value: /sins/lidar/processed
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
@@ -355,7 +355,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /jo_detector_v2/front_camera/depth/processed
+        Value: /sins/front_camera/depth/processed
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
@@ -388,7 +388,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /jo_detector_v2/back_camera/depth/processed
+        Value: /sins/back_camera/depth/processed
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
@@ -404,7 +404,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /jo_detector_v2/dbscan_detector/boxes_markers
+        Value: /sins/dbscan_detector/boxes_markers
       Value: false
 
     # Punti dei cluster (spenti di default)
@@ -436,7 +436,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /jo_detector_v2/dbscan_detector/lidar/clusters
+        Value: /sins/dbscan_detector/lidar/clusters
       Use Fixed Frame: true
       Use rainbow: true
       Value: false
@@ -469,7 +469,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /jo_detector_v2/dbscan_detector/front_camera/clusters
+        Value: /sins/dbscan_detector/front_camera/clusters
       Use Fixed Frame: true
       Use rainbow: true
       Value: false
@@ -502,7 +502,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /jo_detector_v2/dbscan_detector/back_camera/clusters
+        Value: /sins/dbscan_detector/back_camera/clusters
       Use Fixed Frame: true
       Use rainbow: true
       Value: false

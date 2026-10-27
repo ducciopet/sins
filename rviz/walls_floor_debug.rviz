@@ -141,7 +141,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /jo_detector_v2/static_structures/wall_points
+        Value: /sins/static_structures/wall_points
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
@@ -181,7 +181,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /jo_detector_v2/front_camera/floor_points
+        Value: /sins/front_camera/floor_points
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
@@ -214,7 +214,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /jo_detector_v2/back_camera/floor_points
+        Value: /sins/back_camera/floor_points
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
@@ -255,7 +255,7 @@ Visualization Manager:
         Filter size: 10
         History Policy: Keep Last
         Reliability Policy: Best Effort
-        Value: /jo_detector_v2/lidar/gseg3d_ground
+        Value: /sins/lidar/gseg3d_ground
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
@@ -276,7 +276,7 @@ Visualization Manager:
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
-        Value: /jo_detector_v2/static_structures/wall_markers
+        Value: /sins/static_structures/wall_markers
       Value: true
 
   Enabled: true

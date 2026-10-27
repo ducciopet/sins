@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""YOLO instance-segmentation + tracking node — jo_detector_v2's Phase 2
+"""YOLO instance-segmentation + tracking node — sins's Phase 2
 prototype (see ../README.md's phase plan: "replace YOLOv11 (bounding boxes)
 with a YOLO segmentation model"). This node gets segmentation + per-instance
 tracking working and publishing on EVERY camera in camera_names; it does NOT
@@ -83,13 +83,13 @@ got only one of.
 
 Layout: the NODE is yolo_seg_track_node.py, in src/ alongside every other
 node's source (preprocessing_node.cpp, static_structures_node.cpp,
-calibration_icp_node.cpp) and installed to lib/jo_detector_v2/ like
+calibration_icp_node.cpp) and installed to lib/sins/ like
 their executables — that's the thin entrypoint ros2 run actually invokes.
 This file is the SCRIPT it wraps: the detection/tracking implementation,
-under scripts/ (share/jo_detector_v2/scripts/ once installed, found
+under scripts/ (share/sins/scripts/ once installed, found
 at runtime via get_package_share_directory — see yolo_seg_track_node.py).
 weights_path/class_names_path below are resolved the same way, against
-share/jo_detector_v2/ (weights/ and cfg/ are their own top-level
+share/sins/ (weights/ and cfg/ are their own top-level
 install destinations, not installed next to scripts/).
 """
 
@@ -216,8 +216,8 @@ class YoloSegTrackDetector(Node):
         # 'weights/yolo11n-seg.pt', 'cfg/coco.names') — resolved against the
         # PACKAGE SHARE dir, not this file's own install dir (lib/), since
         # weights/ and cfg/ are their own install(DIRECTORY ...)
-        # destinations under share/jo_detector_v2/. See file header.
-        pkg_share = get_package_share_directory('jo_detector_v2')
+        # destinations under share/sins/. See file header.
+        pkg_share = get_package_share_directory('sins')
         self.weights_path = os.path.join(pkg_share, self.weights_path)
         self.class_names_path = os.path.join(pkg_share, self.class_names_path)
         self.use_half = (device == "cuda")

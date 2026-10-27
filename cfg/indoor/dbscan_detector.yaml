@@ -7,8 +7,8 @@ dbscan_detector_node:
     # preprocessing.yaml, so all nodes agree on the same list.
     # -----------------------------------------------------------------------
     global_frame: odom
-    lidar_topic: /jo_detector_v2/lidar/processed
-    camera_topic_template: /jo_detector_v2/{camera}/depth/processed
+    lidar_topic: /sins/lidar/processed
+    camera_topic_template: /sins/{camera}/depth/processed
     odom_topic: /odometry/filtered  # only used for the robot position (range for the adaptive eps)
 
     # "yaw": box whose z axis is the LOCAL up (the normal of the nearest floor plane fitted by
@@ -67,7 +67,7 @@ dbscan_detector_node:
     yolo_refine_min_retention: 0.35   # the leaf-bounded cut must keep at least this fraction of the fused object's own pre-cut points, on top of the absolute camera_min_points floor — rejects a match that only grabs a thin, barely-representative sliver of the object (v1 equivalent in spirit: dynamicDetector.cpp's yoloPointFractionThresh_/sparseLargeBox)
     yolo_refine_keep_rest: true       # false = drop the points outside the region instead of re-clustering them
     leaves_enabled: true              # YOLO leaves (preprocessing_node) are used as region priors to refine the fused boxes
-    leaves_topic_template: /jo_detector_v2/{camera}/semantic_leaves
+    leaves_topic_template: /sins/{camera}/semantic_leaves
     fusion_enabled: true
     # Matching / nesting metric. "footprint" (in use): mutual best match by footprint IoU (rotated rectangles, each inflated by
     # fusion_margin, gated by the height overlap fusion_z_overlap), nested = footprint containment >= fusion_nest_thresh AND height

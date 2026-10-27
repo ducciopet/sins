@@ -1,4 +1,8 @@
-# jo_detector_v2
+# SINS: Still Is Not Static
+
+Dynamic and potentially-dynamic obstacle detection and tracking from LiDAR and RGB-D, with a three-state label per
+track: DYNAMIC (moving), POTENTIALLY_DYNAMIC (standing still but able to move, e.g. a person) and STATIC. ROS 2
+package `sins` (named `jo_detector_v2` until 2026-10-26; topics were `/jo_detector_v2/...`, now `/sins/...`).
 
 Ground-up rewrite of [`jo_detector`](../jo_detector), built one
 stage at a time. `jo_detector` is untouched and stays the deployed
@@ -114,13 +118,13 @@ reference: `docs/framework_architecture.md`.
 `jo_detector/scripts/wall_detector/wallDetector.{h,cpp}` (own
 executable, own `rclcpp::spin()`, no coupling to `preprocessing_node`'s own
 callbacks, exactly like the original's `dynamicDetector`/`wall_detector_node`
-split, which `jo_detector_v2` didn't have until this pass — wall/floor
+split, which `sins` didn't have until this pass — wall/floor
 detection used to run inline inside `preprocessing_node`'s own LiDAR
 callback). Two deliberate differences from the original: (1) it reads
 `preprocessing_node`'s already-voxel-downsampled — but NOT range/ground-
 cropped — LiDAR and per-camera depth clouds
-(`/jo_detector_v2/lidar/voxelized_sensor`,
-`/jo_detector_v2/<camera>/depth/voxelized_sensor`) instead of
+(`/sins/lidar/voxelized_sensor`,
+`/sins/<camera>/depth/voxelized_sensor`) instead of
 re-subscribing to raw sensor topics and re-voxelizing itself, so the
 expensive voxel-grid pass happens exactly once, shared; its own range crop
 still happens on the cheap, already-downsampled centroids. (2) floor is a
@@ -135,7 +139,7 @@ LiDAR's 360°, consistent-height scan is the better source for vertical
 walls across the whole range, while a downward-angled depth camera sees
 the floor immediately ahead at far higher density than the LiDAR's own
 sparse near-field rings, which is what actually matters for catching a
-slope early. Publishes `/jo_detector_v2/static_structures/wall_markers`
+slope early. Publishes `/sins/static_structures/wall_markers`
 (`MarkerArray`, `ns="wall_bbox"` + `ns="floor"`), which `preprocessing_node`
 parses back into filtering planes (`onWallMarkers()`) and rviz subscribes
 to directly. See `docs/framework_architecture.md` §5.
@@ -212,7 +216,7 @@ list param, default `["front_camera"]`, this robot's cfg sets
 `["front_camera", "back_camera"]`) drives construction of one `CameraStream`
 per name in `preprocessing_node`'s constructor — each with its own topics,
 intrinsics, cached TF and publishers
-(`/jo_detector_v2/<name>/depth/{cloud,processed,voxelized_sensor}`) —
+(`/sins/<name>/depth/{cloud,processed,voxelized_sensor}`) —
 and one `CameraSource` per name in `static_structures_node`'s own constructor,
 reading that last topic. Adding a camera is a cfg change, not a code
 change, as long as it follows the same `/<name>/camera/...` topic-naming
@@ -225,7 +229,7 @@ automatically).
 
 **Wall registry**: persistent tracking across scans, ported from
 `jo_detector/wall_detector_node`'s `WallBBoxRegistry` — see
-`include/jo_detector_v2/wall_registry.hpp` and
+`include/sins/wall_registry.hpp` and
 `docs/framework_architecture.md` §5. Lives in `static_structures_node` now (not
 `preprocessing_node`, see above). A fresh RANSAC detection merges into a
 matching existing entry (EMA-extend its length/height, EMA-blend its

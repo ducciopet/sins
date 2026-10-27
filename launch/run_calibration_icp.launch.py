@@ -21,7 +21,7 @@ def _load_node_params(config_path, node_name):
 
 
 def _launch_setup(context, *args, **kwargs):
-    pkg_dir = get_package_share_directory('jo_detector_v2')
+    pkg_dir = get_package_share_directory('sins')
     env = LaunchConfiguration('env')
 
     # cfg/<env>/calibration_icp.yaml (see cfg/README-equivalent notes in
@@ -67,7 +67,7 @@ def _launch_setup(context, *args, **kwargs):
     camera_frame_initial_guess = robot_tf_camera_frame if robot_tf_camera_frame else yaml_camera_frame_initial_guess
 
     calibration_node = Node(
-        package='jo_detector_v2',
+        package='sins',
         executable='calibration_icp_node',
         name='calibration_icp_node',
         output='screen',

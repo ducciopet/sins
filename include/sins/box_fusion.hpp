@@ -2,14 +2,14 @@
 // Geometry helpers for fusing oriented boxes from different sensors: rotated-footprint overlap, height overlap,
 // and a range-banded voxel-centroid filter used to bring a merged point set back to the sensors' own density.
 
-#include "jo_detector_v2/cluster_obb.hpp"
+#include "sins/cluster_obb.hpp"
 
 #include <array>
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
 
-namespace jo_detector_v2 {
+namespace sins {
 
 // Footprint of a box on the horizontal plane (its first two axes), counter-clockwise, inflated by `margin` per side.
 inline std::vector<Eigen::Vector2d> obbFootprint(const Obb& b, double margin) {
@@ -194,4 +194,4 @@ inline std::vector<Eigen::Vector3f> voxelCentroidBands(const std::vector<Eigen::
     return out;
 }
 
-}  // namespace jo_detector_v2
+}  // namespace sins

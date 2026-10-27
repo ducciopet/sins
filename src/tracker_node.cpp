@@ -240,15 +240,15 @@
     for a weaker, projection-only match — exactly what this whole session's ID-swap hardening has been guarding
     against.
 
-    Subscribes:  /jo_detector_v2/dbscan_detector/fused/detections3d   vision_msgs/Detection3DArray
-    Publishes:   /jo_detector_v2/tracker/tracks                       vision_msgs/Detection3DArray
+    Subscribes:  /sins/dbscan_detector/fused/detections3d   vision_msgs/Detection3DArray
+    Publishes:   /sins/tracker/tracks                       vision_msgs/Detection3DArray
                  (id = "track_<n>", results[0] = {class_id: "dynamic"|"static", score: horizontal speed [m/s]},
                  results[0].pose.pose.position = (vx, vy, vz) [m/s], vz unused for classification — same "stash
                  extra numbers in the unused pose field" convention jo_detector's own YOLO detection callback
                  uses for pixel coords; results[1] = {class_id: <YOLO class name>, score: vote fraction}, present
                  only once a YOLO leaf has ever refined this track. Only CONFIRMED, matched-this-tick, non-static
                  (or class-exempt) tracks are published — see STATIC TRACKS MUST DIE above.
-                 /jo_detector_v2/tracker/tracks_markers                visualization_msgs/MarkerArray
+                 /sins/tracker/tracks_markers                visualization_msgs/MarkerArray
                  (box edges + a velocity arrow + an id/[DYN|POT|STA] tag/class/speed label — dynamic=blue,
                  potentially_dynamic=green, static=neutral grey, v1 parity, see appendTrackMarkers()'s own
                  comment)
@@ -651,7 +651,7 @@ public:
         // points, corroborating (not replacing) the plain speed check for a track with no classification
         // evidence of its own — see the matched-branch comment on how this, kf_vel_confident, and the plain
         // speed check combine. Needs dbscan_detector_node's fused/clusters cloud (det_idx field).
-        fused_clusters_topic_ = declare_parameter<std::string>("fused_clusters_topic", "/jo_detector_v2/dbscan_detector/fused/clusters");
+        fused_clusters_topic_ = declare_parameter<std::string>("fused_clusters_topic", "/sins/dbscan_detector/fused/clusters");
         point_vote_thresh_ = declare_parameter<double>("track_point_vote_thresh", 0.7);         // v1: dynaVoteThresh_
         point_vote_max_points_ = declare_parameter<int>("track_point_vote_max_points", 500);    // cap — brute-force nearest-neighbor is O(n*m); v1 never capped this (its own clusters were smaller), this file's can be larger (LiDAR walls, etc.)
         point_vote_max_age_ = declare_parameter<double>("point_vote_max_age", 0.5);  // [s] ignore a stale clusters cloud (same convention as yolo2d_max_age)
@@ -912,8 +912,8 @@ public:
                 [cam_ptr](const vision_msgs::msg::Detection2DArray::ConstSharedPtr& msg) { cam_ptr->latest_2d = msg; });
         }
 
-        pub_tracks_ = create_publisher<vision_msgs::msg::Detection3DArray>("/jo_detector_v2/tracker/tracks", rclcpp::QoS(10));
-        pub_markers_ = create_publisher<visualization_msgs::msg::MarkerArray>("/jo_detector_v2/tracker/tracks_markers", rclcpp::QoS(10));
+        pub_tracks_ = create_publisher<vision_msgs::msg::Detection3DArray>("/sins/tracker/tracks", rclcpp::QoS(10));
+        pub_markers_ = create_publisher<visualization_msgs::msg::MarkerArray>("/sins/tracker/tracks_markers", rclcpp::QoS(10));
         // jo_msgs/ObstacleArray — see the file header's own comment: the pre-existing stable interface
         // glim_ros2's BBOX dynamic-rejection mode already subscribes to (its own bbox_topic config, default
         // matches this default exactly) to strip dynamic/potentially-dynamic points out of its own map.
@@ -936,7 +936,7 @@ public:
             fused_clusters_topic_, rclcpp::SensorDataQoS(),
             [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) { latest_clusters_ = msg; });
         sub_ = create_subscription<vision_msgs::msg::Detection3DArray>(
-            "/jo_detector_v2/dbscan_detector/fused/detections3d", rclcpp::QoS(10),
+            "/sins/dbscan_detector/fused/detections3d", rclcpp::QoS(10),
             [this](const vision_msgs::msg::Detection3DArray::ConstSharedPtr& msg) { onFused(msg); });
 
         RCLCPP_INFO(get_logger(), "tracker_node ready: max_match_dist=%.2f max_match_speed=%.2f min_hits=%d max_missed=%d max_missed_classified=%d",

@@ -3,7 +3,7 @@
 eval_tracking.py
 ------------------
 Compares a prediction JSON (produced by extract_obstacles.py, from EITHER
-jo_detector v1 or jo_detector_v2 — same schema, see that file's
+jo_detector v1 or sins — same schema, see that file's
 own header) against a hand-annotated ground truth JSON (waypoint-based, see
 GT_SCHEMA.md), and reports:
 

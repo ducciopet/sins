@@ -6,7 +6,7 @@
     (own executable, own node, spun independently via rclcpp::spin, no
     coupling to preprocessing_node's own callbacks/executor): same iterative
     RANSAC, same PCA refitPlane, same WallBBoxRegistry persistent tracking
-    (include/jo_detector_v2/wall_registry.hpp), same "detect in the
+    (include/sins/wall_registry.hpp), same "detect in the
     sensor's own frame, transform only the small set of FOUND boxes/planes
     afterward" design as the original's pointCloudCallback.
 
@@ -70,7 +70,7 @@
     into planes, the "only call registry update() when this callback found
     at least one wall" quirk — is intentionally identical to the original.
 
-    Published: /jo_detector_v2/static_structures/wall_markers
+    Published: /sins/static_structures/wall_markers
     (visualization_msgs/MarkerArray) — ns="wall_bbox" (CUBE per tracked
     wall, position=center/orientation=rotation/scale=size, exactly the
     original's wire format) plus one ns="floor" CUBE slab PER CAMERA
@@ -82,14 +82,14 @@
 
     Also published, raw RANSAC inlier points behind the boxes/plane above
     (DetectionResult::wall_points_global/floor_points_global — debug-only,
-    nothing subscribes to these for logic): /jo_detector_v2/
+    nothing subscribes to these for logic): /sins/
     static_structures/wall_points (LiDAR, all wall planes this scan combined —
     walls only ever come from LiDAR, see the split above) and
-    /jo_detector_v2/<camera>/floor_points (one PER CAMERA, that
+    /sins/<camera>/floor_points (one PER CAMERA, that
     camera's own RANSAC floor detection this callback — NOT the
     EMA-tracked floor_plane_global, its raw per-frame input instead).
 
-    Also, per camera, /jo_detector_v2/<camera>/depth_calibrated: that
+    Also, per camera, /sins/<camera>/depth_calibrated: that
     camera's own INPUT points (same `pts` GSeg3D/RANSAC both consume, no
     filtering beyond finite-check), placed via T_global_cam — the SAME
     transform GSeg3D/wall_points/floor_points use, correct for that
@@ -119,7 +119,7 @@
     reaches ground the cameras' limited FOV never sees at all, e.g. behind
     the robot). One shared runGseg3d() for both — see its own comment for
     why publishers are passed in rather than read off a CameraSource.
-    Vendored header-only from include/jo_detector_v2/gseg3d/
+    Vendored header-only from include/sins/gseg3d/
     (github.com/dfki-ric/ground_segmentation, BSD-3-Clause — see that
     directory's own LICENSE file), a grid-based per-cell PCA/RANSAC/slope
     classifier — see that header's own comments for the algorithm. Runs on
@@ -156,8 +156,8 @@
 #include <Eigen/Dense>
 #include <Eigen/Eigenvalues>
 
-#include "jo_detector_v2/wall_registry.hpp"
-#include "jo_detector_v2/gseg3d/ground_detection.hpp"
+#include "sins/wall_registry.hpp"
+#include "sins/gseg3d/ground_detection.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -166,8 +166,8 @@
 #include <vector>
 #include <memory>
 
-using jo_detector_v2::WallBBox;
-using jo_detector_v2::WallBBoxRegistry;
+using sins::WallBBox;
+using sins::WallBBoxRegistry;
 
 class StaticStructuresNode : public rclcpp::Node {
 public:
@@ -187,7 +187,7 @@ public:
         // gets launched in the first place).
         calibration_enabled_ = this->declare_parameter("calibration_enabled", true);
         lidar_voxelized_topic_ = this->declare_parameter(
-            "lidar_voxelized_topic", std::string("/jo_detector_v2/lidar/voxelized_sensor"));
+            "lidar_voxelized_topic", std::string("/sins/lidar/voxelized_sensor"));
 
         // Own range crop, applied to preprocessing_node's already-voxelized
         // (not range-cropped) LiDAR centroids — see the file header. Cheap
@@ -276,21 +276,21 @@ public:
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_, this, false);
 
         pub_wall_markers_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
-            "/jo_detector_v2/static_structures/wall_markers", rclcpp::QoS(10));
+            "/sins/static_structures/wall_markers", rclcpp::QoS(10));
         // Raw RANSAC inlier points behind wall_markers' ns="wall_bbox" boxes
         // above — see DetectionResult::wall_points_global's own comment.
         // Single/shared: only LiDAR ever contributes walls (see
         // onLidarVoxelized), so there's no per-camera split to make here,
         // unlike floor_points below.
         pub_wall_points_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            "/jo_detector_v2/static_structures/wall_points", rclcpp::SensorDataQoS());
+            "/sins/static_structures/wall_points", rclcpp::SensorDataQoS());
         // GSeg3D on LiDAR — see runGseg3d()'s own comment. Single/shared,
         // same reasoning as pub_wall_points_ above: one LiDAR, not one per
         // camera.
         pub_gseg3d_lidar_ground_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            "/jo_detector_v2/lidar/gseg3d_ground", rclcpp::SensorDataQoS());
+            "/sins/lidar/gseg3d_ground", rclcpp::SensorDataQoS());
         pub_gseg3d_lidar_non_ground_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            "/jo_detector_v2/lidar/gseg3d_non_ground", rclcpp::SensorDataQoS());
+            "/sins/lidar/gseg3d_non_ground", rclcpp::SensorDataQoS());
 
         sub_odom_ = this->create_subscription<nav_msgs::msg::Odometry>(
             odom_topic_, rclcpp::SensorDataQoS(),
@@ -446,7 +446,7 @@ private:
             return this->declare_parameter(name + "." + key, def);
         };
         cam->voxelized_depth_topic = p(
-            "voxelized_depth_topic", std::string("/jo_detector_v2/") + name + "/depth/voxelized_sensor");
+            "voxelized_depth_topic", std::string("/sins/") + name + "/depth/voxelized_sensor");
         cam->refined_camera_frame = p("refined_camera_frame", name + "_refined");
         cam->floor_plane_global.normal = Eigen::Vector3d::UnitZ();
         cam->floor_plane_global.d = -ground_height_;
@@ -454,13 +454,13 @@ private:
             cam->voxelized_depth_topic, rclcpp::SensorDataQoS(),
             [this, cam](const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) { onCameraVoxelized(*cam, msg); });
         cam->pub_gseg3d_ground = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            std::string("/jo_detector_v2/") + name + "/gseg3d_ground", rclcpp::SensorDataQoS());
+            std::string("/sins/") + name + "/gseg3d_ground", rclcpp::SensorDataQoS());
         cam->pub_gseg3d_non_ground = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            std::string("/jo_detector_v2/") + name + "/gseg3d_non_ground", rclcpp::SensorDataQoS());
+            std::string("/sins/") + name + "/gseg3d_non_ground", rclcpp::SensorDataQoS());
         cam->pub_floor_points = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            std::string("/jo_detector_v2/") + name + "/floor_points", rclcpp::SensorDataQoS());
+            std::string("/sins/") + name + "/floor_points", rclcpp::SensorDataQoS());
         cam->pub_depth_calibrated = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            std::string("/jo_detector_v2/") + name + "/depth_calibrated", rclcpp::SensorDataQoS());
+            std::string("/sins/") + name + "/depth_calibrated", rclcpp::SensorDataQoS());
 
         cam->is_native_depth_frame = p("is_native_depth_frame", false);
         if (cam->is_native_depth_frame) {

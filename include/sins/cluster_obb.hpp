@@ -33,7 +33,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace jo_detector_v2 {
+namespace sins {
 
 struct Obb {
     Eigen::Vector3d center = Eigen::Vector3d::Zero();
@@ -178,4 +178,4 @@ inline Obb computeObb(const std::vector<Eigen::Vector3f>& pts, const std::vector
     return box;
 }
 
-}  // namespace jo_detector_v2
+}  // namespace sins

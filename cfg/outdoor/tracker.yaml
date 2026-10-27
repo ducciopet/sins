@@ -143,7 +143,7 @@ tracker_node:
     # voting between this track's own points now and from the last matched tick, corroborating the KF estimate
     # for an UNCLASSIFIED track (see the PATH 1/3 split above). Needs dbscan_detector_node's fused/clusters
     # cloud (det_idx field) — subscribing here is what turns its publishing on (it's otherwise lazy).
-    fused_clusters_topic: /jo_detector_v2/dbscan_detector/fused/clusters
+    fused_clusters_topic: /sins/dbscan_detector/fused/clusters
     track_point_vote_thresh: 0.7        # min vote ratio to count as corroborating evidence — v1: dynaVoteThresh_
     track_point_vote_max_points: 500    # safety cap: brute-force nearest-neighbor is O(n*m); v1 never capped this (its own clusters were smaller)
     point_vote_max_age: 0.5             # [s] ignore a stale clusters cloud

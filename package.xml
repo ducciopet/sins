@@ -1,9 +1,10 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>jo_detector_v2</name>
+  <name>sins</name>
   <version>0.1.0</version>
   <description>
-    Ground-up rewrite of jo_detector, built one stage at a time (see
+    SINS (Still Is Not Static): dynamic / potentially-dynamic / static obstacle detection and tracking
+    from LiDAR and RGB-D. Ground-up rewrite of jo_detector, built one stage at a time (see
     README.md for the phase plan). jo_detector itself is untouched and
     stays the deployed package until a given stage here is proven out.
   </description>

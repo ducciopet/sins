@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Single, growing launch file for the whole jo_detector_v2 pipeline —
+Single, growing launch file for the whole sins pipeline —
 mirrors jo_detector/launch/run_detector.launch.py's role (the "launch
 everything" file, as opposed to run_calibration_icp.launch.py and
 run_yolo.launch.py, which each stay their own standalone file for
@@ -65,7 +65,7 @@ def _parse_camera_intrinsics_map(spec):
 
 
 def _launch_setup(context, *args, **kwargs):
-    pkg_dir = get_package_share_directory('jo_detector_v2')
+    pkg_dir = get_package_share_directory('sins')
     env = LaunchConfiguration('env')
     env_str = env.perform(context)
     use_sim_time = LaunchConfiguration('use_sim_time')
@@ -208,7 +208,7 @@ def _launch_setup(context, *args, **kwargs):
         # calibration_icp_node.cpp's own default: deprojection, unchanged.
         depth_cloud_topic = str((preprocessing_params.get(name, {}) or {}).get('aligned_depth_cloud_topic', ''))
         calibration_nodes.append(Node(
-            package='jo_detector_v2',
+            package='sins',
             executable='calibration_icp_node',
             name=f'calibration_icp_node_{name}',
             output='screen',
@@ -304,7 +304,7 @@ def _launch_setup(context, *args, **kwargs):
                 preprocessing_camera_params[f'{name}.yolo_detections_topic'] = '/' + det_template2.format(camera=name).lstrip('/')
 
     preprocessing_node = Node(
-        package='jo_detector_v2',
+        package='sins',
         executable='preprocessing_node',
         name='preprocessing_node',
         output='screen',
@@ -345,7 +345,7 @@ def _launch_setup(context, *args, **kwargs):
         static_structures_camera_params[f'{name}.depth_to_color_extrinsics_topic'] = f'/{name}/camera/extrinsics/depth_to_color'
 
     static_structures_node = Node(
-        package='jo_detector_v2',
+        package='sins',
         executable='static_structures_node',
         name='static_structures_node',
         output='screen',
@@ -366,7 +366,7 @@ def _launch_setup(context, *args, **kwargs):
     dbscan_detector_nodes = []
     if LaunchConfiguration('enable_dbscan_detector').perform(context) == 'true':
         dbscan_detector_nodes.append(Node(
-            package='jo_detector_v2',
+            package='sins',
             executable='dbscan_detector_node',
             name='dbscan_detector_node',
             output='screen',
@@ -388,7 +388,7 @@ def _launch_setup(context, *args, **kwargs):
     tracker_nodes = []
     if LaunchConfiguration('enable_tracker').perform(context) == 'true':
         tracker_nodes.append(Node(
-            package='jo_detector_v2',
+            package='sins',
             executable='tracker_node',
             name='tracker_node',
             output='screen',
@@ -465,7 +465,7 @@ def _launch_setup(context, *args, **kwargs):
             os.path.join(pkg_dir, 'cfg', env_str, config_filename), 'yolo_seg_track_detector')
         for name in camera_names:
             detection_nodes.append(Node(
-                package='jo_detector_v2',
+                package='sins',
                 executable='yolo_seg_track_node.py',
                 name=f'{node_prefix}_{name}',
                 output='screen',
@@ -489,7 +489,7 @@ def _launch_setup(context, *args, **kwargs):
     if enable_semantic_segmentation:
         for name in camera_names:
             semantic_seg_nodes.append(Node(
-                package='jo_detector_v2',
+                package='sins',
                 executable='yolo_semantic_seg_node.py',
                 name=f'yolo_semantic_seg_detector_{name}',
                 output='screen',
@@ -518,7 +518,7 @@ def _launch_setup(context, *args, **kwargs):
         pointpillars_params = _load_node_params(
             os.path.join(pkg_dir, 'cfg', env_str, 'pointpillars.yaml'), 'pointpillars_detector')
         pointpillars_nodes.append(Node(
-            package='jo_detector_v2',
+            package='sins',
             executable='pointpillars_node.py',
             name='pointpillars_detector',
             output='screen',

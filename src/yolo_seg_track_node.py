@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
 """Thin ROS2 entrypoint — this file is the "node" (lives in src/ alongside
-every other node's source, installs to lib/jo_detector_v2/ like their
+every other node's source, installs to lib/sins/ like their
 executables); yolo_seg_track_detector.py itself is the "script" holding the
 actual detection/tracking implementation and lives under scripts/ (share/
-jo_detector_v2/scripts/ once installed), so it's resolved via
+sins/scripts/ once installed), so it's resolved via
 get_package_share_directory rather than sys.path-of-this-file like before.
 Explicit fatal log instead of a bare traceback if torch/ultralytics aren't
 importable."""
@@ -19,7 +19,7 @@ from ament_index_python.packages import get_package_share_directory
 
 
 def main():
-    _pkg_share = get_package_share_directory("jo_detector_v2")
+    _pkg_share = get_package_share_directory("sins")
     _scripts_dir = os.path.join(_pkg_share, "scripts")
     if _scripts_dir not in sys.path:
         sys.path.insert(0, _scripts_dir)

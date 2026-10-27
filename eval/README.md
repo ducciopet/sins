@@ -1,7 +1,7 @@
 # Dynamic/potentially-dynamic object evaluation
 
 Evaluation harness for comparing jo_detector (v1) and
-jo_detector_v2's own dynamic-object classification against hand-labeled
+sins's own dynamic-object classification against hand-labeled
 ground truth and, eventually, against external baselines (AB3DMOT, a
 SemanticKITTI-MOS method) on the same bags. Built for the paper evaluating
 the tracker's dynamic/potentially_dynamic classification — not the ground

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
-project(jo_detector_v2)
+project(sins)
 
 if(POLICY CMP0144)
   cmake_policy(SET CMP0144 NEW)

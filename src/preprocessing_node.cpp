@@ -359,7 +359,7 @@ public:
         // detection's class STRING into a small numeric index for the semantic-leaves cloud (see
         // publishSemanticLeaves's own comment on why a number, not the string, travels on the wire).
         {
-            const std::string class_names_path = ament_index_cpp::get_package_share_directory("jo_detector_v2") +
+            const std::string class_names_path = ament_index_cpp::get_package_share_directory("sins") +
                 "/" + this->declare_parameter("yolo_class_names_path", std::string("cfg/coco.names"));
             std::ifstream f(class_names_path);
             std::string line;
@@ -401,20 +401,20 @@ public:
 
         rclcpp::QoS qos(10);
         pub_lidar_processed_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            "/jo_detector_v2/lidar/processed", qos);
+            "/sins/lidar/processed", qos);
         // Tiny per-scan trigger (header only, stamp = the scan's own stamp),
         // published the moment a scan is accepted in onLidarOdom, before any
         // heavy processing — lets other nodes (YOLO detection) run ONE
         // inference per scan on the camera frame closest to it instead of
         // free-running on every frame.
         pub_scan_trigger_ = this->create_publisher<std_msgs::msg::Header>(
-            "/jo_detector_v2/lidar/scan_trigger", qos);
+            "/sins/lidar/scan_trigger", qos);
         // Voxel-downsampled, NOT range/ground-cropped — the ONLY thing
         // static_structures_node's own LiDAR subscription reads (see the file
         // header and that node's own header comment). Sensor frame
         // (lidar_frame_), published straight from onLidarOdom's Pass 2.
         pub_lidar_voxelized_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            "/jo_detector_v2/lidar/voxelized_sensor", qos);
+            "/sins/lidar/voxelized_sensor", qos);
         // static_structures_node's own output — walls (ns="wall_bbox") and each
         // camera's own fitted floor plane (ns="floor", one per camera),
         // parsed back into wall_planes_global_/floor_planes_global_ by
@@ -423,7 +423,7 @@ public:
         // separate publishDetectedPlanes() here anymore — rviz subscribes
         // to this same topic directly).
         sub_wall_markers_ = this->create_subscription<visualization_msgs::msg::MarkerArray>(
-            "/jo_detector_v2/static_structures/wall_markers", qos,
+            "/sins/static_structures/wall_markers", qos,
             [this](const visualization_msgs::msg::MarkerArray::ConstSharedPtr& msg) { onWallMarkers(msg); });
 
         sub_lidar_.subscribe(this, lidar_topic_);
@@ -470,7 +470,7 @@ public:
                     lidar_frame_.c_str(), base_frame_.c_str(), global_frame_.c_str());
         RCLCPP_INFO(this->get_logger(), "  ground(bootstrap)=%.2f roof_offset=%.2f voxel=%.3f removal_margin=%.3f",
                     ground_height_, ground_roof_offset_, voxel_resolution_, wall_removal_margin_);
-        RCLCPP_INFO(this->get_logger(), "  wall/floor planes sourced from static_structures_node via /jo_detector_v2/static_structures/wall_markers");
+        RCLCPP_INFO(this->get_logger(), "  wall/floor planes sourced from static_structures_node via /sins/static_structures/wall_markers");
     }
 
 private:
@@ -759,13 +759,13 @@ private:
 
         rclcpp::QoS qos(10);
         cam->pub_depth_cloud = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            "/jo_detector_v2/" + name + "/depth/cloud", qos);
+            "/sins/" + name + "/depth/cloud", qos);
         cam->pub_depth_processed = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            "/jo_detector_v2/" + name + "/depth/processed", qos);
+            "/sins/" + name + "/depth/processed", qos);
         cam->pub_depth_voxelized = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            "/jo_detector_v2/" + name + "/depth/voxelized_sensor", qos);
+            "/sins/" + name + "/depth/voxelized_sensor", qos);
         cam->pub_depth_voxelized_global = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-            "/jo_detector_v2/" + name + "/depth/voxelized_global", qos);
+            "/sins/" + name + "/depth/voxelized_global", qos);
 
         cam->sub_depth = image_transport::create_subscription(
             this, cam->depth_topic,
@@ -807,7 +807,7 @@ private:
                     while (cam->yolo_ring.size() > 3) cam->yolo_ring.pop_front();
                 });
             cam->pub_semantic_leaves = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-                "/jo_detector_v2/" + name + "/semantic_leaves", qos);
+                "/sins/" + name + "/semantic_leaves", qos);
         }
         if (!cam->yolo_mask_topic.empty()) {
             cam->sub_yolo_mask = this->create_subscription<sensor_msgs::msg::Image>(
@@ -825,7 +825,7 @@ private:
                 cam->ground_mask_topic, rclcpp::SensorDataQoS(),
                 [this, cam](const sensor_msgs::msg::Image::ConstSharedPtr& msg) { onGroundMask(*cam, msg); });
             cam->pub_ground_points = this->create_publisher<sensor_msgs::msg::PointCloud2>(
-                "/jo_detector_v2/" + name + "/semantic_ground_points", qos);
+                "/sins/" + name + "/semantic_ground_points", qos);
         }
 
         // transient_local — matches what the RealSense driver (and this

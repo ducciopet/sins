@@ -94,7 +94,7 @@ preprocessing_node:
     # true: native depth clouds are processed only for the frame closest to each LiDAR scan (scan_trigger),
     # not for every camera frame — the detection tick is the scan, the other frames would never be used.
     depth_process_on_scan_trigger: true
-    # YOLO 2D detections -> 3D semantic leaves (topic /jo_detector_v2/<camera>/semantic_leaves): the depth points inside each
+    # YOLO 2D detections -> 3D semantic leaves (topic /sins/<camera>/semantic_leaves): the depth points inside each
     # detection's box, foreground only, with the detection's track id per point. The detections topic per camera is forwarded from
     # semantic_segmentation.yaml by run_detector.launch.py.
     #

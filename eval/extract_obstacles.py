@@ -6,7 +6,7 @@ One-shot ROS2 subscriber that records every message on a jo_msgs/ObstacleArray
 topic into a flat JSON time series, for offline evaluation against a manually
 annotated ground truth (see eval_tracking.py and GT_SCHEMA.md in this folder).
 
-Works unmodified against EITHER jo_detector (v1) or jo_detector_v2's
+Works unmodified against EITHER jo_detector (v1) or sins's
 tracker_node: both publish to the same topic name and message type
 (/perception/tracked_dynamic_obstacles, jo_msgs/ObstacleArray) — this
 script does not care which pipeline produced the data, which is the whole

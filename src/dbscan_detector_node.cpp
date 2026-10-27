@@ -56,10 +56,10 @@
 #include <string>
 #include <vector>
 
-#include "jo_detector_v2/box_fusion.hpp"
-#include "jo_detector_v2/cluster_obb.hpp"
+#include "sins/box_fusion.hpp"
+#include "sins/cluster_obb.hpp"
 
-using jo_detector_v2::Obb;
+using sins::Obb;
 
 namespace {
 
@@ -123,9 +123,9 @@ public:
     DbscanDetectorNode() : Node("dbscan_detector_node") {
         global_frame_ = declare_parameter<std::string>("global_frame", "odom");
         camera_names_ = declare_parameter<std::vector<std::string>>("camera_names", {"front_camera", "back_camera"});
-        lidar_topic_ = declare_parameter<std::string>("lidar_topic", "/jo_detector_v2/lidar/processed");
+        lidar_topic_ = declare_parameter<std::string>("lidar_topic", "/sins/lidar/processed");
         camera_topic_template_ = declare_parameter<std::string>(
-            "camera_topic_template", "/jo_detector_v2/{camera}/depth/processed");
+            "camera_topic_template", "/sins/{camera}/depth/processed");
 
         const std::string obb_mode = declare_parameter<std::string>("obb_mode", "pca3d");
         yaw_only_ = (obb_mode == "yaw");
@@ -151,15 +151,15 @@ public:
         stats_period_ = declare_parameter<double>("stats_log_period_sec", 5.0);
 
         pub_markers_ = create_publisher<visualization_msgs::msg::MarkerArray>(
-            "/jo_detector_v2/dbscan_detector/boxes_markers", rclcpp::QoS(10));
-        lidar_pub_ = create_publisher<vision_msgs::msg::Detection3DArray>("/jo_detector_v2/dbscan_detector/lidar/detections3d", rclcpp::QoS(10));
-        lidar_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/jo_detector_v2/dbscan_detector/lidar/clusters", rclcpp::SensorDataQoS());
+            "/sins/dbscan_detector/boxes_markers", rclcpp::QoS(10));
+        lidar_pub_ = create_publisher<vision_msgs::msg::Detection3DArray>("/sins/dbscan_detector/lidar/detections3d", rclcpp::QoS(10));
+        lidar_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/sins/dbscan_detector/lidar/clusters", rclcpp::SensorDataQoS());
 
         marker_lifetime_sec_ = declare_parameter<double>("marker_lifetime_sec", 0.0);
         // Same class list preprocessing_node loads (cfg/coco.names by default) to turn the semantic leaves'
         // numeric class_idx back into a name — see onLeaves() and this node's own header.
         {
-            const std::string class_names_path = ament_index_cpp::get_package_share_directory("jo_detector_v2") +
+            const std::string class_names_path = ament_index_cpp::get_package_share_directory("sins") +
                 "/" + declare_parameter<std::string>("yolo_class_names_path", "cfg/coco.names");
             std::ifstream f(class_names_path);
             std::string line;
@@ -216,7 +216,7 @@ public:
         yolo_refine_min_retention_ = declare_parameter<double>("yolo_refine_min_retention", 0.35);
         yolo_keep_rest_ = declare_parameter<bool>("yolo_refine_keep_rest", true);
         leaves_enabled_ = declare_parameter<bool>("leaves_enabled", true);
-        leaves_topic_template_ = declare_parameter<std::string>("leaves_topic_template", "/jo_detector_v2/{camera}/semantic_leaves");
+        leaves_topic_template_ = declare_parameter<std::string>("leaves_topic_template", "/sins/{camera}/semantic_leaves");
         const auto fc = declare_parameter<std::vector<double>>("fused_color", {1.0, 1.0, 0.0});
         if (fc.size() == 3) fused_color_ = {static_cast<float>(fc[0]), static_cast<float>(fc[1]), static_cast<float>(fc[2])};
         fusion_enabled_ = declare_parameter<bool>("fusion_enabled", true);
@@ -237,9 +237,9 @@ public:
         fusion_nest_attach_dist_ = declare_parameter<double>("fusion_nest_attach_dist", 0.4);
         fusion_child_overlap_ = declare_parameter<double>("fusion_child_overlap", 0.1);
         fusion_nested_leaves_ = declare_parameter<std::string>("fusion_nested_multi_child", "leaves") == "leaves";
-        fused_pub_ = create_publisher<vision_msgs::msg::Detection3DArray>("/jo_detector_v2/dbscan_detector/fused/detections3d", rclcpp::QoS(10));
-        fused_markers_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("/jo_detector_v2/dbscan_detector/fused/boxes_markers", rclcpp::QoS(10));
-        fused_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/jo_detector_v2/dbscan_detector/fused/clusters", rclcpp::SensorDataQoS());
+        fused_pub_ = create_publisher<vision_msgs::msg::Detection3DArray>("/sins/dbscan_detector/fused/detections3d", rclcpp::QoS(10));
+        fused_markers_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>("/sins/dbscan_detector/fused/boxes_markers", rclcpp::QoS(10));
+        fused_cloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>("/sins/dbscan_detector/fused/clusters", rclcpp::SensorDataQoS());
         fusion_timer_ = create_wall_timer(std::chrono::milliseconds(20), [this] { tryFuse(); });
 
         int color_idx = 0;
@@ -248,8 +248,8 @@ public:
             Camera cam;
             cam.name = name;
             cam.eps_scale = declare_parameter<double>(name + ".eps_scale", 1.0);
-            cam.pub = create_publisher<vision_msgs::msg::Detection3DArray>("/jo_detector_v2/dbscan_detector/" + name + "/detections3d", rclcpp::QoS(10));
-            cam.cloud_pub = create_publisher<sensor_msgs::msg::PointCloud2>("/jo_detector_v2/dbscan_detector/" + name + "/clusters", rclcpp::SensorDataQoS());
+            cam.pub = create_publisher<vision_msgs::msg::Detection3DArray>("/sins/dbscan_detector/" + name + "/detections3d", rclcpp::QoS(10));
+            cam.cloud_pub = create_publisher<sensor_msgs::msg::PointCloud2>("/sins/dbscan_detector/" + name + "/clusters", rclcpp::SensorDataQoS());
             std::string topic = camera_topic_template_;
             const auto pos = topic.find("{camera}");
             if (pos != std::string::npos) topic.replace(pos, 8, name);
@@ -272,7 +272,7 @@ public:
                 origin_ = Eigen::Vector3d(msg->pose.pose.position.x, msg->pose.pose.position.y, msg->pose.pose.position.z);
             });
         wall_markers_sub_ = create_subscription<visualization_msgs::msg::MarkerArray>(
-            "/jo_detector_v2/static_structures/wall_markers", rclcpp::QoS(10),
+            "/sins/static_structures/wall_markers", rclcpp::QoS(10),
             [this](const visualization_msgs::msg::MarkerArray::ConstSharedPtr msg) { onWallMarkers(msg); });
         lidar_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
             lidar_topic_, rclcpp::SensorDataQoS(),
@@ -362,7 +362,7 @@ private:
         std::vector<Eigen::Vector3f> hp;
         std::vector<float> he, hez;
         for (int k : high) { hp.push_back(pts[idx[k]]); he.push_back(eps_i[idx[k]]); hez.push_back(epsz_i[idx[k]]); }
-        const auto comps = jo_detector_v2::dbscanGrid(hp, he, hez, min_pts);
+        const auto comps = sins::dbscanGrid(hp, he, hez, min_pts);
 
         std::vector<std::vector<int>> tall;  // points of each tall component (indices into idx)
         std::vector<std::vector<int>> tall_high;
@@ -404,7 +404,7 @@ private:
         std::vector<Eigen::Vector3f> rp;
         std::vector<float> re, rez;
         for (int k : rest) { rp.push_back(pts[idx[static_cast<size_t>(k)]]); re.push_back(eps_i[idx[static_cast<size_t>(k)]]); rez.push_back(epsz_i[idx[static_cast<size_t>(k)]]); }
-        const auto rest_clusters = jo_detector_v2::dbscanGrid(rp, re, rez, min_pts);
+        const auto rest_clusters = sins::dbscanGrid(rp, re, rez, min_pts);
         if (rest_clusters.empty()) return whole;
         for (const auto& rc : rest_clusters) {
             std::vector<int> g;
@@ -435,7 +435,7 @@ private:
             eps_i[i] = eps.at(r);
             epsz_i[i] = eps.atZ(r);
         }
-        auto clusters = jo_detector_v2::dbscanGrid(res.pts, eps_i, epsz_i, min_pts);
+        auto clusters = sins::dbscanGrid(res.pts, eps_i, epsz_i, min_pts);
         if (split.enabled && yaw_only && !planes.empty()) {
             std::vector<std::vector<int>> refined;
             for (auto& idx : clusters) {
@@ -453,7 +453,7 @@ private:
                 for (int i : idx) c += res.pts[i].cast<double>();
                 up = localUp(planes, c / static_cast<double>(idx.size()));
             }
-            Obb box = jo_detector_v2::computeObb(res.pts, idx, yaw_only, up);
+            Obb box = sins::computeObb(res.pts, idx, yaw_only, up);
             if (box.volume() < min_volume || box.volume() > max_volume) continue;
             if (yaw_only) {
                 // Box z axis = local up: size.z is the height above the local ground plane, x/y the footprint.
@@ -641,7 +641,7 @@ private:
             for (int i : idx) c += res->pts[i].cast<double>();
             c /= static_cast<double>(idx.size());
             const Eigen::Vector3d up = yaw_only_ ? localUp(floor_planes_, c) : Eigen::Vector3d::UnitZ();
-            Obb box = jo_detector_v2::computeObb(res->pts, idx, yaw_only_, up);
+            Obb box = sins::computeObb(res->pts, idx, yaw_only_, up);
             if (!boxOk(box, res->pts)) continue;
             for (int i : idx) res->point_cluster[i] = static_cast<int>(res->boxes.size());
             res->boxes.push_back(box);
@@ -760,7 +760,7 @@ private:
             if (it != pending_.cams.end())
                 for (size_t i = 0; i < it->second->boxes.size(); ++i) items.push_back({static_cast<unsigned>(k + 1), it->second.get(), i});
         }
-        namespace obf = jo_detector_v2;
+        namespace obf = sins;
 
         // One object candidate: its points, OBB and which sources contributed.
         struct Group {

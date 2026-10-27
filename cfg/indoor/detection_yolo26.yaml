@@ -27,7 +27,7 @@ yolo_seg_track_detector:
     # first run either pulls it via Ultralytics' own auto-download (works
     # only if the installed ultralytics version recognizes this exact
     # filename) or needs the .pt placed here by hand at
-    # share/jo_detector_v2/weights/yolo26s-seg.pt. If YOLO() raises on
+    # share/sins/weights/yolo26s-seg.pt. If YOLO() raises on
     # startup, that's the first thing to check — see this node's own
     # __init__ (fatal log on import/init failure either way, not a crash
     # with no explanation).

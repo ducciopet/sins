@@ -11,7 +11,7 @@ static_structures_node:
     base_frame: base_link
     global_frame: odom
     odom_topic: /odometry/filtered
-    lidar_voxelized_topic: /jo_detector_v2/lidar/voxelized_sensor
+    lidar_voxelized_topic: /sins/lidar/voxelized_sensor
     camera_names: ["front_camera", "back_camera"]
     # calibration_enabled: unset here on purpose — see
     # cfg/indoor/static_structures.yaml's own comment on this.
@@ -90,7 +90,7 @@ static_structures_node:
 
     # -----------------------------------------------------------------------
     # Wall registry (persistent tracking across scans) — see
-    # include/jo_detector_v2/wall_registry.hpp. A fresh detection is
+    # include/sins/wall_registry.hpp. A fresh detection is
     # merged into a matching registry entry (not replacing it); an existing
     # entry unmatched this scan is NOT deleted immediately — missed_frames
     # increments, only dropped once that exceeds wall_max_missed_frames.
