@@ -1,0 +1,64 @@
+yolo_semantic_seg_detector:
+  ros__parameters:
+    # -----------------------------------------------------------------------
+    # Generic, configurable-class semantic segmentation via Ultralytics
+    # YOLO26-sem (Cityscapes-pretrained) — NOT the same task as
+    # detection*.yaml's instance segmentation+tracking — see
+    # scripts/yolo_semantic_seg_detector.py's own header for the full
+    # reasoning. This node has no built-in notion of what segmentation_classes
+    # is "for" (floor, pedestrians, vehicles, ...) — that meaning lives
+    # entirely in this file, per deployment.
+    #
+    # No values differ from cfg/indoor/semantic_segmentation.yaml yet (matches
+    # detection.yaml's own indoor/outdoor split — see its comment). Outdoor
+    # is actually where this model's Cityscapes pretraining is the closest
+    # domain match (it's a street-scene dataset).
+    #
+    # camera_names below is only the standalone-run fallback:
+    # run_detector.launch.py overrides it with preprocessing.yaml's own list,
+    # same forwarding as static_structures_node/detection*.yaml, so every node
+    # agrees on which cameras exist.
+    # -----------------------------------------------------------------------
+    camera_names: ["front_camera"]  # coda (base: ["front_camera", "back_camera"])
+    image_topic_template: '/{camera}/camera/color/image_raw'
+    detected_image_topic_template: 'yolo_semantic_seg/{camera}/detected_image'
+    semantic_mask_topic_template: 'yolo_semantic_seg/{camera}/semantic_mask'
+    segmentation_mask_topic_template: 'yolo_semantic_seg/{camera}/segmentation_mask'
+    semantic_color_topic_template: 'yolo_semantic_seg/{camera}/semantic_color'
+    inference_time_topic_template: 'yolo_semantic_seg/{camera}/inference_time'
+
+    enable_semantic: false   # floor semantic segmentation off: its only consumer is semantic_ground_points (RViz); floor removal uses the RANSAC planes. Saves a full-res decode + a second inference pass per camera
+    weights_path: weights/yolo26s-sem.pt
+    class_names_path: cfg/cityscapes.names
+    segmentation_classes: ["road", "sidewalk", "terrain"]
+    inference_size: 1024
+    queue_size: 10
+    jpeg_quality: 80
+    overlay_color_bgr: [0, 255, 0]
+    overlay_alpha: 0.5
+    semantic_color_alpha: 0.6
+    gpu_preprocess: true            # letterbox/normalize on the GPU instead of Ultralytics' CPU preprocessing (same aspect ratio => identical geometry)
+    stats_log_period_sec: 5.0
+
+    # -----------------------------------------------------------------------
+    # 2D detection + tracking (second model, own thread per camera). The
+    # Cityscapes semantic checkpoint above has no boxes, so boxes/track ids
+    # come from a separate COCO detector run on the same decoded frame.
+    # -----------------------------------------------------------------------
+    enable_detection: true
+    detection_weights_path: weights/yolo26s.pt
+    detection_class_names_path: cfg/coco.names
+    detection_target_classes: [person, bicycle, car, motorbike, bus, truck, dog, cat, horse]   # COCO names from cfg/coco.names
+    detection_trigger_topic: ''   # empty = YOLO free-running (asynchronous, no wait for the LiDAR); the fusion picks the detection closest in time
+    detection_trigger_policy: latest          # latest = infer on the newest frame already received (no wait, offset -35..-70 ms); nearest_wait = wait for a frame at/after the scan (aligned, ~35 ms later)
+    detection_trigger_stamp_offset_sec: 0.0   # added to the scan stamp (stamp = END of scan; -0.05 targets the scan middle)
+    detection_trigger_max_wait_sec: 0.15      # give up on a trigger if no camera frame reaches it within this
+    detection_decode_reduced: 2               # JPEG decoded at 1/N size (1,2,4,8): 2 -> 640x360, what the detector uses anyway
+    detection_frame_stride: 2                 # free-running: 1 frame every N (2 of 30 Hz = 15 Hz)
+    detection_score_threshold: 0.5
+    detection_inference_size: 640
+    detection_enable_tracking: true
+    detection_tracker: bytetrack.yaml
+    detections_topic_template: 'yolo_semantic_seg/{camera}/detections'          # vision_msgs/Detection2DArray, id = persistent ByteTrack id
+    detection_image_topic_template: 'yolo_semantic_seg/{camera}/detection_image' # boxes + track ids, only rendered when subscribed; + '/compressed'
+    detection_time_topic_template: 'yolo_semantic_seg/{camera}/detection_time'

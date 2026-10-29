@@ -114,6 +114,7 @@ preprocessing_node:
     yolo_leaf_valley_fraction: 0.08    # the depth window expands from the mode bin until density drops below this fraction of the peak — i.e. stops at the real gap between the object and whatever's adjacent to it in depth — used by both yolo_leaf_method values. Lowered from 0.15 alongside yolo_leaf_depth_tolerance above (same confirmed failure): a shallower required valley stops the window sooner when a second object's own depth cluster sits close behind/beside the detected one, without changing anything for a cleanly isolated object (its own histogram tapers to ~0 past its real extent regardless of this threshold)
     yolo_class_names_path: cfg/coco.names   # same class list the YOLO detection nodes use, loaded to turn each leaf's class STRING into a small numeric index for the leaves cloud (see publishSemanticLeaves)
     yolo_leaf_max_age: 0.3             # [s] ignore detections older than this
+    yolo_leaf_lidar_beyond_depth: false   # true = the latest LiDAR scan's points beyond depth_max_value also feed each detection's leaf (a YOLO detection farther than the depth camera sees still labels its LiDAR cluster)
     depth_trigger_max_wait_sec: 0.15   # give up on a scan if no camera frame reaches it within this
 
     # -----------------------------------------------------------------------

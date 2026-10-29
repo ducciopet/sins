@@ -165,6 +165,7 @@
     only a simple bottom-rows ground estimate there, never full wall
     RANSAC).
 */
+#include <chrono>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
@@ -355,6 +356,13 @@ public:
         // of the peak's own count — the "gap" that marks where the detected object's own surface ends and
         // whatever's adjacent to it in depth begins.
         yolo_leaf_valley_fraction_ = this->declare_parameter("yolo_leaf_valley_fraction", 0.15);
+        // LiDAR points as semantic-leaf candidates where the depth camera cannot see: the latest scan (floor/roof
+        // cropped, global frame) is brought into the depth frame and its points FARTHER than depth_max_value along
+        // the optical axis join the depth points of each detection's box, then go through the same mode/valley
+        // window. A YOLO detection beyond the depth range (stereo/ToF depth degrades quadratically with range, a
+        // long-range LiDAR does not) still yields a leaf, so the object it labels is classified; within the depth
+        // range nothing changes. false = depth-only leaves (indoor profile: RealSense range covers the room).
+        yolo_leaf_lidar_beyond_depth_ = this->declare_parameter("yolo_leaf_lidar_beyond_depth", false);
         // Same class list the YOLO detection nodes use (cfg/coco.names by default) — loaded here only to turn a
         // detection's class STRING into a small numeric index for the semantic-leaves cloud (see
         // publishSemanticLeaves's own comment on why a number, not the string, travels on the wire).
@@ -652,6 +660,10 @@ private:
     std::map<std::string, int> coco_class_to_idx_;
     std::string yolo_leaf_method_{"box"};
     double yolo_leaf_box_inflate_{0.10}, yolo_leaf_depth_tolerance_{0.7}, yolo_leaf_max_age_{0.3}, yolo_leaf_depth_bin_{0.3};
+    bool yolo_leaf_lidar_beyond_depth_{false};
+    // latest LiDAR scan after the floor/roof crop (global frame), kept for yolo_leaf_lidar_beyond_depth_
+    pcl::PointCloud<pcl::PointXYZ> lidar_leaf_cloud_;
+    double lidar_leaf_stamp_{-1e9};
     double yolo_leaf_valley_fraction_{0.15};
     int yolo_leaf_min_points_{10};
     double depth_trigger_max_wait_sec_{0.15};
@@ -1428,11 +1440,26 @@ private:
         return {depthLo, depthHi};
     }
 
-    void publishSemanticLeaves(CameraStream& cam, const pcl::PointCloud<pcl::PointXYZ>& cloud,
+    void publishSemanticLeaves(CameraStream& cam, const pcl::PointCloud<pcl::PointXYZ>& depth_cloud,
                                const builtin_interfaces::msg::Time& stamp, const std::string& frame_id) {
         if (!cam.pub_semantic_leaves) return;
         Eigen::Matrix4d T_global_depth;
         if (!computeGlobalDepthTransform(cam, frame_id, /*is_native_depth_frame=*/true, T_global_depth)) return;
+
+        // yolo_leaf_lidar_beyond_depth_: the depth points plus the latest scan's points beyond the depth range,
+        // both in the depth frame (see the parameter's own comment)
+        pcl::PointCloud<pcl::PointXYZ> augmented;
+        if (yolo_leaf_lidar_beyond_depth_ && !lidar_leaf_cloud_.empty() &&
+            std::abs(lidar_leaf_stamp_ - rclcpp::Time(stamp).seconds()) < yolo_leaf_max_age_) {
+            const Eigen::Matrix4d T_depth_global = T_global_depth.inverse();
+            augmented = depth_cloud;
+            for (const auto& pt : lidar_leaf_cloud_.points) {
+                const Eigen::Vector4d pd = T_depth_global * Eigen::Vector4d(pt.x, pt.y, pt.z, 1.0);
+                if (pd.z() > depth_max_)
+                    augmented.points.emplace_back(static_cast<float>(pd.x()), static_cast<float>(pd.y()), static_cast<float>(pd.z()));
+            }
+        }
+        const pcl::PointCloud<pcl::PointXYZ>& cloud = augmented.empty() ? depth_cloud : augmented;
 
         // Leaf.class_idx: index into class_names_ (loaded from yolo_class_names_path, the same cfg/coco.names the
         // YOLO detection nodes use) for the ORIGINAL detection's own class string — -1 when that string isn't in
@@ -1850,6 +1877,7 @@ private:
 
     void onLidarOdom(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& lidar_msg,
                       const nav_msgs::msg::Odometry::ConstSharedPtr& odom_msg) {
+        const auto scan_t0 = std::chrono::steady_clock::now();
         pub_scan_trigger_->publish(lidar_msg->header);
         queueDepthTargets(lidar_msg->header.stamp);
         if (!ensureStaticTf()) {
@@ -2012,6 +2040,10 @@ private:
         }
         global_cloud.width = static_cast<uint32_t>(global_cloud.points.size());
         global_cloud.height = 1;
+        if (yolo_leaf_lidar_beyond_depth_) {
+            lidar_leaf_cloud_ = global_cloud;
+            lidar_leaf_stamp_ = rclcpp::Time(lidar_msg->header.stamp).seconds();
+        }
 
         // Pass 4: voxel downsample the general-purpose cloud — adaptive leaf
         // size, matching jo_detector's dynamicDetector::lidarPoseCB/
@@ -2019,8 +2051,8 @@ private:
         // comment): only runs at all if still above the point budget, and
         // escalates the leaf size until back under it.
         pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled = global_cloud.makeShared();
+        float leaf = static_cast<float>(lidar_processed_voxel_size_);
         if (lidar_processed_voxel_size_ > 0.0) {
-            float leaf = static_cast<float>(lidar_processed_voxel_size_);
             pcl::VoxelGrid<pcl::PointXYZ> voxel;
             while (static_cast<int>(downsampled->size()) > lidar_processed_downsample_threshold_) {
                 voxel.setInputCloud(downsampled);
@@ -2031,6 +2063,13 @@ private:
                 leaf *= 1.1f;
             }
         }
+
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
+            "lidar point counts: raw=%u | after floor/roof crop=%zu | adaptive voxel (final leaf %.3f m, budget %d)=%zu | scan %.1f ms",
+            lidar_msg->width * lidar_msg->height, global_cloud.points.size(),
+            downsampled->size() < global_cloud.points.size() ? leaf / 1.1f : 0.0f,
+            lidar_processed_downsample_threshold_, downsampled->size(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - scan_t0).count());
 
         // Pass 5: strip points near a wall_planes_global_ entry (also
         // received from static_structures_node), then publish.
