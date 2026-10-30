@@ -220,6 +220,9 @@ tracker_node:
     track_class_anchor_ttl: 5.0             # [s] class memory of still objects (0 = off): a still track inherits the class repeatedly seen at its spot by YOLO until this long without a new sighting — far parked objects get a YOLO vote only every ~2 s and their tracks fragment; 5 s = the life of an unclassified still track (track_stationary_max_ticks)
     track_class_anchor_min_votes: 2         # strong (depth-leaf) votes at the spot before it passes the class on
     track_class_anchor_radius: 0.6          # [m] same spot
+    track_class_min_height_classes: [car, truck, bus]   # LiDAR-only fallback: a class only for an object at least this tall (as dbscan yolo_class_min_height_*)
+    track_class_min_height_values: [1.1, 1.1, 1.5]     # [m]
+    track_classified_corroboration_min_size: 2.0  # [m] a CLASSIFIED track this long (vehicles, not people or bikes) also needs KF-confidence or point-vote corroboration to be dynamic: its partly seen cluster centre slides with the viewpoint (0 = never)
     track_person_box_completion: true       # published box of a "person" track: stood on the floor, at least track_person_min_height tall, centre pushed along the LiDAR ray (sensors only see the near surface; the VLP-16 cone cuts legs and head up close)
     floor_frame: base_footprint            # its z in global_frame is the floor height used above
     track_person_min_height: 1.7            # [m] adult prior (conservative for navigation)

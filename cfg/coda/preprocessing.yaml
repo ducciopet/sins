@@ -1,5 +1,6 @@
 preprocessing_node:
   ros__parameters:
+    stereo_camera: {"aligned_depth_transport": "zstd", "aligned_depth_cloud_topic": "/stereo_camera/camera/depth/color/points", "depth_max_value": 6.0}  # coda (not in base)
     # -----------------------------------------------------------------------
     # Topics
     # -----------------------------------------------------------------------
@@ -145,6 +146,7 @@ preprocessing_node:
     # indoor/outdoor there too. See preprocessing_node.cpp's own comment on
     # lidar_processed_voxel_size_ for the adaptive-growth mechanism.
     lidar_processed_voxel_size: 0.1   # [m] starting voxel leaf size for the general-purpose/detection LiDAR cloud
+    lidar_processed_voxel_max_range: 0.0   # [m] 0 = whole cloud. Tried 8.0 on CODa (far points untouched): more fragments of far objects, PD precision 59% -> 48%, IDF1 60% -> 49% (3 reps): off. With >0 the adaptive voxel above only thins points closer than this (= lidar_voxel_split_range); farther ones are already sparser than the leaf (OS1-128 at 13 m: ~8 cm) and a far bike lost ~40% of its returns to it. 0 = whole cloud
     downsample_threshold: 30000        # points — leaf size only grows (by 10%, re-filtering) while still above this
 
     wall_removal_margin: 0.15       # [m] points within this distance of a static_structures_node-reported wall/floor plane are dropped

@@ -185,6 +185,13 @@ public:
         // rejecting it outright.
         yolo_refine_min_iou_ = declare_parameter<double>("yolo_refine_min_iou", 0.12);
         yolo_refine_margin_ = declare_parameter<double>("yolo_refine_margin", 0.10);
+        // Minimum physical height per class (parallel lists; empty = no check): a YOLO class is only given to an
+        // object at least that tall (see the size check in the refinement loop)
+        {
+            const auto cls = declare_parameter<std::vector<std::string>>("yolo_class_min_height_classes", std::vector<std::string>{});
+            const auto hgt = declare_parameter<std::vector<double>>("yolo_class_min_height_values", std::vector<double>{});
+            for (size_t i = 0; i < std::min(cls.size(), hgt.size()); ++i) yolo_class_min_height_[cls[i]] = hgt[i];
+        }
         // Misattribution guard: when a person stands close to another object, its fused box can end up a
         // near-tie with the person's own fused box for IoU against the YOLO leaf (imperfect box fit, partial
         // occlusion, ...) — refining the wrong one is exactly how a NEARBY GENERIC OBJECT inherits the semantic
@@ -1053,6 +1060,16 @@ private:
                             fused[static_cast<size_t>(best)].box.size.x(), fused[static_cast<size_t>(best)].box.size.y(), fused[static_cast<size_t>(best)].box.size.z());
                         continue;
                     }
+                    // physical size check: a class with a minimum height (vehicles) cannot land on a lower object —
+                    // a bollard in front of a van falls inside the van's YOLO box/mask but is not 1.5 m tall
+                    if (const auto mh = yolo_class_min_height_.find(leaves.box_class[li]); mh != yolo_class_min_height_.end() &&
+                        fused[static_cast<size_t>(best)].box.size.z() < mh->second) {
+                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                            "yolo_refine: skipped too low for its class (%s leaf %zu class=%s, object height %.2f m < %.2f m)",
+                            camera_names_[k].c_str(), li, leaves.box_class[li].c_str(),
+                            fused[static_cast<size_t>(best)].box.size.z(), mh->second);
+                        continue;
+                    }
                     Fused& o = fused[static_cast<size_t>(best)];
                     // Successful-match diagnostic (the failure-path warnings above only cover rejections — this
                     // is the one that actually matters for tracing a WRONG-but-accepted match, e.g. the leaf
@@ -1319,6 +1336,7 @@ private:
     double marker_lifetime_sec_{0.0};
     SplitParams split_;
     bool yolo_refine_enabled_{true}, yolo_keep_rest_{true};
+    std::map<std::string, double> yolo_class_min_height_;  // see yolo_class_min_height_classes
     double yolo_refine_min_iou_{0.12}, yolo_refine_margin_{0.10}, yolo_refine_min_iou_margin_{0.05};
     double yolo_refine_min_retention_{0.35};
     bool leaves_enabled_{true};

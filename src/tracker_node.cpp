@@ -738,6 +738,12 @@ public:
         // object does not move, so its identity at that spot holds between sparse YOLO sightings (far objects:
         // one vote every ~2 s) and across track fragmentation; anchors only come from still tracks, so a person
         // walking past a static object never leaves one there.
+        {   // per-class minimum height for the LiDAR-only fallback (dbscan_detector_node's yolo_class_min_height_*)
+            const auto cls = declare_parameter<std::vector<std::string>>("track_class_min_height_classes", std::vector<std::string>{});
+            const auto hgt = declare_parameter<std::vector<double>>("track_class_min_height_values", std::vector<double>{});
+            for (size_t i = 0; i < std::min(cls.size(), hgt.size()); ++i) class_min_height_[cls[i]] = hgt[i];
+        }
+        classified_corroboration_min_size_ = declare_parameter<double>("track_classified_corroboration_min_size", 0.0);
         class_anchor_ttl_ = declare_parameter<double>("track_class_anchor_ttl", 0.0);
         class_anchor_min_votes_ = declare_parameter<int>("track_class_anchor_min_votes", 2);
         class_anchor_radius_ = declare_parameter<double>("track_class_anchor_radius", 0.6);
@@ -1948,6 +1954,9 @@ private:
                     }
                     if (const auto cv = covered_best_iou.find(key); cv != covered_best_iou.end() && cv->second >= c.iou)
                         continue;  // a camera-covered detection explains this box at least as well
+                    // physical size: same per-class minimum height as dbscan_detector_node's refinement
+                    if (const auto mh = class_min_height_.find(c.cls); mh != class_min_height_.end() && d.bbox.size.z < mh->second)
+                        continue;
                     const auto it = best_per_box.find(key);
                     if (it == best_per_box.end() || c.iou > it->second.iou)
                         best_per_box[key] = {di, c.iou, c.cls};
@@ -2147,7 +2156,12 @@ private:
             // 2's equivalent bypass for an already-established track.
             const bool speed_ok = speed >= dynamic_speed_thresh_;
             const bool classified_now = isDynamicClass(tr.best_class) || isDynamicClass(eff_class);
-            const bool motion_evidence = classified_now ? speed_ok : (speed_ok && (kf_vel_confident || point_vote_evidence));
+            // a large classified object (vehicle) is seen only in part and its cluster centre slides as the robot
+            // views it from another side: from track_classified_corroboration_min_size up it needs the same
+            // corroboration as an unclassified track
+            const bool large = classified_corroboration_min_size_ > 0.0 &&
+                               std::max(tr.size.x, tr.size.y) >= classified_corroboration_min_size_;
+            const bool motion_evidence = (classified_now && !large) ? speed_ok : (speed_ok && (kf_vel_confident || point_vote_evidence));
             // Disocclusion only gates the UNCLASSIFIED (PATH3) case — see this check's own first attempt at
             // scoping (only an actively-moving OTHER track counts at all) and the comment above on why PATH1/
             // PATH3 exist as separate bars in the first place: a CLASSIFIED track already has strong, direct
@@ -2593,6 +2607,8 @@ private:
     double last_stamp_{-1.0};
     struct ClassAnchor { double x, y; std::string cls; int votes; double last; };
     std::vector<ClassAnchor> class_anchors_;
+    std::map<std::string, double> class_min_height_;
+    double classified_corroboration_min_size_{0.0};
     double class_anchor_ttl_{0.0}, class_anchor_radius_{0.6};
     int class_anchor_min_votes_{2};
 

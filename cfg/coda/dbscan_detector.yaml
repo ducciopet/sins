@@ -1,5 +1,6 @@
 dbscan_detector_node:
   ros__parameters:
+    stereo_camera: {"eps_scale": 1.0}  # coda (not in base)
     # -----------------------------------------------------------------------
     # DBSCAN + 3D OBB detection on the processed LiDAR cloud and on every
     # camera's processed depth cloud (see src/dbscan_detector_node.cpp), each
@@ -63,6 +64,8 @@ dbscan_detector_node:
     yolo_refine_enabled: true
     yolo_refine_min_iou: 0.12         # 3D IoU between the leaf's box and the object needed to refine it — a genuinely correct match for a non-rectangular object (person) via a plain 2D box tops out around 0.15-0.3, not near 1.0, since the box always includes some same-depth background around the silhouette; the distance-sanity check below is the REAL correctness guard, not this threshold
     yolo_refine_margin: 0.10          # [m] the leaf's oriented box is grown by this before cutting
+    yolo_class_min_height_classes: [car, truck, bus]   # a YOLO class is given only to an object at least this tall (physical minimum of the class): a bollard in front of a van falls inside its box/mask
+    yolo_class_min_height_values: [1.1, 1.1, 1.5]     # [m] same order: OBSERVED cluster height (above the floor crop, roof partly unseen) — a 1.9 m van shows 1.36-1.46 m on CODa, bollards 0.55-0.9 m
     yolo_refine_min_iou_margin: 0.05  # misattribution guard: min IoU lead the winning fused object needs over the runner-up, else skip as ambiguous (a person close to another object can make its box a near-tie) — also rejects a winner whose center is not near-coincident with the leaf's own box, so a nearby object never inherits the person's class. Lowered alongside yolo_refine_min_iou: a fixed 0.08 was disproportionately strict once typical correct-match IoU dropped to ~0.15-0.3
     yolo_refine_min_retention: 0.35   # the leaf-bounded cut must keep at least this fraction of the fused object's own pre-cut points, on top of the absolute camera_min_points floor — rejects a match that only grabs a thin, barely-representative sliver of the object (v1 equivalent in spirit: dynamicDetector.cpp's yoloPointFractionThresh_/sparseLargeBox)
     yolo_refine_keep_rest: true       # false = drop the points outside the region instead of re-clustering them

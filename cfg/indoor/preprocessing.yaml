@@ -165,6 +165,7 @@ preprocessing_node:
     # indoor/outdoor there too. See preprocessing_node.cpp's own comment on
     # lidar_processed_voxel_size_ for the adaptive-growth mechanism.
     lidar_processed_voxel_size: 0.1   # [m] starting voxel leaf size for the general-purpose/detection LiDAR cloud
+    lidar_processed_voxel_max_range: 0.0   # [m] 0 = the adaptive voxel thins the whole cloud
     downsample_threshold: 30000        # points — leaf size only grows (by 10%, re-filtering) while still above this
 
     wall_removal_margin: 0.10       # [m] points within this distance of a static_structures_node-reported wall/floor plane are dropped

@@ -291,6 +291,7 @@ public:
         // looks like an off-by-one rather than intent, so it's not reproduced
         // here: the first attempt below is at the configured size itself.
         lidar_processed_voxel_size_ = this->declare_parameter("lidar_processed_voxel_size", 0.1);
+        lidar_processed_voxel_max_range_ = this->declare_parameter("lidar_processed_voxel_max_range", 0.0);
         lidar_processed_downsample_threshold_ = this->declare_parameter("downsample_threshold", 7000);
 
         // pub_depth_processed_'s OWN density filter (finishDepthCloud, used
@@ -500,6 +501,7 @@ private:
     // =====================================================================
     struct CameraStream {
         std::string name;
+        double depth_min = 0.5, depth_max = 5.0;  // per-camera depth range (default: the global depth_min/max_value)
 
         // Scan-triggered depth processing (depth_process_on_scan_trigger_): recent native cloud
         // messages + the LiDAR scan stamps still waiting for a camera frame at/after them.
@@ -670,6 +672,7 @@ private:
     // latest LiDAR scan after the floor/roof crop (global frame), kept for yolo_leaf_lidar_beyond_depth_
     pcl::PointCloud<pcl::PointXYZ> lidar_leaf_cloud_;
     bool yolo_leaf_nearest_cluster_ = false;
+    double lidar_processed_voxel_max_range_ = 0.0;
     double yolo_leaf_min_box_coverage_ = 0.5;
     double lidar_leaf_stamp_{-1e9};
     double yolo_leaf_valley_fraction_{0.15};
@@ -765,6 +768,10 @@ private:
         // when the input is already a point cloud there's no reason to
         // reconstruct one from its source image) — see onNativeDepthCloud().
         cam->aligned_depth_cloud_topic = p("aligned_depth_cloud_topic", std::string(""));
+        // depth range of THIS camera's sensor (a stereo pair with a wider baseline is accurate farther than a
+        // RealSense/ZED); default the global depth_min_value/depth_max_value
+        cam->depth_min = p("depth_min_value", depth_min_);
+        cam->depth_max = p("depth_max_value", depth_max_);
         cam->ground_mask_topic = p("ground_mask_topic", std::string(""));
         cam->yolo_detections_topic = p("yolo_detections_topic", std::string(""));
         cam->yolo_mask_topic = p("yolo_mask_topic", std::string(""));
@@ -1294,7 +1301,7 @@ private:
                     if (!std::isfinite(d) || d <= 0.0f) continue;
                     z = static_cast<double>(d);
                 }
-                if (z < depth_min_ || z > depth_max_) continue;
+                if (z < cam.depth_min || z > cam.depth_max) continue;
 
                 // Aligned depth's own (= this camera's color) intrinsics —
                 // never the raw depth sensor's fx_depth/cx_depth/etc, and
@@ -1425,11 +1432,12 @@ private:
     // deep (points stay dense all the way through, no valley to stop at). yolo_leaf_depth_tolerance_ remains an
     // absolute safety cap on top, in case a noisy/sparse histogram never finds a clean valley.
     std::pair<float, float> depthModeValleyWindow(const std::vector<float>& depths, const std::vector<float>* us = nullptr,
-                                                  double box_width = 0.0) const {
+                                                  double box_width = 0.0, double depth_max = -1.0) const {
+        if (depth_max < 0.0) depth_max = depth_max_;
         // nearest-cluster rule only for a leaf made mostly of LiDAR points beyond the depth range (sparse returns
         // of a far object); a leaf inside the depth range keeps the most populated cluster (dense depth)
         const bool nearest = yolo_leaf_nearest_cluster_ &&
-            2 * std::count_if(depths.begin(), depths.end(), [this](float d) { return d > depth_max_; }) > static_cast<long>(depths.size());
+            2 * std::count_if(depths.begin(), depths.end(), [depth_max](float d) { return d > depth_max; }) > static_cast<long>(depths.size());
         const float dmin = *std::min_element(depths.begin(), depths.end());
         const float dmax = *std::max_element(depths.begin(), depths.end());
         const int nBins = std::max(1, static_cast<int>(std::ceil((dmax - dmin) / static_cast<float>(yolo_leaf_depth_bin_))) + 1);
@@ -1499,7 +1507,7 @@ private:
             augmented = depth_cloud;
             for (const auto& pt : lidar_leaf_cloud_.points) {
                 const Eigen::Vector4d pd = T_depth_global * Eigen::Vector4d(pt.x, pt.y, pt.z, 1.0);
-                if (pd.z() > depth_max_)
+                if (pd.z() > cam.depth_max)
                     augmented.points.emplace_back(static_cast<float>(pd.x()), static_cast<float>(pd.y()), static_cast<float>(pd.z()));
             }
         }
@@ -1580,7 +1588,7 @@ private:
                     for (const auto& dp : pv) depths.push_back(dp.first);
                     // an occluder in front of the object can fall inside its mask (a bollard before a van): the
                     // same box-width coverage test as the box method
-                    const auto [depthLo, depthHi] = depthModeValleyWindow(depths, &usByLabel[label], widthByLabel[label]);
+                    const auto [depthLo, depthHi] = depthModeValleyWindow(depths, &usByLabel[label], widthByLabel[label], cam.depth_max);
                     const auto& info = byLabel.at(label);
                     Leaf leaf{info.first, info.second, {}};
                     for (const auto& dp : pv)
@@ -1633,7 +1641,7 @@ private:
                 // (see its own comment) instead of anchoring on the single nearest depth, which systematically
                 // picked the occluder's surface instead of the detected object's own.
                 const double box_w = (boxes[b].x1 - boxes[b].x0) / (1.0 + 2.0 * yolo_leaf_box_inflate_);  // un-inflated
-                const auto [depthLo, depthHi] = depthModeValleyWindow(depths, &inside_u[b], box_w);
+                const auto [depthLo, depthHi] = depthModeValleyWindow(depths, &inside_u[b], box_w, cam.depth_max);
                 Leaf leaf{boxes[b].id, boxes[b].class_idx, {}};
                 for (const auto& q : v)
                     if (q.first >= depthLo && q.first <= depthHi) {
@@ -1682,7 +1690,7 @@ private:
             // z is this point's depth along the optical axis, same quantity
             // processAlignedDepth's own per-pixel z value is — same bounds
             // apply for the same reason (too close/far to trust).
-            if (pt.z < depth_min_ || pt.z > depth_max_) continue;
+            if (pt.z < cam.depth_min || pt.z > cam.depth_max) continue;
             cloud.points.push_back(pt);
 
             // Semantic ground: a native cloud is unorganized (no pixel grid
@@ -2110,19 +2118,40 @@ private:
         // lidarOdomCB (see lidar_processed_voxel_size_'s own declare_parameter
         // comment): only runs at all if still above the point budget, and
         // escalates the leaf size until back under it.
-        pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled = global_cloud.makeShared();
+        // lidar_processed_voxel_max_range > 0: only points closer than that (horizontal range from the sensor) are
+        // voxelized; farther ones are already sparser than the leaf and pass untouched (a far object keeps all of
+        // its returns), the budget still counts them.
+        pcl::PointCloud<pcl::PointXYZ>::Ptr downsampled(new pcl::PointCloud<pcl::PointXYZ>());
+        pcl::PointCloud<pcl::PointXYZ> far_pts;
+        if (lidar_processed_voxel_max_range_ > 0.0) {
+            const Eigen::Vector3d sensor = T_global_lidar.block<3, 1>(0, 3);
+            for (const auto& pt : global_cloud.points) {
+                if (std::hypot(pt.x - sensor.x(), pt.y - sensor.y()) < lidar_processed_voxel_max_range_) downsampled->points.push_back(pt);
+                else far_pts.points.push_back(pt);
+            }
+            downsampled->width = static_cast<uint32_t>(downsampled->points.size());
+            downsampled->height = 1;
+        } else {
+            *downsampled = global_cloud;
+        }
         float leaf = static_cast<float>(lidar_processed_voxel_size_);
         if (lidar_processed_voxel_size_ > 0.0) {
             pcl::VoxelGrid<pcl::PointXYZ> voxel;
-            while (static_cast<int>(downsampled->size()) > lidar_processed_downsample_threshold_) {
+            while (static_cast<int>(downsampled->size() + far_pts.size()) > lidar_processed_downsample_threshold_ &&
+                   !downsampled->empty() && leaf < 2.0f) {
                 voxel.setInputCloud(downsampled);
                 voxel.setLeafSize(leaf, leaf, leaf);
                 pcl::PointCloud<pcl::PointXYZ>::Ptr next(new pcl::PointCloud<pcl::PointXYZ>());
                 voxel.filter(*next);
+                // near band alone cannot bring the total under budget (far points are never voxelized): stop
+                if (lidar_processed_voxel_max_range_ > 0.0 && next->size() == downsampled->size()) { downsampled = next; break; }
                 downsampled = next;
                 leaf *= 1.1f;
             }
         }
+        downsampled->points.insert(downsampled->points.end(), far_pts.points.begin(), far_pts.points.end());
+        downsampled->width = static_cast<uint32_t>(downsampled->points.size());
+        downsampled->height = 1;
 
         RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 10000,
             "lidar point counts: raw=%u | after floor/roof crop=%zu | adaptive voxel (final leaf %.3f m, budget %d)=%zu | scan %.1f ms",
