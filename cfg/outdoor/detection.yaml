@@ -25,15 +25,15 @@ yolo_seg_track_detector:
     detected_detections_topic_template: 'yolo_seg_track/{camera}/detections'  # vision_msgs/Detection2DArray, id = track id
     inference_time_topic_template: 'yolo_seg_track/{camera}/inference_time'   # per-frame inference timing
 
-    weights_path: weights/yolo11n-seg.pt    # COCO-pretrained YOLO11n segmentation checkpoint (shared across cameras)
+    weights_path: weights/yolo26s-seg.pt    # outdoor: same family/size as the box detector (yolo26s), segmentation head (shared across cameras)
     class_names_path: cfg/coco.names
-    target_classes: [person]
+    target_classes: [person, bicycle, car, motorbike, bus, truck, dog, cat, horse]   # outdoor: the box detector's own detection_target_classes (semantic_segmentation.yaml), so with yolo_leaf_method=mask every movable class gets a pixel-exact leaf
     score_threshold: 0.5     # min confidence required to keep a detection/track
     # No timer_period_sec: processing is worker-thread-driven per camera now
     # (see yolo_seg_track_detector.py's file header), not timer-polled —
     # a fixed-period timer measurably dropped ~18% of frames to phase
     # misalignment against the camera's own publish jitter.
-    inference_size: 640      # [px] YOLO input resolution (lower = faster, less accurate at distance)
+    inference_size: 1280     # [px] outdoor: native camera width, as the box detector (objects at 10-25 m are 30-50 px tall)
     queue_size: 10
     jpeg_quality: 80          # compressed annotated-image quality (0-100)
     tracker: bytetrack.yaml  # motion/IoU tracker, ships with ultralytics — see file header for why not botsort

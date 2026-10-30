@@ -732,6 +732,15 @@ public:
         // classified track gives the class up or dies.
         class_handover_dist_ = declare_parameter<double>("track_class_handover_dist", 0.5);
         class_handover_window_ = declare_parameter<double>("track_class_handover_window", 3.0);
+        // Class memory of still objects (0 = off): a strong (depth-leaf) vote of a dynamic class on a STILL track
+        // leaves an anchor at that spot; a still track there inherits the class once the anchor has
+        // track_class_anchor_min_votes votes, until track_class_anchor_ttl seconds pass with no new vote. A parked
+        // object does not move, so its identity at that spot holds between sparse YOLO sightings (far objects:
+        // one vote every ~2 s) and across track fragmentation; anchors only come from still tracks, so a person
+        // walking past a static object never leaves one there.
+        class_anchor_ttl_ = declare_parameter<double>("track_class_anchor_ttl", 0.0);
+        class_anchor_min_votes_ = declare_parameter<int>("track_class_anchor_min_votes", 2);
+        class_anchor_radius_ = declare_parameter<double>("track_class_anchor_radius", 0.6);
         // Height term of the association (see the candidate loop): penalty per metre of difference between the
         // candidate's box top and the track's smoothed top, hard reject beyond track_max_top_diff, active once the
         // track has track_height_min_samples matched ticks; the smoothing is an EMA with this alpha.
@@ -1588,6 +1597,8 @@ private:
         double dt = last_stamp_ > 0.0 ? stamp - last_stamp_ : 0.1;
         if (dt <= 0.0 || dt > 1.0) dt = 0.1;  // clock jump (bag loop) or first message: fall back to the nominal LiDAR period
         last_stamp_ = stamp;
+        class_anchors_.erase(std::remove_if(class_anchors_.begin(), class_anchors_.end(),
+            [&](const ClassAnchor& an) { return stamp - an.last > class_anchor_ttl_; }), class_anchors_.end());
         refreshCameraTf();  // once per tick, not per track — see its own comment
         refreshLidarTf();
         const std::map<size_t, std::vector<Eigen::Vector3f>> points_by_det = parsePointsByDetection(stamp);
@@ -2079,7 +2090,12 @@ private:
                     tr.stationary_ticks, tr.confirmed ? 1 : 0, jump,
                     tr.last_obs.x, tr.last_obs.y, tr.last_obs.z, tr.size.x, tr.size.y, tr.size.z);
             }
-            decaySemanticEvidence(track_ids[ti], tr, eff_class, d.bbox.size, det_track_id, detectionMask(d) != "L");
+            {
+                // an active still-object anchor counts as this tick's class evidence (see track_class_anchor_ttl)
+                const std::string anchored = classAnchor(tr, eff_class, had_depth_class, stamp);
+                decaySemanticEvidence(track_ids[ti], tr, eff_class.empty() ? anchored : eff_class, d.bbox.size,
+                                      det_track_id, detectionMask(d) != "L");
+            }
             matched_ids.insert(track_ids[ti]);
 
             // Static-track aging (see this class's own constructor comment): counts consecutive ticks this track
@@ -2229,6 +2245,7 @@ private:
             // hits == 1 is always well below first_class_established_hits_, so voteClass()'s motion gate never
             // engages for a just-spawned track regardless.
             voteClass(tr, eff_class, tr.last_obs, !detectionClass(d).empty());
+            classAnchor(tr, eff_class, !detectionClass(d).empty(), stamp);
             tracks_.emplace(tr.id, std::move(tr));
         }
 
@@ -2574,6 +2591,47 @@ private:
     std::set<int> last_published_ids_;
     int next_id_{1};
     double last_stamp_{-1.0};
+    struct ClassAnchor { double x, y; std::string cls; int votes; double last; };
+    std::vector<ClassAnchor> class_anchors_;
+    double class_anchor_ttl_{0.0}, class_anchor_radius_{0.6};
+    int class_anchor_min_votes_{2};
+
+    // See track_class_anchor_ttl. Returns the class an active anchor at this spot supports ("" if none).
+    std::string classAnchor(Track& tr, const std::string& cls, bool strong, double now) {
+        if (class_anchor_ttl_ <= 0.0) return std::string();
+        const bool still = planarSpeed(tr.kf.vel()) < dynamic_speed_thresh_;
+        if (!still) return std::string();
+        ClassAnchor* best = nullptr;
+        double best_d = class_anchor_radius_;
+        for (auto& an : class_anchors_) {
+            const double d = std::hypot(an.x - tr.last_obs.x, an.y - tr.last_obs.y);
+            if (d < best_d && (cls.empty() || !strong || an.cls == cls)) { best_d = d; best = &an; }
+        }
+        if (strong && isDynamicClass(cls)) {
+            if (best && best->cls == cls) {
+                ++best->votes;
+                best->last = now;
+                best->x = 0.8 * best->x + 0.2 * tr.last_obs.x;
+                best->y = 0.8 * best->y + 0.2 * tr.last_obs.y;
+            } else {
+                class_anchors_.push_back({tr.last_obs.x, tr.last_obs.y, cls, 1, now});
+                return std::string();
+            }
+        }
+        if (!best || best->votes < class_anchor_min_votes_ || now - best->last > class_anchor_ttl_) return std::string();
+        if (tr.best_class.empty()) {
+            tr.best_class = best->cls;
+            tr.class_votes[best->cls] = std::max(tr.class_votes[best->cls], 1);
+            tr.confirmed = true;
+            tr.pending_class.clear();
+            tr.pending_class_ticks = 0;
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+                "track #%d: class '%s' from the still-object anchor at [%.2f,%.2f] (%d votes, last %.1f s ago)",
+                tr.id, best->cls.c_str(), best->x, best->y, best->votes, now - best->last);
+        }
+        return best->cls == tr.best_class ? best->cls : std::string();
+    }
+
 };
 
 int main(int argc, char** argv) {

@@ -42,8 +42,8 @@ dbscan_detector_node:
     camera_min_points: 8
 
     # Box filtering (a cluster whose box breaks any of these is discarded)
-    max_box_extent: [3.0, 3.0, 2.5]  # [m] yaw: footprint (x,y, compared sorted) and height above the local ground (z); pca3d: three extents compared sorted + world-z range
-    max_box_volume: 12.0             # [m^3]
+    max_box_extent: [6.0, 6.0, 3.5]  # outdoor: the largest movable class in the YOLO list we expect next to a sidewalk robot (van / light truck ~5-6 m, 3 m tall); indoor [3.0, 3.0, 2.5] — a 3.2 m service vehicle was discarded whole on CODa  # [m] yaw: footprint (x,y, compared sorted) and height above the local ground (z); pca3d: three extents compared sorted + world-z range
+    max_box_volume: 40.0             # [m^3] outdoor: van/light truck (indoor 12)
     min_box_volume: 0.02             # [m^3] smaller boxes are dropped: half of all boxes were under 0.03 m^3 (fragments of 9-12 points); raising min_points instead removed real camera objects
 
     # Fusion of the three sources into one box per object (see the node's header). Overlapping boxes of DIFFERENT

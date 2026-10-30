@@ -1543,6 +1543,7 @@ private:
                 // label (== the SAME id a Detection2DArray entry's own det.id carries, see
                 // yolo_seg_track_detector.py's own mask_label comment) -> (id, class_idx), built once per tick.
                 std::map<int32_t, std::pair<double, int>> byLabel;
+                std::map<int32_t, double> widthByLabel;  // detection box width [px], for the nearest-cluster coverage test
                 for (const auto& d : det->detections) {
                     int32_t label = 0;
                     try { label = static_cast<int32_t>(std::stol(d.id)); } catch (...) { continue; }
@@ -1552,10 +1553,12 @@ private:
                         if (it != coco_class_to_idx_.end()) class_idx = it->second;
                     }
                     byLabel[label] = {static_cast<double>(label), class_idx};
+                    widthByLabel[label] = d.bbox.size_x;
                 }
                 // (camera-frame depth, point in depth-sensor frame) per label — depth kept per-point so the
                 // same mode+valley window used by the box method can reject background bleed-through here too.
                 std::map<int32_t, std::vector<std::pair<float, Eigen::Vector3f>>> ptsByLabel;
+                std::map<int32_t, std::vector<float>> usByLabel;
                 const auto* data = reinterpret_cast<const int32_t*>(mask_img->data.data());
                 const int w = static_cast<int>(mask_img->width), h = static_cast<int>(mask_img->height);
                 const size_t stepElems = mask_img->step / sizeof(int32_t);
@@ -1568,13 +1571,16 @@ private:
                     const int32_t label = data[static_cast<size_t>(v) * stepElems + static_cast<size_t>(u)];
                     if (label == 0 || byLabel.find(label) == byLabel.end()) continue;  // background, or a stale/stray label not in this tick's own detections
                     ptsByLabel[label].emplace_back(static_cast<float>(pc.z()), Eigen::Vector3f(pt.x, pt.y, pt.z));
+                    usByLabel[label].push_back(static_cast<float>(u));
                 }
                 for (auto& [label, pv] : ptsByLabel) {
                     if (static_cast<int>(pv.size()) < yolo_leaf_min_points_) continue;
                     std::vector<float> depths;
                     depths.reserve(pv.size());
                     for (const auto& dp : pv) depths.push_back(dp.first);
-                    const auto [depthLo, depthHi] = depthModeValleyWindow(depths);
+                    // an occluder in front of the object can fall inside its mask (a bollard before a van): the
+                    // same box-width coverage test as the box method
+                    const auto [depthLo, depthHi] = depthModeValleyWindow(depths, &usByLabel[label], widthByLabel[label]);
                     const auto& info = byLabel.at(label);
                     Leaf leaf{info.first, info.second, {}};
                     for (const auto& dp : pv)
