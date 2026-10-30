@@ -223,6 +223,8 @@ tracker_node:
     track_class_min_height_classes: [car, truck, bus]   # LiDAR-only fallback: a class only for an object at least this tall (as dbscan yolo_class_min_height_*)
     track_class_min_height_values: [1.1, 1.1, 1.5]     # [m]
     track_classified_corroboration_min_size: 2.0  # [m] a CLASSIFIED track this long (vehicles, not people or bikes) also needs KF-confidence or point-vote corroboration to be dynamic: its partly seen cluster centre slides with the viewpoint (0 = never)
+    track_classified_corroboration_all: true      # every classified track needs that corroboration to be dynamic (CODa: 4% of the still-object moments were labelled D, bikes at 12-15 m whose partial cluster centre slides with the viewpoint)
+    track_lidar_fallback: true                    # LiDAR-only pixel fallback (3D box projected onto the 2D YOLO boxes). Candidate to switch off with single_yolo masks: the many small bike boxes of the segmentation model give its class to bollards (NOT yet tested)
     track_person_box_completion: true       # published box of a "person" track: stood on the floor, at least track_person_min_height tall, centre pushed along the LiDAR ray (sensors only see the near surface; the VLP-16 cone cuts legs and head up close)
     floor_frame: base_footprint            # its z in global_frame is the floor height used above
     track_person_min_height: 1.7            # [m] adult prior (conservative for navigation)

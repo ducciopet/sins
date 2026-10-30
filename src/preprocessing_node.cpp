@@ -175,7 +175,9 @@
 #include <vision_msgs/msg/detection2_d_array.hpp>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <fstream>
+#include <array>
 #include <map>
+#include <set>
 #include <utility>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -370,6 +372,8 @@ public:
         yolo_leaf_nearest_cluster_ = this->declare_parameter("yolo_leaf_nearest_cluster", false);
         // with yolo_leaf_nearest_cluster: the chosen cluster must span at least this fraction of the box width
         yolo_leaf_min_box_coverage_ = this->declare_parameter("yolo_leaf_min_box_coverage", 0.5);
+        // mask method: a detection whose mask yields no leaf falls back to its own box (box method, same detection)
+        yolo_leaf_mask_box_fallback_ = this->declare_parameter("yolo_leaf_mask_box_fallback", false);
         // Same class list the YOLO detection nodes use (cfg/coco.names by default) — loaded here only to turn a
         // detection's class STRING into a small numeric index for the semantic-leaves cloud (see
         // publishSemanticLeaves's own comment on why a number, not the string, travels on the wire).
@@ -674,6 +678,7 @@ private:
     bool yolo_leaf_nearest_cluster_ = false;
     double lidar_processed_voxel_max_range_ = 0.0;
     double yolo_leaf_min_box_coverage_ = 0.5;
+    bool yolo_leaf_mask_box_fallback_ = false;
     double lidar_leaf_stamp_{-1e9};
     double yolo_leaf_valley_fraction_{0.15};
     int yolo_leaf_min_points_{10};
@@ -1552,6 +1557,7 @@ private:
                 // yolo_seg_track_detector.py's own mask_label comment) -> (id, class_idx), built once per tick.
                 std::map<int32_t, std::pair<double, int>> byLabel;
                 std::map<int32_t, double> widthByLabel;  // detection box width [px], for the nearest-cluster coverage test
+                std::map<int32_t, std::array<double, 4>> boxByLabel;  // inflated box x0, x1, y0, y1 [px], box fallback
                 for (const auto& d : det->detections) {
                     int32_t label = 0;
                     try { label = static_cast<int32_t>(std::stol(d.id)); } catch (...) { continue; }
@@ -1562,7 +1568,11 @@ private:
                     }
                     byLabel[label] = {static_cast<double>(label), class_idx};
                     widthByLabel[label] = d.bbox.size_x;
+                    const double hw = d.bbox.size_x * 0.5 * (1.0 + 2.0 * yolo_leaf_box_inflate_), hh = d.bbox.size_y * 0.5 * (1.0 + 2.0 * yolo_leaf_box_inflate_);
+                    boxByLabel[label] = {d.bbox.center.position.x - hw, d.bbox.center.position.x + hw,
+                                         d.bbox.center.position.y - hh, d.bbox.center.position.y + hh};
                 }
+                std::set<int32_t> leafLabels;  // labels that produced a mask leaf
                 // (camera-frame depth, point in depth-sensor frame) per label — depth kept per-point so the
                 // same mode+valley window used by the box method can reject background bleed-through here too.
                 std::map<int32_t, std::vector<std::pair<float, Eigen::Vector3f>>> ptsByLabel;
@@ -1596,7 +1606,42 @@ private:
                             const Eigen::Vector4d pg = T_global_depth * Eigen::Vector4d(dp.second.x(), dp.second.y(), dp.second.z(), 1.0);
                             leaf.pts.emplace_back(static_cast<float>(pg.x()), static_cast<float>(pg.y()), static_cast<float>(pg.z()));
                         }
-                    if (static_cast<int>(leaf.pts.size()) >= yolo_leaf_min_points_) leaves.push_back(std::move(leaf));
+                    if (static_cast<int>(leaf.pts.size()) >= yolo_leaf_min_points_) { leaves.push_back(std::move(leaf)); leafLabels.insert(label); }
+                }
+                // yolo_leaf_mask_box_fallback: a detection whose mask yields no leaf (a coarse mask of a thin far
+                // object holds too few points) gets the box method on its own box — same detection, same class
+                if (yolo_leaf_mask_box_fallback_) {
+                    std::map<int32_t, std::vector<std::pair<float, Eigen::Vector3f>>> boxPts;
+                    std::map<int32_t, std::vector<float>> boxUs;
+                    for (const auto& pt : cloud.points) {
+                        const Eigen::Vector4d pc = cam.T_color_depth * Eigen::Vector4d(pt.x, pt.y, pt.z, 1.0);
+                        if (pc.z() <= 0.05) continue;
+                        const double u = cam.fx_aligned * pc.x() / pc.z() + cam.cx_aligned, v = cam.fy_aligned * pc.y() / pc.z() + cam.cy_aligned;
+                        int32_t best = 0;
+                        double best_area = std::numeric_limits<double>::max();
+                        for (const auto& [label, b] : boxByLabel) {
+                            if (leafLabels.count(label) || u < b[0] || u > b[1] || v < b[2] || v > b[3]) continue;
+                            const double area = (b[1] - b[0]) * (b[3] - b[2]);
+                            if (area < best_area) { best_area = area; best = label; }  // the smallest box that contains it
+                        }
+                        if (best == 0) continue;
+                        boxPts[best].emplace_back(static_cast<float>(pc.z()), Eigen::Vector3f(pt.x, pt.y, pt.z));
+                        boxUs[best].push_back(static_cast<float>(u));
+                    }
+                    for (auto& [label, pv] : boxPts) {
+                        if (static_cast<int>(pv.size()) < yolo_leaf_min_points_) continue;
+                        std::vector<float> depths;
+                        for (const auto& dp : pv) depths.push_back(dp.first);
+                        const auto [depthLo, depthHi] = depthModeValleyWindow(depths, &boxUs[label], widthByLabel[label], cam.depth_max);
+                        const auto& info = byLabel.at(label);
+                        Leaf leaf{info.first, info.second, {}};
+                        for (const auto& dp : pv)
+                            if (dp.first >= depthLo && dp.first <= depthHi) {
+                                const Eigen::Vector4d pg = T_global_depth * Eigen::Vector4d(dp.second.x(), dp.second.y(), dp.second.z(), 1.0);
+                                leaf.pts.emplace_back(static_cast<float>(pg.x()), static_cast<float>(pg.y()), static_cast<float>(pg.z()));
+                            }
+                        if (static_cast<int>(leaf.pts.size()) >= yolo_leaf_min_points_) leaves.push_back(std::move(leaf));
+                    }
                 }
             }
         } else if (ready) {

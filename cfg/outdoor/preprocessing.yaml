@@ -97,6 +97,7 @@ preprocessing_node:
     yolo_leaf_lidar_beyond_depth: true   # true = the latest LiDAR scan's points beyond depth_max_value also feed each detection's leaf (a YOLO detection farther than the depth camera sees still labels its LiDAR cluster)
     yolo_leaf_nearest_cluster: true      # true = a leaf made mostly of LiDAR points beyond depth_max_value takes the NEAREST depth cluster in its box with >= yolo_leaf_min_points points, not the most populated one: a thin far object (parked bike) has fewer LiDAR returns in its YOLO box than the wall behind it
     yolo_leaf_min_box_coverage: 0.5      # ...and that cluster must span at least this fraction of the box width in the image: the object fills its own box sideways, a bollard in front of a parked bike does not
+    yolo_leaf_mask_box_fallback: true # mask method: a detection whose mask yields no leaf (coarse mask of a thin far object, too few points) falls back to its own box
     depth_trigger_max_wait_sec: 0.15   # give up on a scan if no camera frame reaches it within this
 
     # -----------------------------------------------------------------------

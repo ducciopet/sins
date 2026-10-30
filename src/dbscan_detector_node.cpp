@@ -50,6 +50,7 @@
 #include <fstream>
 #include <future>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <numeric>
 #include <set>
@@ -186,6 +187,9 @@ public:
         yolo_refine_min_iou_ = declare_parameter<double>("yolo_refine_min_iou", 0.12);
         yolo_refine_margin_ = declare_parameter<double>("yolo_refine_margin", 0.10);
         yolo_refine_nested_ = declare_parameter<bool>("yolo_refine_nested", false);
+        // "iou" (default): leaf box vs object box 3D IoU + ambiguity/distance/retention tests; "points": the object
+        // sharing the most of the leaf's points (see the refinement loop)
+        yolo_refine_points_ = declare_parameter<std::string>("yolo_refine_assoc", std::string("iou")) == "points";
         // Minimum physical height per class (parallel lists; empty = no check): a YOLO class is only given to an
         // object at least that tall (see the size check in the refinement loop)
         {
@@ -1021,11 +1025,52 @@ private:
                         if (v > best_iou) { second_iou = best_iou; best_iou = v; best = static_cast<int>(fi); }
                         else if (v > second_iou) { second_iou = v; }
                     }
+                    // yolo_refine_assoc == "points": the fused object sharing the most of the leaf's own points (within
+                    // yolo_refine_margin; leaf and object points come from the same scan). Replaces the 3D IoU / ambiguity /
+                    // distance tests: a bike merged with its rack shares all of its leaf's points with the merged
+                    // cluster even though their boxes' IoU is tiny; the cut below then keeps exactly those points.
+                    bool by_points = false;
+                    std::vector<char> leaf_member;  // per point of the chosen object: shared with the leaf
+                    if (yolo_refine_points_) {
+                        const double e = yolo_refine_margin_;
+                        std::unordered_map<long long, std::vector<Eigen::Vector3f>> grid;
+                        auto key = [e](const Eigen::Vector3f& q, int dx, int dy, int dz) {
+                            const long long ix = static_cast<long long>(std::floor(q.x() / e)) + dx, iy = static_cast<long long>(std::floor(q.y() / e)) + dy,
+                                            iz = static_cast<long long>(std::floor(q.z() / e)) + dz;
+                            return (ix * 73856093LL) ^ (iy * 19349663LL) ^ (iz * 83492791LL);
+                        };
+                        for (int pi : leaves.box_points[li]) { const auto& q = leaves.pts[static_cast<size_t>(pi)]; grid[key(q, 0, 0, 0)].push_back(q); }
+                        auto shared = [&](const Eigen::Vector3f& q) {
+                            for (int dx = -1; dx <= 1; ++dx) for (int dy = -1; dy <= 1; ++dy) for (int dz = -1; dz <= 1; ++dz) {
+                                const auto it = grid.find(key(q, dx, dy, dz));
+                                if (it == grid.end()) continue;
+                                for (const auto& l : it->second) if ((l - q).squaredNorm() <= e * e) return true;
+                            }
+                            return false;
+                        };
+                        double best_ratio = 0.0; size_t best_n = 0;
+                        best = -1;
+                        for (size_t fi = 0; fi < fused.size(); ++fi) {
+                            if (fused[fi].yolo_refined) continue;
+                            std::vector<char> m(fused[fi].pts.size(), 0);
+                            size_t n = 0;
+                            for (size_t q = 0; q < fused[fi].pts.size(); ++q) if (shared(fused[fi].pts[q])) { m[q] = 1; ++n; }
+                            if (static_cast<int>(n) < camera_min_points_) continue;
+                            const double ratio = static_cast<double>(n) / static_cast<double>(fused[fi].pts.size());
+                            // the object that explains the MOST of the leaf (most shared points); the share of the object
+                            // only breaks ties — ranking by it favoured small objects lying next to the leaf (a bollard
+                            // beside a parked bike, entirely within the margin of a few leaf points)
+                            if (n > best_n || (n == best_n && ratio > best_ratio)) {
+                                best_ratio = ratio; best_n = n; best = static_cast<int>(fi); leaf_member = std::move(m);
+                            }
+                        }
+                        if (best >= 0) { by_points = true; best_iou = obf::obbOverlap3D(lb, fused[static_cast<size_t>(best)].box, 0.0).iou; second_iou = -1.0; }
+                    }
                     // Nested leaf (yolo_refine_nested): no object overlaps the leaf enough by IoU, but one CONTAINS it
                     // — a parked bike merged with its rack and neighbours into one larger cluster, whose IoU with the
                     // bike's small leaf is far below yolo_refine_min_iou. That object is cut to the leaf as below.
-                    bool nested = false;
-                    if (best < 0 && yolo_refine_nested_) {
+                    bool nested = by_points;
+                    if (!by_points && best < 0 && yolo_refine_nested_) {
                         double best_vol = std::numeric_limits<double>::max();
                         const double lvol = lb.size.x() * lb.size.y() * lb.size.z();
                         for (size_t fi = 0; fi < fused.size(); ++fi) {
@@ -1109,7 +1154,9 @@ private:
                         maskName(o.mask).c_str(), best_iou, center_dist);
                     const Eigen::Matrix3d Rl = lb.rotation.toRotationMatrix().transpose();
                     std::vector<Eigen::Vector3f> inside, rest;
-                    for (const auto& q : o.pts) {
+                    if (by_points) {
+                        for (size_t q = 0; q < o.pts.size(); ++q) (leaf_member[q] ? inside : rest).push_back(o.pts[q]);
+                    } else for (const auto& q : o.pts) {
                         const Eigen::Vector3d d = Rl * (q.cast<double>() - lb.center);
                         (std::abs(d.x()) <= lb.size.x() * 0.5 + yolo_refine_margin_ && std::abs(d.y()) <= lb.size.y() * 0.5 + yolo_refine_margin_ &&
                          std::abs(d.z()) <= lb.size.z() * 0.5 + yolo_refine_margin_ ? inside : rest).push_back(q);
@@ -1364,6 +1411,7 @@ private:
     bool yolo_refine_enabled_{true}, yolo_keep_rest_{true};
     std::map<std::string, double> yolo_class_min_height_;  // see yolo_class_min_height_classes
     bool yolo_refine_nested_{false};  // see the nested-leaf case in the refinement loop
+    bool yolo_refine_points_{false};  // yolo_refine_assoc == "points"
     double yolo_refine_min_iou_{0.12}, yolo_refine_margin_{0.10}, yolo_refine_min_iou_margin_{0.05};
     double yolo_refine_min_retention_{0.35};
     bool leaves_enabled_{true};

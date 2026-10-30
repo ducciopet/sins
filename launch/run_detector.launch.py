@@ -397,7 +397,11 @@ def _launch_setup(context, *args, **kwargs):
             parameters=[
                 ParameterFile(os.path.join(pkg_dir, 'cfg', env_str, 'tracker.yaml'), allow_substs=True),
                 {'use_sim_time': use_sim_time, 'camera_names': camera_names,
-                 'track_debug_lifecycle': LaunchConfiguration('tracker_debug_lifecycle').perform(context) == 'true'},
+                 'track_debug_lifecycle': LaunchConfiguration('tracker_debug_lifecycle').perform(context) == 'true',
+                 # mask leaves: the LiDAR-only fallback reads the same (instance-segmentation) detections as the leaves
+                 **({'yolo2d_topic_template': '/' + str(detection_yaml_params.get('detected_detections_topic_template', '')).lstrip('/')}
+                    if (yolo_leaf_method == 'mask' and detection_yaml_params.get('detected_detections_topic_template')
+                        and LaunchConfiguration('single_yolo').perform(context) == 'true') else {})},
             ],
         ))
 
@@ -488,7 +492,12 @@ def _launch_setup(context, *args, **kwargs):
     # (ahead of preprocessing_node's own Node(...), which needs
     # semantic_seg_params too — see that block's own comment).
     semantic_seg_nodes = []
-    if enable_semantic_segmentation:
+    # yolo_leaf_method == "mask": the instance-segmentation node already gives every detection (box + mask + track id),
+    # so the box node would only duplicate it — one YOLO per camera, as with "box". It still runs when its semantic
+    # (floor) segmentation is enabled; its own detection leg is then off.
+    seg_only_detector = (yolo_leaf_method == 'mask' and not bool(semantic_seg_params.get('enable_semantic', True))
+                         and LaunchConfiguration('single_yolo').perform(context) == 'true')
+    if enable_semantic_segmentation and not seg_only_detector:
         for name in camera_names:
             semantic_seg_nodes.append(Node(
                 package='sins',
@@ -680,6 +689,10 @@ def generate_launch_description():
         description='Whether to launch the YOLO11n-seg detection_nodes (cfg/<env>/detection.yaml). Off by '
                      'default — see the comment above this arg for why. Forced on regardless when '
                      'yolo_leaf_method=="mask" (that method needs this node\'s own instance masks).')
+    single_yolo_arg = DeclareLaunchArgument(
+        'single_yolo', default_value='true',
+        description='With yolo_leaf_method "mask": run only the instance-segmentation YOLO per camera (it gives boxes, '
+                    'masks and track ids) and point every consumer at it; false = also the box detector, as before.')
     yolo_leaf_method_arg = DeclareLaunchArgument(
         'yolo_leaf_method', default_value='',
         description='Empty (default): the env profile yolo_leaf_method (cfg/<env>/preprocessing.yaml, box if unset). '
@@ -753,6 +766,7 @@ def generate_launch_description():
         enable_calibration_arg,
         enable_yolo11_arg,
         yolo_leaf_method_arg,
+        single_yolo_arg,
         enable_yolo26_arg,
         enable_semantic_segmentation_arg,
         enable_semantic_ground_points_arg,

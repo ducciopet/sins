@@ -744,6 +744,13 @@ public:
             for (size_t i = 0; i < std::min(cls.size(), hgt.size()); ++i) class_min_height_[cls[i]] = hgt[i];
         }
         classified_corroboration_min_size_ = declare_parameter<double>("track_classified_corroboration_min_size", 0.0);
+        // true: EVERY classified track needs KF-confidence or point-vote corroboration to be dynamic (outdoors far
+        // still objects are seen in part and their cluster centre slides with the viewpoint, whatever their size)
+        classified_corroboration_all_ = declare_parameter<bool>("track_classified_corroboration_all", false);
+        // LiDAR-only semantic fallback (a LiDAR box projected onto the raw 2D YOLO boxes, see pixelCandidates): off
+        // when the leaves already reach beyond the depth range (masks + LiDAR points) and its monocular box overlap
+        // only adds wrong classes (outdoors: a bollard next to the many small boxes of a bike rack)
+        lidar_fallback_ = declare_parameter<bool>("track_lidar_fallback", true);
         class_anchor_ttl_ = declare_parameter<double>("track_class_anchor_ttl", 0.0);
         class_anchor_min_votes_ = declare_parameter<int>("track_class_anchor_min_votes", 2);
         class_anchor_radius_ = declare_parameter<double>("track_class_anchor_radius", 0.6);
@@ -1893,7 +1900,7 @@ private:
         // YOLO boxes, and each box is awarded to its single HIGHEST-IoU candidate only. Keyed by detection index
         // into msg->detections (not by track), since matched/new-track status isn't decided yet here.
         std::map<size_t, std::string> fallback_class;
-        {
+        if (lidar_fallback_) {  // track_lidar_fallback
             struct Claim { size_t di; double iou; std::string cls; };
             std::map<std::pair<int, size_t>, Claim> best_per_box;  // (cam_idx, 2D det idx) -> current best claim
 
@@ -2159,8 +2166,8 @@ private:
             // a large classified object (vehicle) is seen only in part and its cluster centre slides as the robot
             // views it from another side: from track_classified_corroboration_min_size up it needs the same
             // corroboration as an unclassified track
-            const bool large = classified_corroboration_min_size_ > 0.0 &&
-                               std::max(tr.size.x, tr.size.y) >= classified_corroboration_min_size_;
+            const bool large = classified_corroboration_all_ || (classified_corroboration_min_size_ > 0.0 &&
+                               std::max(tr.size.x, tr.size.y) >= classified_corroboration_min_size_);
             const bool motion_evidence = (classified_now && !large) ? speed_ok : (speed_ok && (kf_vel_confident || point_vote_evidence));
             // Disocclusion only gates the UNCLASSIFIED (PATH3) case — see this check's own first attempt at
             // scoping (only an actively-moving OTHER track counts at all) and the comment above on why PATH1/
@@ -2609,6 +2616,8 @@ private:
     std::vector<ClassAnchor> class_anchors_;
     std::map<std::string, double> class_min_height_;
     double classified_corroboration_min_size_{0.0};
+    bool classified_corroboration_all_{false};
+    bool lidar_fallback_{true};
     double class_anchor_ttl_{0.0}, class_anchor_radius_{0.6};
     int class_anchor_min_votes_{2};
 
