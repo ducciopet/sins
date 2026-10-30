@@ -121,7 +121,9 @@ def _launch_setup(context, *args, **kwargs):
     # above — single source of truth for detection.yaml's own topic names, needed to wire preprocessing_node's
     # "mask" yolo_leaf_method (see preprocessing_node.cpp's own yolo_leaf_method_ comment and this file's own
     # yolo_leaf_method_arg description).
-    yolo_leaf_method = LaunchConfiguration('yolo_leaf_method').perform(context)
+    yolo_leaf_method = LaunchConfiguration('yolo_leaf_method').perform(context).strip()
+    if not yolo_leaf_method:  # not given on the command line: the env profile's own choice (cfg/<env>/preprocessing.yaml)
+        yolo_leaf_method = str(preprocessing_params.get('yolo_leaf_method', 'box'))
     detection_yaml_params = {}
     if yolo_leaf_method == 'mask':
         detection_yaml_params = _load_node_params(
@@ -679,8 +681,9 @@ def generate_launch_description():
                      'default — see the comment above this arg for why. Forced on regardless when '
                      'yolo_leaf_method=="mask" (that method needs this node\'s own instance masks).')
     yolo_leaf_method_arg = DeclareLaunchArgument(
-        'yolo_leaf_method', default_value='box',
-        description='How preprocessing_node turns a YOLO 2D detection into 3D "semantic leaf" points (see '
+        'yolo_leaf_method', default_value='',
+        description='Empty (default): the env profile yolo_leaf_method (cfg/<env>/preprocessing.yaml, box if unset). '
+                    'How preprocessing_node turns a YOLO 2D detection into 3D "semantic leaf" points (see '
                      'preprocessing_node.cpp\'s own yolo_leaf_method_ comment). "box" (default): crop the '
                      'detection\'s 2D box out of the depth cloud, then isolate its own depth cluster within '
                      'that crop (histogram mode + valley-bounded window) — works with the existing COCO '

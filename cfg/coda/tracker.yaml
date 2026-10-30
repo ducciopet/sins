@@ -218,7 +218,7 @@ tracker_node:
     track_class_handover_dist: 0.5          # [m] class handover: a track born this close to a classified track's prediction, from a detection that track passed over...
     track_class_handover_window: 3.0        # [s] ...inherits the class if the classified track gives it up (identity swap) or dies within this time
     track_class_anchor_ttl: 5.0             # [s] class memory of still objects (0 = off): a still track inherits the class repeatedly seen at its spot by YOLO until this long without a new sighting — far parked objects get a YOLO vote only every ~2 s and their tracks fragment; 5 s = the life of an unclassified still track (track_stationary_max_ticks)
-    track_class_anchor_min_votes: 2         # strong (depth-leaf) votes at the spot before it passes the class on
+    track_class_anchor_min_votes: 2         # strong (depth-leaf) votes at the spot before it passes the class on (3 tried on CODa: fewer parked bikes found, no fewer false PD on bollards)
     track_class_anchor_radius: 0.6          # [m] same spot
     track_class_min_height_classes: [car, truck, bus]   # LiDAR-only fallback: a class only for an object at least this tall (as dbscan yolo_class_min_height_*)
     track_class_min_height_values: [1.1, 1.1, 1.5]     # [m]

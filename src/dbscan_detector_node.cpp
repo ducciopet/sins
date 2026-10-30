@@ -185,6 +185,7 @@ public:
         // rejecting it outright.
         yolo_refine_min_iou_ = declare_parameter<double>("yolo_refine_min_iou", 0.12);
         yolo_refine_margin_ = declare_parameter<double>("yolo_refine_margin", 0.10);
+        yolo_refine_nested_ = declare_parameter<bool>("yolo_refine_nested", false);
         // Minimum physical height per class (parallel lists; empty = no check): a YOLO class is only given to an
         // object at least that tall (see the size check in the refinement loop)
         {
@@ -1020,6 +1021,26 @@ private:
                         if (v > best_iou) { second_iou = best_iou; best_iou = v; best = static_cast<int>(fi); }
                         else if (v > second_iou) { second_iou = v; }
                     }
+                    // Nested leaf (yolo_refine_nested): no object overlaps the leaf enough by IoU, but one CONTAINS it
+                    // — a parked bike merged with its rack and neighbours into one larger cluster, whose IoU with the
+                    // bike's small leaf is far below yolo_refine_min_iou. That object is cut to the leaf as below.
+                    bool nested = false;
+                    if (best < 0 && yolo_refine_nested_) {
+                        double best_vol = std::numeric_limits<double>::max();
+                        const double lvol = lb.size.x() * lb.size.y() * lb.size.z();
+                        for (size_t fi = 0; fi < fused.size(); ++fi) {
+                            if (fused[fi].yolo_refined) continue;
+                            const auto& fb = fused[fi].box;
+                            const double fvol = fb.size.x() * fb.size.y() * fb.size.z();
+                            const Eigen::Vector3d dl = fb.rotation.toRotationMatrix().transpose() * (lb.center - fb.center);
+                            const bool inside = std::abs(dl.x()) <= 0.5 * fb.size.x() && std::abs(dl.y()) <= 0.5 * fb.size.y() &&
+                                                std::abs(dl.z()) <= 0.5 * fb.size.z() + yolo_refine_margin_;
+                            if (inside && fvol > lvol && obf::obbOverlap3D(lb, fb, 0.0).iov >= 0.5 && fvol < best_vol) {
+                                best_vol = fvol; best = static_cast<int>(fi);
+                            }
+                        }
+                        if (best >= 0) { nested = true; best_iou = obf::obbOverlap3D(lb, fused[static_cast<size_t>(best)].box, 0.0).iou; second_iou = -1.0; }
+                    }
                     if (best < 0) {
                         if (best_any >= 0) {
                             const auto& bf = fused[static_cast<size_t>(best_any)];
@@ -1052,7 +1073,7 @@ private:
                     // so their centers should be near-coincident — reject a "best" that is really just adjacent.
                     const double center_dist = (lb.center - fused[static_cast<size_t>(best)].box.center).norm();
                     const double allowed = 0.5 * lb.size.norm() + yolo_refine_margin_;
-                    if (center_dist > allowed) {
+                    if (!nested && center_dist > allowed) {
                         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                             "yolo_refine: skipped distant match (%s leaf %zu class=%s, center_dist=%.2fm > allowed=%.2fm, iou=%.2f, leaf_size=[%.2f,%.2f,%.2f], fused_size=[%.2f,%.2f,%.2f]) — "
                             "closest-IoU candidate was not actually co-located with the leaf", camera_names_[k].c_str(), li, leaves.box_class[li].c_str(), center_dist, allowed, best_iou,
@@ -1099,7 +1120,8 @@ private:
                     // was pre-cut, is rejected the same way: skip this tick, never publish a marginal match.
                     const double retention = o.pts.empty() ? 0.0 :
                         static_cast<double>(inside.size()) / static_cast<double>(o.pts.size());
-                    if (static_cast<int>(inside.size()) < camera_min_points_ || retention < yolo_refine_min_retention_) {
+                    // (a nested cut keeps by construction a small part of the larger object: only the absolute floor)
+                    if (static_cast<int>(inside.size()) < camera_min_points_ || (!nested && retention < yolo_refine_min_retention_)) {
                         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
                             "yolo_refine: skipped low-retention cut (%s leaf %zu class=%s, inside=%zu rest=%zu "
                             "of %zu pre-cut, retention=%.0f%% < %.0f%%)", camera_names_[k].c_str(), li,
@@ -1114,6 +1136,10 @@ private:
                     ic /= static_cast<double>(inside.size());
                     Obb pbox = obf::computeObb(inside, iidx, yaw_only_, yaw_only_ ? localUp(floor_planes_, ic) : Eigen::Vector3d::UnitZ());
                     if (!boxOk(pbox, inside)) continue;
+                    // the size check above on the object that is actually kept (a nested cut keeps only a part)
+                    if (const auto mh = yolo_class_min_height_.find(leaves.box_class[li]); mh != yolo_class_min_height_.end() &&
+                        pbox.size.z() < mh->second)
+                        continue;
                     const unsigned omask = o.mask;
                     // Re-clustered with the LiDAR's own radii/min-points — correct for any object that went
                     // through mergeGroups (Phase 1 mutual-match, split-residual, or Phase 2 nested-absorb, all
@@ -1337,6 +1363,7 @@ private:
     SplitParams split_;
     bool yolo_refine_enabled_{true}, yolo_keep_rest_{true};
     std::map<std::string, double> yolo_class_min_height_;  // see yolo_class_min_height_classes
+    bool yolo_refine_nested_{false};  // see the nested-leaf case in the refinement loop
     double yolo_refine_min_iou_{0.12}, yolo_refine_margin_{0.10}, yolo_refine_min_iou_margin_{0.05};
     double yolo_refine_min_retention_{0.35};
     bool leaves_enabled_{true};
