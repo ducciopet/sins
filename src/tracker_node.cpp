@@ -704,6 +704,9 @@ public:
         // contaminated tick (e.g. dbscan_detector_node's own nested-cluster merge briefly fusing a person with
         // nearby static clutter) painting a long-lived static track with a passing person's class.
         first_class_confirm_ticks_ = declare_parameter<int>("track_first_class_confirm_ticks", 2);
+        // false: any weak (pixel-fallback) vote restarts the strong-evidence streak of an established still track;
+        // true: only a vote for a DIFFERENT class does (see voteClass)
+        first_class_weak_keeps_streak_ = declare_parameter<bool>("track_first_class_weak_keeps_streak", false);
         // Established-track motion corroboration (no v1 equivalent — see voteClass()'s own comment): a track
         // with at least this many matched hits (and still unclassified) uses its own debounce window
         // (track_first_class_established_confirm_ticks) and additionally requires NET displacement across
@@ -1539,7 +1542,10 @@ private:
                 tr.pending_class_start_pos = cur_pos;
             }
             ++tr.pending_class_ticks;
-            tr.pending_strong_ticks = strong ? tr.pending_strong_ticks + 1 : 0;
+            // a weak vote of the SAME class agrees with the strong ones: with first_class_weak_keeps_streak it leaves
+            // the streak as is (a far parked bike alternates depth-leaf and pixel-fallback evidence tick by tick)
+            if (strong) ++tr.pending_strong_ticks;
+            else if (!first_class_weak_keeps_streak_) tr.pending_strong_ticks = 0;
             const bool established = tr.hits >= first_class_established_hits_;
             const int need_ticks = established ? first_class_established_confirm_ticks_ : first_class_confirm_ticks_;
             if (tr.pending_class_ticks < need_ticks) return;
@@ -2508,6 +2514,7 @@ private:
     double floor_z_{0.0};
     bool floor_ok_{false};
     int first_class_confirm_ticks_{2};
+    bool first_class_weak_keeps_streak_{false};
     int first_class_established_hits_{10};
     int first_class_established_confirm_ticks_{2};
     double first_class_min_jump_{0.08};

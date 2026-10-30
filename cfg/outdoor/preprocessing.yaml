@@ -94,6 +94,8 @@ preprocessing_node:
     yolo_class_names_path: cfg/coco.names   # same class list the YOLO detection nodes use, loaded to turn each leaf's class STRING into a small numeric index for the leaves cloud (see publishSemanticLeaves)
     yolo_leaf_max_age: 0.3             # [s] ignore detections older than this
     yolo_leaf_lidar_beyond_depth: true   # true = the latest LiDAR scan's points beyond depth_max_value also feed each detection's leaf (a YOLO detection farther than the depth camera sees still labels its LiDAR cluster)
+    yolo_leaf_nearest_cluster: true      # true = a leaf made mostly of LiDAR points beyond depth_max_value takes the NEAREST depth cluster in its box with >= yolo_leaf_min_points points, not the most populated one: a thin far object (parked bike) has fewer LiDAR returns in its YOLO box than the wall behind it
+    yolo_leaf_min_box_coverage: 0.5      # ...and that cluster must span at least this fraction of the box width in the image: the object fills its own box sideways, a bollard in front of a parked bike does not
     depth_trigger_max_wait_sec: 0.15   # give up on a scan if no camera frame reaches it within this
 
     # -----------------------------------------------------------------------

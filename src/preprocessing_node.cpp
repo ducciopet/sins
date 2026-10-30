@@ -363,6 +363,12 @@ public:
         // long-range LiDAR does not) still yields a leaf, so the object it labels is classified; within the depth
         // range nothing changes. false = depth-only leaves (indoor profile: RealSense range covers the room).
         yolo_leaf_lidar_beyond_depth_ = this->declare_parameter("yolo_leaf_lidar_beyond_depth", false);
+        // Depth window of a leaf: false = the most populated depth cluster in the box (indoor: dense depth, the
+        // object fills its box); true = the nearest cluster with at least yolo_leaf_min_points points (see
+        // depthModeValleyWindow), for sparse LiDAR leaves of thin far objects whose box shows mostly background.
+        yolo_leaf_nearest_cluster_ = this->declare_parameter("yolo_leaf_nearest_cluster", false);
+        // with yolo_leaf_nearest_cluster: the chosen cluster must span at least this fraction of the box width
+        yolo_leaf_min_box_coverage_ = this->declare_parameter("yolo_leaf_min_box_coverage", 0.5);
         // Same class list the YOLO detection nodes use (cfg/coco.names by default) — loaded here only to turn a
         // detection's class STRING into a small numeric index for the semantic-leaves cloud (see
         // publishSemanticLeaves's own comment on why a number, not the string, travels on the wire).
@@ -663,6 +669,8 @@ private:
     bool yolo_leaf_lidar_beyond_depth_{false};
     // latest LiDAR scan after the floor/roof crop (global frame), kept for yolo_leaf_lidar_beyond_depth_
     pcl::PointCloud<pcl::PointXYZ> lidar_leaf_cloud_;
+    bool yolo_leaf_nearest_cluster_ = false;
+    double yolo_leaf_min_box_coverage_ = 0.5;
     double lidar_leaf_stamp_{-1e9};
     double yolo_leaf_valley_fraction_{0.15};
     int yolo_leaf_min_points_{10};
@@ -1416,7 +1424,12 @@ private:
     // to it in depth, however close that gap is, while keeping the object's own full extent if it's genuinely
     // deep (points stay dense all the way through, no valley to stop at). yolo_leaf_depth_tolerance_ remains an
     // absolute safety cap on top, in case a noisy/sparse histogram never finds a clean valley.
-    std::pair<float, float> depthModeValleyWindow(const std::vector<float>& depths) const {
+    std::pair<float, float> depthModeValleyWindow(const std::vector<float>& depths, const std::vector<float>* us = nullptr,
+                                                  double box_width = 0.0) const {
+        // nearest-cluster rule only for a leaf made mostly of LiDAR points beyond the depth range (sparse returns
+        // of a far object); a leaf inside the depth range keeps the most populated cluster (dense depth)
+        const bool nearest = yolo_leaf_nearest_cluster_ &&
+            2 * std::count_if(depths.begin(), depths.end(), [this](float d) { return d > depth_max_; }) > static_cast<long>(depths.size());
         const float dmin = *std::min_element(depths.begin(), depths.end());
         const float dmax = *std::max_element(depths.begin(), depths.end());
         const int nBins = std::max(1, static_cast<int>(std::ceil((dmax - dmin) / static_cast<float>(yolo_leaf_depth_bin_))) + 1);
@@ -1430,8 +1443,39 @@ private:
         for (int i = 1; i < nBins; ++i) if (hist[static_cast<size_t>(i)] > hist[static_cast<size_t>(bestBin)]) bestBin = i;
         const int valleyFloor = std::max(1, static_cast<int>(std::ceil(hist[static_cast<size_t>(bestBin)] * yolo_leaf_valley_fraction_)));
         int lo = bestBin, hi = bestBin;
-        while (lo > 0 && hist[static_cast<size_t>(lo - 1)] >= valleyFloor) --lo;
-        while (hi < nBins - 1 && hist[static_cast<size_t>(hi + 1)] >= valleyFloor) ++hi;
+        bool found = false;
+        if (nearest) {
+            // the nearest valley-bounded depth cluster with at least yolo_leaf_min_points points, instead of the
+            // most populated one: the detected object is in FRONT of whatever shows around it in its 2D box, and
+            // for a thin object (a bike at 10+ m, ~20 LiDAR returns) the wall behind it has more points than it
+            for (int s = 0; s < nBins;) {
+                if (hist[static_cast<size_t>(s)] < valleyFloor) { ++s; continue; }
+                int e = s, n = 0, peak = s;
+                while (e < nBins && hist[static_cast<size_t>(e)] >= valleyFloor) {
+                    n += hist[static_cast<size_t>(e)];
+                    if (hist[static_cast<size_t>(e)] > hist[static_cast<size_t>(peak)]) peak = e;
+                    ++e;
+                }
+                // ...that also spans at least yolo_leaf_min_box_coverage of the box width in the image: the
+                // detected object fills its own box sideways, a narrower thing in front of it (a bollard before a
+                // parked bike) does not
+                bool wide = true;
+                if (us && box_width > 0.0) {
+                    const float zlo = dmin + static_cast<float>(s) * static_cast<float>(yolo_leaf_depth_bin_);
+                    const float zhi = dmin + static_cast<float>(e) * static_cast<float>(yolo_leaf_depth_bin_);
+                    float umin = std::numeric_limits<float>::max(), umax = std::numeric_limits<float>::lowest();
+                    for (size_t q = 0; q < depths.size(); ++q)
+                        if (depths[q] >= zlo && depths[q] < zhi) { umin = std::min(umin, (*us)[q]); umax = std::max(umax, (*us)[q]); }
+                    wide = umax - umin >= yolo_leaf_min_box_coverage_ * box_width;
+                }
+                if (n >= yolo_leaf_min_points_ && wide) { bestBin = peak; lo = s; hi = e - 1; found = true; break; }
+                s = e;
+            }
+        }
+        if (!found) {  // most populated cluster (also when no cluster qualifies for the nearest rule)
+            while (lo > 0 && hist[static_cast<size_t>(lo - 1)] >= valleyFloor) --lo;
+            while (hi < nBins - 1 && hist[static_cast<size_t>(hi + 1)] >= valleyFloor) ++hi;
+        }
         const float modeDepth = dmin + (static_cast<float>(bestBin) + 0.5f) * static_cast<float>(yolo_leaf_depth_bin_);
         const float depthLo = std::max(dmin + static_cast<float>(lo) * static_cast<float>(yolo_leaf_depth_bin_),
                                        modeDepth - static_cast<float>(yolo_leaf_depth_tolerance_));
@@ -1559,6 +1603,7 @@ private:
             }
             std::sort(boxes.begin(), boxes.end(), [](const Box& a, const Box& b) { return a.area < b.area; });  // smallest first
             std::vector<std::vector<std::pair<float, Eigen::Vector3f>>> inside(boxes.size());  // (depth, point in depth frame)
+            std::vector<std::vector<float>> inside_u(boxes.size());                            // image column of each
             for (const auto& pt : cloud.points) {
                 const Eigen::Vector4d pc = cam.T_color_depth * Eigen::Vector4d(pt.x, pt.y, pt.z, 1.0);
                 if (pc.z() <= 0.05) continue;
@@ -1566,6 +1611,7 @@ private:
                 for (size_t b = 0; b < boxes.size(); ++b)
                     if (u >= boxes[b].x0 && u <= boxes[b].x1 && v >= boxes[b].y0 && v <= boxes[b].y1) {
                         inside[b].push_back({static_cast<float>(pc.z()), Eigen::Vector3f(pt.x, pt.y, pt.z)});
+                        inside_u[b].push_back(static_cast<float>(u));
                         break;  // a point belongs to the smallest box that contains it
                     }
             }
@@ -1580,7 +1626,8 @@ private:
                 // pixels inside its box too — depthModeValleyWindow() isolates the dominant depth cluster
                 // (see its own comment) instead of anchoring on the single nearest depth, which systematically
                 // picked the occluder's surface instead of the detected object's own.
-                const auto [depthLo, depthHi] = depthModeValleyWindow(depths);
+                const double box_w = (boxes[b].x1 - boxes[b].x0) / (1.0 + 2.0 * yolo_leaf_box_inflate_);  // un-inflated
+                const auto [depthLo, depthHi] = depthModeValleyWindow(depths, &inside_u[b], box_w);
                 Leaf leaf{boxes[b].id, boxes[b].class_idx, {}};
                 for (const auto& q : v)
                     if (q.first >= depthLo && q.first <= depthHi) {
@@ -2041,7 +2088,14 @@ private:
         global_cloud.width = static_cast<uint32_t>(global_cloud.points.size());
         global_cloud.height = 1;
         if (yolo_leaf_lidar_beyond_depth_) {
-            lidar_leaf_cloud_ = global_cloud;
+            // the same wall strip as the published cloud (pass 5): a leaf is matched against clusters of that cloud,
+            // and a thin object in front of a wall (a parked bike) has fewer returns in its YOLO box than the wall
+            // behind it, so with the wall left in the leaf's depth mode lands on the wall, where no cluster exists
+            lidar_leaf_cloud_.clear();
+            for (const auto& pt : global_cloud.points)
+                if (!isNearAnyWall(Eigen::Vector3d(pt.x, pt.y, pt.z))) lidar_leaf_cloud_.points.push_back(pt);
+            lidar_leaf_cloud_.width = static_cast<uint32_t>(lidar_leaf_cloud_.points.size());
+            lidar_leaf_cloud_.height = 1;
             lidar_leaf_stamp_ = rclcpp::Time(lidar_msg->header.stamp).seconds();
         }
 

@@ -115,6 +115,7 @@ preprocessing_node:
     yolo_class_names_path: cfg/coco.names   # same class list the YOLO detection nodes use, loaded to turn each leaf's class STRING into a small numeric index for the leaves cloud (see publishSemanticLeaves)
     yolo_leaf_max_age: 0.3             # [s] ignore detections older than this
     yolo_leaf_lidar_beyond_depth: false   # true = the latest LiDAR scan's points beyond depth_max_value also feed each detection's leaf (a YOLO detection farther than the depth camera sees still labels its LiDAR cluster)
+    yolo_leaf_nearest_cluster: false     # dense depth: the object fills its box, the most populated depth cluster is the object
     depth_trigger_max_wait_sec: 0.15   # give up on a scan if no camera frame reaches it within this
 
     # -----------------------------------------------------------------------

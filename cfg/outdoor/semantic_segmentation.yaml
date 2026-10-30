@@ -56,7 +56,7 @@ yolo_semantic_seg_detector:
     detection_decode_reduced: 2               # JPEG decoded at 1/N size (1,2,4,8): 2 -> 640x360, what the detector uses anyway
     detection_frame_stride: 2                 # free-running: 1 frame every N (2 of 30 Hz = 15 Hz)
     detection_score_threshold: 0.5
-    detection_inference_size: 640
+    detection_inference_size: 1280   # outdoor: the color camera's native width; objects at 10-25 m are only 30-50 px tall (640: half the parked bikes found on CODa seq 0)
     detection_enable_tracking: true
     detection_tracker: bytetrack.yaml
     detections_topic_template: 'yolo_semantic_seg/{camera}/detections'          # vision_msgs/Detection2DArray, id = persistent ByteTrack id
