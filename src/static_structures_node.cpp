@@ -236,6 +236,13 @@ public:
         // ground_height param uses.
         floor_max_tilt_deg_ = this->declare_parameter("floor_max_tilt_deg", 25.0);
         floor_ema_alpha_ = this->declare_parameter("floor_ema_alpha", 0.1);
+        // The floor is the LOWEST near-horizontal plane, and it lies BELOW the sensor that sees it. false (default) = the
+        // first (best-supported) near-horizontal plane is the floor, as before; true = every near-horizontal plane of the
+        // max_planes extracted is a candidate, those with the sensor under them (ceiling, canopy) are skipped, and the
+        // lowest of the rest wins (not a table top). Needed when a camera's depth reaches above the floor's near field:
+        // horizontal cameras with LiDAR-projected depth (JRDB) see ceilings and tables, which as the largest horizontal
+        // planes became the "floor" and cropped the people. A downward RealSense sees the floor first anyway.
+        floor_lowest_below_sensor_ = this->declare_parameter("floor_lowest_below_sensor", false);
         ground_height_ = this->declare_parameter("ground_height", -0.3);
 
         // GSeg3D ground estimate — see the file header's own section and
@@ -1077,6 +1084,7 @@ private:
                                             bool detect_walls, bool detect_floor) {
         const Eigen::Vector3d up_sensor = T_global_sensor.linear().transpose() * Eigen::Vector3d::UnitZ();
         DetectionResult result;
+        double best_floor_d = 0.0;   // floor_lowest_below_sensor_: sensor height above the lowest floor candidate so far
 
         for (int p = 0; p < max_planes_; ++p) {
             if (static_cast<int>(pts.size()) < ransac_min_inliers_) break;
@@ -1093,7 +1101,7 @@ private:
                 // see DetectionResult::wall_points_global's own comment.
                 result.wall_points_global.reserve(result.wall_points_global.size() + inliers.size());
                 for (const auto& p : inliers) result.wall_points_global.push_back(T_global_sensor * p);
-            } else if (detect_floor && !result.floor_found && isFloorCandidate(plane, up_sensor)) {
+            } else if (detect_floor && (!result.floor_found || floor_lowest_below_sensor_) && isFloorCandidate(plane, up_sensor)) {
                 // Orient normal toward "up" before transforming, same
                 // convention preprocessing_node's own floor fit used —
                 // signedDistance() downstream (there, not here — this node
@@ -1103,6 +1111,10 @@ private:
                     plane.normal = -plane.normal;
                     plane.d = -plane.d;
                 }
+                // normal up: n.x + d = 0, the sensor origin's height above the plane is d (see floor_lowest_below_sensor_)
+                if (floor_lowest_below_sensor_ && (plane.d <= 0.0 || (result.floor_found && plane.d <= best_floor_d))) continue;
+                best_floor_d = plane.d;
+                result.floor_points_global.clear();
                 result.floor_plane_global = transformPlane(plane, T_global_sensor);
                 result.floor_found = true;
                 result.floor_points_global.reserve(inliers.size());
@@ -1529,6 +1541,7 @@ private:
     double wall2d_perp_tol_deg_{20.0}, wall2d_split_margin_{0.5}, wall2d_split_half_gap_{0.3}, wall2d_junction_reach_{1.0};
     double nested_merge_iov_thresh_{0.5};
     double floor_max_tilt_deg_{25.0};
+    bool floor_lowest_below_sensor_{false};
     double floor_ema_alpha_{0.1};
     double ground_height_{-0.3};
 

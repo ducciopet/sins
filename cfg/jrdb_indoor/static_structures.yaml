@@ -1,5 +1,6 @@
 static_structures_node:
   ros__parameters:
+    floor_lowest_below_sensor: true  # jrdb_indoor (not in base)
     # -----------------------------------------------------------------------
     # Topics / frames — camera_names/camera_frame_names MUST match
     # cfg/indoor/preprocessing.yaml's own camera_names (run_detector.launch.py
