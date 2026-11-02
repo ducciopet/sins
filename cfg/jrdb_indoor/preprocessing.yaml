@@ -5,6 +5,7 @@ preprocessing_node:
     ground_grid_tol: 0.15  # jrdb_indoor (not in base)
     ground_grid_cell: 0.25  # jrdb_indoor (not in base)
     ground_model: "grid"  # jrdb_indoor (not in base)
+    yolo_leaf_mask_box_fallback: true  # jrdb_indoor (not in base)
     cam8: {"aligned_depth_transport": "zstd", "aligned_depth_cloud_topic": "/cam8/camera/depth/color/points", "depth_max_value": 15.0}  # jrdb_indoor (not in base)
     cam6: {"aligned_depth_transport": "zstd", "aligned_depth_cloud_topic": "/cam6/camera/depth/color/points", "depth_max_value": 15.0}  # jrdb_indoor (not in base)
     cam4: {"aligned_depth_transport": "zstd", "aligned_depth_cloud_topic": "/cam4/camera/depth/color/points", "depth_max_value": 15.0}  # jrdb_indoor (not in base)
@@ -108,7 +109,7 @@ preprocessing_node:
     # detection's box, foreground only, with the detection's track id per point. The detections topic per camera is forwarded from
     # semantic_segmentation.yaml by run_detector.launch.py.
     #
-    yolo_leaf_method: box            # read by run_detector.launch.py when its yolo_leaf_method arg is empty: the 2D boxes of the box detector: objects are near and covered by the depth camera
+    yolo_leaf_method: "mask"  # jrdb_indoor (base: box)            # read by run_detector.launch.py when its yolo_leaf_method arg is empty: the 2D boxes of the box detector: objects are near and covered by the depth camera
     # (older note) yolo_leaf_method: unset here on purpose, same reasoning as calibration_enabled above — run_detector.launch.py's
     # own yolo_leaf_method arg (default "box") forwards it, single source of truth shared with which topics get
     # wired into yolo_detections_topic/yolo_mask_topic below. "box" = the box-crop + mode/valley extraction this

@@ -56,7 +56,7 @@ yolo_semantic_seg_detector:
     detection_trigger_policy: latest          # latest = infer on the newest frame already received (no wait, offset -35..-70 ms); nearest_wait = wait for a frame at/after the scan (aligned, ~35 ms later)
     detection_trigger_stamp_offset_sec: 0.0   # added to the scan stamp (stamp = END of scan; -0.05 targets the scan middle)
     detection_trigger_max_wait_sec: 0.15      # give up on a trigger if no camera frame reaches it within this
-    detection_decode_reduced: 2               # JPEG decoded at 1/N size (1,2,4,8): 2 -> 640x360, what the detector uses anyway
+    detection_decode_reduced: 1  # jrdb_indoor (base: 2)               # JPEG decoded at 1/N size (1,2,4,8): 2 -> 640x360, what the detector uses anyway
     detection_frame_stride: 2                 # free-running: 1 frame every N (2 of 30 Hz = 15 Hz)
     detection_score_threshold: 0.5
     detection_inference_size: 640
