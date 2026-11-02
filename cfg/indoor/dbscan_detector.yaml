@@ -63,8 +63,8 @@ dbscan_detector_node:
     yolo_refine_enabled: true
     yolo_refine_min_iou: 0.12         # 3D IoU between the leaf's box and the object needed to refine it — a genuinely correct match for a non-rectangular object (person) via a plain 2D box tops out around 0.15-0.3, not near 1.0, since the box always includes some same-depth background around the silhouette; the distance-sanity check below is the REAL correctness guard, not this threshold
     yolo_refine_margin: 0.10          # [m] the leaf's oriented box is grown by this before cutting
-    yolo_class_min_height_classes: []   # outdoor only (vehicles); see cfg/outdoor
-    yolo_class_min_height_values: []
+    # yolo_class_min_height_classes: []  # outdoor only (vehicles); see cfg/outdoor. Left unset: an empty YAML list has no type for ROS 2 (the node aborts), the code default is already empty
+    # yolo_class_min_height_values: []
     yolo_refine_nested: false
     yolo_refine_assoc: iou
     yolo_refine_min_iou_margin: 0.05  # misattribution guard: min IoU lead the winning fused object needs over the runner-up, else skip as ambiguous (a person close to another object can make its box a near-tie) — also rejects a winner whose center is not near-coincident with the leaf's own box, so a nearby object never inherits the person's class. Lowered alongside yolo_refine_min_iou: a fixed 0.08 was disproportionately strict once typical correct-match IoU dropped to ~0.15-0.3
