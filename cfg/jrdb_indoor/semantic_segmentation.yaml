@@ -1,0 +1,67 @@
+yolo_semantic_seg_detector:
+  ros__parameters:
+    # -----------------------------------------------------------------------
+    # Generic, configurable-class semantic segmentation via Ultralytics
+    # YOLO26-sem (Cityscapes-pretrained) — NOT the same task as
+    # detection*.yaml's instance segmentation+tracking — see
+    # scripts/yolo_semantic_seg_detector.py's own header for the full
+    # reasoning. This node has no built-in notion of what segmentation_classes
+    # is "for" (floor, pedestrians, vehicles, ...) — that meaning lives
+    # entirely in this file, per deployment.
+    #
+    # camera_names below is only the standalone-run fallback:
+    # run_detector.launch.py overrides it with preprocessing.yaml's own list,
+    # same forwarding as static_structures_node/detection*.yaml, so every node
+    # agrees on which cameras exist.
+    # -----------------------------------------------------------------------
+    camera_names: ["cam0", "cam2", "cam4", "cam6", "cam8"]  # jrdb_indoor (base: ["front_camera", "back_camera"])
+    image_topic_template: '/{camera}/camera/color/image_raw'
+    detected_image_topic_template: 'yolo_semantic_seg/{camera}/detected_image'      # + '/compressed' for the JPEG counterpart — segmentation_classes region tinted, for eyeballing quality
+    semantic_mask_topic_template: 'yolo_semantic_seg/{camera}/semantic_mask'        # mono8 label image, pixel value = cfg/cityscapes.names index (0-18); raw only, lossy JPEG would corrupt class indices
+    segmentation_mask_topic_template: 'yolo_semantic_seg/{camera}/segmentation_mask' # mono8, 0 or 255 — "is this pixel one of segmentation_classes"; raw only
+    semantic_color_topic_template: 'yolo_semantic_seg/{camera}/semantic_color'      # + '/compressed' — ALL 19 classes tinted at once (fixed Cityscapes color per class), for seeing more than just segmentation_classes
+    inference_time_topic_template: 'yolo_semantic_seg/{camera}/inference_time'
+
+    enable_semantic: false   # floor semantic segmentation off: its only consumer is semantic_ground_points (RViz); floor removal uses the RANSAC planes. Saves a full-res decode + a second inference pass per camera
+    weights_path: weights/yolo26s-sem.pt
+    class_names_path: cfg/cityscapes.names
+    # Which Cityscapes classes (see class_names_path) get folded into
+    # segmentation_mask/the overlay — the ONLY place this node's purpose is
+    # decided. Any subset of: road, sidewalk, building, wall, fence, pole,
+    # traffic light, traffic sign, vegetation, terrain, sky, person, rider,
+    # car, truck, bus, train, motorcycle, bicycle. This default
+    # (road+sidewalk+terrain) is just the walkable-ground example this node
+    # was first built for — swap freely, e.g. ["person", "rider"] for a
+    # pedestrian mask.
+    segmentation_classes: ["road", "sidewalk", "terrain"]
+    inference_size: 1024     # [px] matches Ultralytics' own Cityscapes benchmark resolution; validated visually against bags/20260910_124939_validation_lab at this size
+    queue_size: 10
+    jpeg_quality: 80          # compressed annotated-image quality (0-100)
+    overlay_color_bgr: [0, 255, 0]  # tint color for the segmentation_classes region in detected_image (BGR, not RGB)
+    overlay_alpha: 0.5              # 0 = no tint, 1 = solid color, no original pixel visible
+    semantic_color_alpha: 0.6       # blend strength for semantic_color's full 19-class overlay (independent of overlay_alpha)
+    gpu_preprocess: true            # letterbox/normalize on the GPU instead of Ultralytics' CPU preprocessing (same aspect ratio => identical geometry)
+    stats_log_period_sec: 5.0       # how often each camera logs avg/max inference time + frames received/dropped
+
+    # -----------------------------------------------------------------------
+    # 2D detection + tracking (second model, own thread per camera). The
+    # Cityscapes semantic checkpoint above has no boxes, so boxes/track ids
+    # come from a separate COCO detector run on the same decoded frame.
+    # -----------------------------------------------------------------------
+    enable_detection: true
+    detection_weights_path: weights/yolo26s.pt
+    detection_class_names_path: cfg/coco.names
+    detection_target_classes: [person, bicycle, car, motorbike, bus, truck, dog, cat, horse]   # COCO names from cfg/coco.names
+    detection_trigger_topic: ''   # empty = YOLO free-running (asynchronous, no wait for the LiDAR); the fusion picks the detection closest in time
+    detection_trigger_policy: latest          # latest = infer on the newest frame already received (no wait, offset -35..-70 ms); nearest_wait = wait for a frame at/after the scan (aligned, ~35 ms later)
+    detection_trigger_stamp_offset_sec: 0.0   # added to the scan stamp (stamp = END of scan; -0.05 targets the scan middle)
+    detection_trigger_max_wait_sec: 0.15      # give up on a trigger if no camera frame reaches it within this
+    detection_decode_reduced: 2               # JPEG decoded at 1/N size (1,2,4,8): 2 -> 640x360, what the detector uses anyway
+    detection_frame_stride: 2                 # free-running: 1 frame every N (2 of 30 Hz = 15 Hz)
+    detection_score_threshold: 0.5
+    detection_inference_size: 640
+    detection_enable_tracking: true
+    detection_tracker: bytetrack.yaml
+    detections_topic_template: 'yolo_semantic_seg/{camera}/detections'          # vision_msgs/Detection2DArray, id = persistent ByteTrack id
+    detection_image_topic_template: 'yolo_semantic_seg/{camera}/detection_image' # boxes + track ids, only rendered when subscribed; + '/compressed'
+    detection_time_topic_template: 'yolo_semantic_seg/{camera}/detection_time'

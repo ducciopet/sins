@@ -1,0 +1,32 @@
+yolo_seg_track_detector:
+  ros__parameters:
+    # -----------------------------------------------------------------------
+    # Phase 2 prototype (see ../../README.md's phase plan) — instance
+    # segmentation + tracking, run on every camera in camera_names (each with
+    # its own tracker instance — see yolo_seg_track_detector.py's file
+    # header). Does not yet feed preprocessing_node.
+    #
+    # camera_names below is only the standalone-run fallback:
+    # run_detector.launch.py overrides it with preprocessing.yaml's own list,
+    # same forwarding as static_structures_node, so every node agrees on which
+    # cameras exist.
+    # -----------------------------------------------------------------------
+    camera_names: ["cam0", "cam2", "cam4", "cam6", "cam8"]  # jrdb_indoor (base: ["front_camera", "back_camera"])
+    image_topic_template: '/{camera}/camera/color/image_raw'
+    detected_image_topic_template: 'yolo_seg_track/{camera}/detected_image'   # + '/compressed' for the JPEG counterpart
+    detected_masks_topic_template: 'yolo_seg_track/{camera}/instance_masks'   # 32SC1 label image, pixel value = track id (0 = background); raw only, see file header
+    detected_detections_topic_template: 'yolo_seg_track/{camera}/detections'  # vision_msgs/Detection2DArray, id = track id
+    inference_time_topic_template: 'yolo_seg_track/{camera}/inference_time'   # per-frame inference timing
+
+    weights_path: weights/yolo11n-seg.pt    # COCO-pretrained YOLO11n segmentation checkpoint (shared across cameras)
+    class_names_path: cfg/coco.names
+    target_classes: [person]
+    score_threshold: 0.5     # min confidence required to keep a detection/track
+    # No timer_period_sec: processing is worker-thread-driven per camera now
+    # (see yolo_seg_track_detector.py's file header), not timer-polled —
+    # a fixed-period timer measurably dropped ~18% of frames to phase
+    # misalignment against the camera's own publish jitter.
+    inference_size: 640      # [px] YOLO input resolution (lower = faster, less accurate at distance)
+    queue_size: 10
+    jpeg_quality: 80          # compressed annotated-image quality (0-100)
+    tracker: bytetrack.yaml  # motion/IoU tracker, ships with ultralytics — see file header for why not botsort

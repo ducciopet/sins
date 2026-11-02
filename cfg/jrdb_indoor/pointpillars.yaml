@@ -1,0 +1,50 @@
+pointpillars_detector:
+  ros__parameters:
+    # -----------------------------------------------------------------------
+    # 3D object detection on raw /velodyne_points via OpenPCDet's
+    # PointPillars, official nuScenes checkpoint (10 classes: car, truck,
+    # construction_vehicle, bus, trailer, barrier, motorcycle, bicycle,
+    # pedestrian, traffic_cone). See scripts/pointpillars_detector.py's own
+    # header for the full story on why a patched, vendored OpenPCDet
+    # (torch2.14/CUDA13.1 vs spconv), and its "Alternate input" section for
+    # exactly what cloud_frame_mode/use_point_features below do.
+    #
+    # Raw /velodyne_points, not a fused/preprocessed cloud: empirically
+    # validated this session against preprocessing_node's own fused_cloud
+    # (LiDAR + camera depth, voxel-merged, floor/wall-cropped, XYZ-only) —
+    # raw LiDAR with its REAL intensity+per-point-time (use_point_features
+    # true) produced far more, and more plausible, detections (e.g.
+    # human-scale "pedestrian" boxes landing on real point clusters) than
+    # fused_cloud's zero-padded features ever did, likely from a combination
+    # of real intensity/time, a much denser single-sweep cloud (~28k points
+    # vs fused_cloud's ~5-7k after crop+voxel-merge), and a more stable rigid
+    # frame transform (static TF vs a drifting odometry pose) — see this
+    # session's own comparison captures. fused_cloud itself has since been
+    # removed from preprocessing_node.cpp entirely (was only ever built for
+    # this).
+    #
+    # Still not a tuned detector: the checkpoint's own multi-sweep training
+    # assumption (meaningless for a single sweep) and street-vehicle class
+    # set (no real cars/trucks in this robot's scenes) remain a genuine
+    # domain gap — see this session's own PointPillars-input research.
+    # -----------------------------------------------------------------------
+    cloud_topic: '/velodyne_points'
+    odom_topic: '/odometry/filtered'    # matches preprocessing_node.cpp's own odom_topic_ default — used to place detections in global_frame_, see scripts/pointpillars_detector.py's own header
+    cloud_frame_mode: 'static_tf'   # /velodyne_points is in a fixed sensor frame (velodyne), not odom — base_frame_ -> velodyne resolved once via TF and cached (rigid mount)
+    use_point_features: true        # read REAL intensity + per-point time off /velodyne_points instead of zero-padding
+    detections_topic: 'pointpillars/detections'          # vision_msgs/Detection3DArray
+    markers_topic: 'pointpillars/bbox_markers'            # visualization_msgs/MarkerArray — same CUBE convention as static_structures_node's wall_markers
+    inference_time_topic: 'pointpillars/inference_time'
+    global_frame: odom          # matches preprocessing_node.cpp's own global_frame_ — every detection published here, boxes transformed from base_frame back into this frame
+    base_frame: base_link       # matches preprocessing_node.cpp's own base_frame_ — points transformed INTO this (ego) frame before voxelizing, see file header on why
+
+    # Vendored OpenPCDet + official checkpoint (not part of this ROS
+    # package — see scripts/pointpillars_detector.py's own header for why).
+    openpcdet_path: /home/ros/thirdparty/OpenPCDet
+    config_path: tools/cfgs/nuscenes_models/cbgs_pp_multihead.yaml
+    checkpoint_path: /home/ros/thirdparty/checkpoints/pointpillar_nuscenes_cbgs_multihead.pth
+
+    score_thresh: 0.3    # matches cbgs_pp_multihead.yaml's own POST_PROCESSING.SCORE_THRESH order of magnitude (0.1); raised here to cut down low-confidence noise for visualization
+    max_voxels: 30000     # matches cbgs_pp_multihead.yaml's own DATA_PROCESSOR.MAX_NUMBER_OF_VOXELS
+    queue_size: 5
+    stats_log_period_sec: 5.0

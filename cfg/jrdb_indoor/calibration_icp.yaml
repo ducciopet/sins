@@ -1,0 +1,44 @@
+calibration_icp_node:
+  ros__parameters:
+    depth_topic: /front_camera/camera/depth/image_rect_raw
+    depth_transport: compressedDepth       # override to 'zstd' against bags/*_validation_lab, 'raw' against jo_sim
+    # depth_cloud_topic / depth_to_color_extrinsics_topic: unset here on
+    # purpose — run_detector.launch.py's calibration_nodes loop forwards
+    # per-camera values straight from cfg/<env>/preprocessing.yaml's own
+    # <name>.aligned_depth_cloud_topic (see that file's own comment and
+    # calibration_icp_node.cpp's file header), so there's a single place to
+    # flip a camera between native-cloud and deprojection, not two. Only
+    # matters when running calibration_icp_node standalone (not through
+    # run_detector.launch.py) — set depth_cloud_topic there if so.
+    velodyne_topic: /velodyne_points
+    lidar_frame: velodyne                         # TF frame of the LiDAR
+    urdf_camera_frame: camera                     # logical camera frame name (used in output TF/logs)
+    camera_frame_initial_guess: camera_initial_guess  # TF frame providing the initial LiDAR->camera transform guess
+    refined_camera_frame: camera_refined          # name of the TF frame published after ICP refinement
+    icp_max_correspondence_distance: 0.2   # [m] max point-to-point distance considered an ICP correspondence
+    icp_max_iteration: 100                 # max ICP iterations per run
+    icp_voxel_size: 0.05                   # [m] voxel down-sampling before ICP (0 = disabled)
+    icp_use_point_to_plane: true           # true = GICP (per-point covariances); false = point-to-point ICP
+    icp_normal_radius: 0.15                # [m] unused by the gtsam_points/GICP backend, kept for reference
+    icp_normal_max_nn: 30                  # unused by the gtsam_points/GICP backend, kept for reference
+    icp_num_threads: 4                     # threads used by the GICP/ICP correspondence search
+    min_overlap_points: 100                # min LiDAR points in camera FOV; if fewer, full cloud is used as target
+    overlap_fov_margin_px: 120             # [px] margin added around image boundary when computing FOV overlap
+    icp_max_runs: 5                        # number of independent ICP scenes to collect before averaging
+    icp_fitness_threshold: 0.3             # min ICP fitness score to accept a result (0-1, higher = better fit)
+    is_indoor: true                        # indoor: no timeout fallback, wait for full ICP calibration
+    recalibration_period_sec: 0.0          # 0 = one-shot calibration only (default). >0 = after the initial
+                                            # one-shot calibration, re-run registration every N seconds and
+                                            # replace camera_refined only when the new result is VALID.
+    depth_intrinsics: [436.9647521972656, 436.9647521972656, 431.9205627441406, 240.13380432128906] # [fx, fy, cx, cy]
+                                            # bootstrap only now — overwritten live from camera_info_topic
+                                            # (see below) the moment a CameraInfo message arrives; kept so the
+                                            # node still starts up usably if that topic is ever misconfigured.
+    # camera_info_topic: unset here on purpose — run_detector.launch.py's
+    # calibration_nodes loop forwards a per-camera value
+    # (/<name>/camera/color/camera_info). Only matters when running
+    # calibration_icp_node standalone; set it there if so.
+    depth_scale_factor: 1000.0           # raw_value / scale = meters
+    depth_min_value: 0.5                 # [m]
+    depth_max_value: 5.0                 # [m] slightly larger than the aligned-depth cloud's crop to include edge points during calibration
+    depth_skip_pixel: 2                  # subsample every N pixels
