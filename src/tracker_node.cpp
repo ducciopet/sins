@@ -2644,6 +2644,10 @@ private:
             }
         }
         if (!best || best->votes < class_anchor_min_votes_ || now - best->last > class_anchor_ttl_) return std::string();
+        // the remembered class obeys the same physical minimum height as the camera and LiDAR-only paths
+        // (track_class_min_height_*): a 0.5 m object beside a parked van must not inherit "truck" from the spot
+        if (const auto mh = class_min_height_.find(best->cls); mh != class_min_height_.end() && tr.size.z < mh->second)
+            return std::string();
         if (tr.best_class.empty()) {
             tr.best_class = best->cls;
             tr.class_votes[best->cls] = std::max(tr.class_votes[best->cls], 1);
