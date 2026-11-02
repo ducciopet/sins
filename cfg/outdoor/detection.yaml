@@ -29,6 +29,9 @@ yolo_seg_track_detector:
     class_names_path: cfg/coco.names
     target_classes: [person, bicycle, car, motorbike, bus, truck, dog, cat, horse]   # outdoor: the box detector's own detection_target_classes (semantic_segmentation.yaml), so with yolo_leaf_method=mask every movable class gets a pixel-exact leaf
     score_threshold: 0.5     # min confidence required to keep a detection/track
+    # outdoor: bicycles kept from 0.3. Parked bikes at 15-20 m packed in a rack score 0.3-0.5 with this model at 1280
+    # (CODa seq 0: 48 of 77 missed bike boxes); one inference at the lowest threshold, other classes still at 0.5
+    class_score_thresholds: ["bicycle:0.3"]
     # No timer_period_sec: processing is worker-thread-driven per camera now
     # (see yolo_seg_track_detector.py's file header), not timer-polled —
     # a fixed-period timer measurably dropped ~18% of frames to phase

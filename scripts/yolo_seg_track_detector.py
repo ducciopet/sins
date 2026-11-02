@@ -177,6 +177,14 @@ class YoloSegTrackDetector(Node):
         self.class_names_path = str(self.declare_parameter('class_names_path', '').value)
         self.target_classes = list(self.declare_parameter('target_classes', ['person']).value)
         self.score_threshold = float(self.declare_parameter('score_threshold', 0.5).value)
+        # Per-class minimum confidence, overriding score_threshold for the listed classes ("bicycle:0.3"). YOLO runs
+        # once at the lowest threshold and the other classes are dropped below score_threshold afterwards: same single
+        # inference. Outdoor: parked bikes at 15-20 m, packed in a rack, score 0.3-0.5 (CODa seq 0).
+        self.class_score_thresholds = {}
+        for item in list(self.declare_parameter('class_score_thresholds', ['']).value):
+            if item.strip():
+                name, thr = item.split(':')
+                self.class_score_thresholds[name.strip()] = float(thr)
         self.inference_size = int(self.declare_parameter('inference_size', 640).value)
         self.queue_size = int(self.declare_parameter('queue_size', 10).value)
         self.jpeg_quality = int(self.declare_parameter('jpeg_quality', 80).value)
@@ -400,7 +408,7 @@ class YoloSegTrackDetector(Node):
         see the id-handling comment below)."""
         common_kwargs = dict(
             classes=self.target_class_ids,
-            conf=self.score_threshold,
+            conf=min([self.score_threshold, *self.class_score_thresholds.values()]),
             imgsz=self.inference_size,
             device=device,
             # quantize=16 is the current spelling of what used to be
@@ -466,6 +474,8 @@ class YoloSegTrackDetector(Node):
         polygons = result.masks.xy if result.masks is not None else [None] * len(ids)
 
         for i in range(len(ids)):
+            if confs[i] < self.class_score_thresholds.get(self.label_names[cls_ids[i]], self.score_threshold):
+                continue
             obj_id = int(ids[i])
             polygon = polygons[i] if i < len(polygons) else None
             # mask_label's 0 means background. A real track id (enable_tracking=true) is assigned by
