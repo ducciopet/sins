@@ -128,6 +128,15 @@ preprocessing_node:
     # -----------------------------------------------------------------------
     ground_height: -0.3             # [m] bootstrap floor Z in global_frame, before static_structures_node's first fit arrives
     ground_roof_offset: 3.0         # [m] roof = floor_plane_global_ + this
+    # Ground model for every floor/roof crop: "grid" = terrain-following height map grown from the robot (cameras near
+    # it, the full LiDAR scan where it reaches, the robot's base plane in the LiDAR's blind cone; include/sins/ground_grid.hpp),
+    # "planes" = the per-camera floor planes (min over them). On CODa terrain labels (w2/w3, eval/diagnostics/
+    # coda_ground_eval.py) the planes cut 49% of the people's legs in w2 and left 4-8% of hard ground.
+    ground_model: grid
+    ground_grid_cell: 0.25          # [m]
+    ground_grid_tol: 0.15           # [m] |surface - height predicted along the local slope|: sensor noise + pebble size
+    ground_grid_max_slope_deg: 40.0 # [deg] steepest terrain the grid follows
+    ground_grid_memory_s: 30.0      # [s] ground seen earlier stays known under whatever covers it
 
     # -----------------------------------------------------------------------
     # LiDAR — final downsample (after transform + crop)

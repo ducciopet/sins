@@ -220,6 +220,7 @@
 #include <deque>
 #include <vector>
 #include <memory>
+#include "sins/ground_grid.hpp"
 
 class PreprocessingNode : public rclcpp::Node {
 public:
@@ -421,6 +422,25 @@ public:
         rclcpp::QoS qos(10);
         pub_lidar_processed_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
             "/sins/lidar/processed", qos);
+
+        // Ground model used by every floor/roof crop (heightAboveGround): "planes" = the per-camera floor planes from
+        // static_structures_node (min over them), the lab default; "grid" = a terrain-following height map grown from
+        // the robot (include/sins/ground_grid.hpp): cameras near the robot, the full LiDAR scan where it reaches, the
+        // robot's own base plane in the LiDAR's blind cone. Outside the grid the planes still apply.
+        ground_model_ = this->declare_parameter("ground_model", std::string("planes"));
+        if (ground_model_ == "grid") {
+            sins::GroundGrid::Params gp;
+            gp.cell = this->declare_parameter("ground_grid_cell", gp.cell);
+            gp.tol = this->declare_parameter("ground_grid_tol", gp.tol);
+            gp.max_grad_deg = this->declare_parameter("ground_grid_max_slope_deg", gp.max_grad_deg);
+            gp.radius = this->declare_parameter("ground_grid_radius", std::max(lidar_range_x_, lidar_range_y_));
+            gp.memory_s = this->declare_parameter("ground_grid_memory_s", gp.memory_s);
+            gp.robot_radius = this->declare_parameter("ground_grid_robot_radius", gp.robot_radius);
+            ground_grid_ = std::make_unique<sins::GroundGrid>(gp);
+            pub_ground_grid_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/sins/ground/grid", 1);
+            RCLCPP_INFO(this->get_logger(), "ground_model: grid (cell %.2f m, tol %.2f m, max slope %.0f deg, radius %.1f m)",
+                        gp.cell, gp.tol, gp.max_grad_deg, gp.radius);
+        }
         // Tiny per-scan trigger (header only, stamp = the scan's own stamp),
         // published the moment a scan is accepted in onLidarOdom, before any
         // heavy processing — lets other nodes (YOLO detection) run ONE
@@ -643,6 +663,9 @@ private:
     std::shared_ptr<message_filters::Synchronizer<SyncPolicy>> sync_;
 
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_lidar_processed_;
+    std::string ground_model_{"planes"};
+    std::unique_ptr<sins::GroundGrid> ground_grid_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_ground_grid_;
     rclcpp::Publisher<std_msgs::msg::Header>::SharedPtr pub_scan_trigger_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_lidar_voxelized_;
     rclcpp::Subscription<visualization_msgs::msg::MarkerArray>::SharedPtr sub_wall_markers_;
@@ -1014,6 +1037,10 @@ private:
     // plane (the bootstrap, or only one camera ever finding a floor) this
     // reduces to the original single-plane behavior exactly.
     double heightAboveGround(const Eigen::Vector3d& p_global) const {
+        if (ground_grid_) {                       // ground_model "grid": the height map, planes only outside it
+            const double hg = ground_grid_->heightAbove(p_global);
+            if (std::isfinite(hg)) return hg;
+        }
         double h_min = std::numeric_limits<double>::infinity();
         for (const auto& plane : floor_planes_global_) {
             h_min = std::min(h_min, plane.signedDistance(p_global));
@@ -1903,6 +1930,13 @@ private:
         // here so publishGroundPoints() can reuse the exact same logic.
         Eigen::Matrix4d T_global_depth;
         const bool have_global_tf = computeGlobalDepthTransform(cam, frame_id, is_native_depth_frame, T_global_depth);
+        if (ground_grid_ && have_global_tf) {     // the camera's near field for the ground height map
+            std::vector<Eigen::Vector3d> gpts;
+            gpts.reserve(depth_downsampled->points.size());
+            for (const auto& pt : depth_downsampled->points)
+                gpts.emplace_back((T_global_depth * Eigen::Vector4d(pt.x, pt.y, pt.z, 1.0)).head<3>());
+            ground_grid_->setCameraPoints(cam.name, std::move(gpts), rclcpp::Time(stamp).seconds());
+        }
 
         // Debug-only global-frame republish (pub_depth_voxelized_global —
         // see that member's own comment on why). Same T_global_depth as the
@@ -2118,6 +2152,27 @@ private:
         // period stale for it, which is fine for a floor/wall crop.
         T_global_base_latest_ = T_global_base;
         has_odom_ = true;
+
+        // ground_model "grid": this scan (all of it, before any crop: the floor band is what it needs) + the latest
+        // camera depth points grow the height map the crops below use.
+        if (ground_grid_) {
+            std::vector<Eigen::Vector3d> gpts;
+            gpts.reserve(local_pts.size());
+            for (const auto& p : local_pts) gpts.emplace_back((T_global_lidar * p).head<3>());
+            ground_grid_->update(gpts, T_global_base, rclcpp::Time(lidar_msg->header.stamp).seconds());
+            if (pub_ground_grid_->get_subscription_count() > 0) {
+                pcl::PointCloud<pcl::PointXYZ> gc;
+                for (const auto& q : ground_grid_->cellsForDisplay())
+                    gc.points.emplace_back(static_cast<float>(q.x()), static_cast<float>(q.y()), static_cast<float>(q.z()));
+                gc.width = static_cast<uint32_t>(gc.points.size());
+                gc.height = 1;
+                sensor_msgs::msg::PointCloud2 gm;
+                pcl::toROSMsg(gc, gm);
+                gm.header.stamp = lidar_msg->header.stamp;
+                gm.header.frame_id = global_frame_;
+                pub_ground_grid_->publish(gm);
+            }
+        }
 
         // Pass 3 (global frame, one combined loop): transform local_pts +
         // slope-aware floor/roof crop together, using heightAboveGround()

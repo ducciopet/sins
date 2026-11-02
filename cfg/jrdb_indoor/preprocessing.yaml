@@ -1,5 +1,10 @@
 preprocessing_node:
   ros__parameters:
+    ground_grid_memory_s: 30.0  # jrdb_indoor (not in base)
+    ground_grid_max_slope_deg: 40.0  # jrdb_indoor (not in base)
+    ground_grid_tol: 0.15  # jrdb_indoor (not in base)
+    ground_grid_cell: 0.25  # jrdb_indoor (not in base)
+    ground_model: "grid"  # jrdb_indoor (not in base)
     cam8: {"aligned_depth_transport": "zstd", "aligned_depth_cloud_topic": "/cam8/camera/depth/color/points", "depth_max_value": 15.0}  # jrdb_indoor (not in base)
     cam6: {"aligned_depth_transport": "zstd", "aligned_depth_cloud_topic": "/cam6/camera/depth/color/points", "depth_max_value": 15.0}  # jrdb_indoor (not in base)
     cam4: {"aligned_depth_transport": "zstd", "aligned_depth_cloud_topic": "/cam4/camera/depth/color/points", "depth_max_value": 15.0}  # jrdb_indoor (not in base)
