@@ -226,6 +226,9 @@ public:
         // the absolute floor rejects a marginal/coincidental overlap outright rather than accepting it as a
         // valid, if small, match.
         yolo_refine_min_retention_ = declare_parameter<double>("yolo_refine_min_retention", 0.35);
+        // diagnostic: every yolo_refine rejection is logged (with the leaf position), not one per 2 s — offline
+        // attribution of a still object whose leaf never classified its cluster (eval/diagnostics/pd_funnel.py)
+        yolo_refine_log_all_ = declare_parameter<bool>("yolo_refine_log_all", false);
         yolo_keep_rest_ = declare_parameter<bool>("yolo_refine_keep_rest", true);
         leaves_enabled_ = declare_parameter<bool>("leaves_enabled", true);
         leaves_topic_template_ = declare_parameter<std::string>("leaves_topic_template", "/sins/{camera}/semantic_leaves");
@@ -992,6 +995,8 @@ private:
             // own second-best candidate, or nothing. Ranking every leaf by its own best achievable IoU BEFORE
             // any claiming starts, and processing strongest-match-first, means the leaf with the clearest claim
             // on an object always gets it, independent of which camera or array position it happened to be in.
+#define REFINE_WARN(...) do { if (yolo_refine_log_all_) RCLCPP_WARN(this->get_logger(), __VA_ARGS__); \
+    else RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, __VA_ARGS__); } while (0)
             struct LeafRef { size_t k, li; double rank_iou; };
             std::vector<LeafRef> leaf_refs;
             for (size_t k = 0; k < camera_names_.size(); ++k) {
@@ -1090,7 +1095,7 @@ private:
                         if (best_any >= 0) {
                             const auto& bf = fused[static_cast<size_t>(best_any)];
                             const double d = (lb.center - bf.box.center).norm();
-                            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                            REFINE_WARN(
                                 "yolo_refine: no candidate at all (%s leaf %zu class=%s, leaf_pos=[%.2f,%.2f,%.2f] leaf_size=[%.2f,%.2f,%.2f]) — "
                                 "closest fused obj: iou=%.3f dist=%.2fm pos=[%.2f,%.2f,%.2f] size=[%.2f,%.2f,%.2f] mask=%s",
                                 camera_names_[k].c_str(), li, leaves.box_class[li].c_str(),
@@ -1098,7 +1103,7 @@ private:
                                 best_any_iou, d, bf.box.center.x(), bf.box.center.y(), bf.box.center.z(),
                                 bf.box.size.x(), bf.box.size.y(), bf.box.size.z(), maskName(bf.mask).c_str());
                         } else {
-                            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                            REFINE_WARN(
                                 "yolo_refine: no candidate at all (%s leaf %zu class=%s, leaf_pos=[%.2f,%.2f,%.2f] leaf_size=[%.2f,%.2f,%.2f]) — "
                                 "ZERO unclaimed fused objects exist at all this tick (all already yolo_refined, or fused[] is empty)",
                                 camera_names_[k].c_str(), li, leaves.box_class[li].c_str(), lb.center.x(), lb.center.y(), lb.center.z(),
@@ -1109,9 +1114,9 @@ private:
                     // ambiguous: a near-tied runner-up means this could easily be the wrong (merely adjacent)
                     // object — skip rather than risk tagging a generic neighbor with the person's class.
                     if (second_iou >= 0.0 && (best_iou - second_iou) < yolo_refine_min_iou_margin_) {
-                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                            "yolo_refine: skipped ambiguous match (%s leaf %zu class=%s, best_iou=%.2f second_iou=%.2f) — "
-                            "would have risked tagging the wrong nearby object", camera_names_[k].c_str(), li, leaves.box_class[li].c_str(), best_iou, second_iou);
+                        REFINE_WARN(
+                            "yolo_refine: skipped ambiguous match (%s leaf %zu class=%s, leaf_pos=[%.2f,%.2f,%.2f] best_iou=%.2f second_iou=%.2f) — "
+                            "would have risked tagging the wrong nearby object", camera_names_[k].c_str(), li, leaves.box_class[li].c_str(), lb.center.x(), lb.center.y(), lb.center.z(), best_iou, second_iou);
                         continue;
                     }
                     // sanity: the leaf and its true match are built from overlapping views of the SAME object,
@@ -1119,9 +1124,9 @@ private:
                     const double center_dist = (lb.center - fused[static_cast<size_t>(best)].box.center).norm();
                     const double allowed = 0.5 * lb.size.norm() + yolo_refine_margin_;
                     if (!nested && center_dist > allowed) {
-                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                            "yolo_refine: skipped distant match (%s leaf %zu class=%s, center_dist=%.2fm > allowed=%.2fm, iou=%.2f, leaf_size=[%.2f,%.2f,%.2f], fused_size=[%.2f,%.2f,%.2f]) — "
-                            "closest-IoU candidate was not actually co-located with the leaf", camera_names_[k].c_str(), li, leaves.box_class[li].c_str(), center_dist, allowed, best_iou,
+                        REFINE_WARN(
+                            "yolo_refine: skipped distant match (%s leaf %zu class=%s, leaf_pos=[%.2f,%.2f,%.2f] center_dist=%.2fm > allowed=%.2fm, iou=%.2f, leaf_size=[%.2f,%.2f,%.2f], fused_size=[%.2f,%.2f,%.2f]) — "
+                            "closest-IoU candidate was not actually co-located with the leaf", camera_names_[k].c_str(), li, leaves.box_class[li].c_str(), lb.center.x(), lb.center.y(), lb.center.z(), center_dist, allowed, best_iou,
                             lb.size.x(), lb.size.y(), lb.size.z(),
                             fused[static_cast<size_t>(best)].box.size.x(), fused[static_cast<size_t>(best)].box.size.y(), fused[static_cast<size_t>(best)].box.size.z());
                         continue;
@@ -1130,9 +1135,9 @@ private:
                     // a bollard in front of a van falls inside the van's YOLO box/mask but is not 1.5 m tall
                     if (const auto mh = yolo_class_min_height_.find(leaves.box_class[li]); mh != yolo_class_min_height_.end() &&
                         fused[static_cast<size_t>(best)].box.size.z() < mh->second) {
-                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                            "yolo_refine: skipped too low for its class (%s leaf %zu class=%s, object height %.2f m < %.2f m)",
-                            camera_names_[k].c_str(), li, leaves.box_class[li].c_str(),
+                        REFINE_WARN(
+                            "yolo_refine: skipped too low for its class (%s leaf %zu class=%s, leaf_pos=[%.2f,%.2f,%.2f] object height %.2f m < %.2f m)",
+                            camera_names_[k].c_str(), li, leaves.box_class[li].c_str(), lb.center.x(), lb.center.y(), lb.center.z(),
                             fused[static_cast<size_t>(best)].box.size.z(), mh->second);
                         continue;
                     }
@@ -1169,10 +1174,10 @@ private:
                         static_cast<double>(inside.size()) / static_cast<double>(o.pts.size());
                     // (a nested cut keeps by construction a small part of the larger object: only the absolute floor)
                     if (static_cast<int>(inside.size()) < camera_min_points_ || (!nested && retention < yolo_refine_min_retention_)) {
-                        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                            "yolo_refine: skipped low-retention cut (%s leaf %zu class=%s, inside=%zu rest=%zu "
+                        REFINE_WARN(
+                            "yolo_refine: skipped low-retention cut (%s leaf %zu class=%s, leaf_pos=[%.2f,%.2f,%.2f] inside=%zu rest=%zu "
                             "of %zu pre-cut, retention=%.0f%% < %.0f%%)", camera_names_[k].c_str(), li,
-                            leaves.box_class[li].c_str(), inside.size(), rest.size(), o.pts.size(),
+                            leaves.box_class[li].c_str(), lb.center.x(), lb.center.y(), lb.center.z(), inside.size(), rest.size(), o.pts.size(),
                             retention * 100.0, yolo_refine_min_retention_ * 100.0);
                         continue;
                     }
@@ -1414,6 +1419,7 @@ private:
     bool yolo_refine_points_{false};  // yolo_refine_assoc == "points"
     double yolo_refine_min_iou_{0.12}, yolo_refine_margin_{0.10}, yolo_refine_min_iou_margin_{0.05};
     double yolo_refine_min_retention_{0.35};
+    bool yolo_refine_log_all_{false};
     bool leaves_enabled_{true};
     std::string leaves_topic_template_;
     std::vector<std::string> class_names_;
