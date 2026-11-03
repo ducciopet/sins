@@ -404,6 +404,8 @@ struct Track {
     double last_obs_stamp = 0.0;                         // [s] stamp of last_obs — see velocityDirectionError()
     int hits = 0;               // total matches since creation (never reset by a miss)
     int missed_in_a_row = 0;
+    bool matched_last_tick = false;   // matched to a detection on the previous tick (not missed, not occlusion-explained)
+    bool matched_prev = false;        // matched_last_tick as it was BEFORE this tick's update
     bool confirmed = false;
 
     // Consecutive ticks this (confirmed, matched) track was slow AND had no semantic evidence of being a
@@ -412,6 +414,9 @@ struct Track {
     // sense of ever deleting the track — this counter and the death it triggers are the one deliberate addition
     // beyond v1 (see the header).
     int stationary_ticks = 0;
+    // diagnostic (track_log_motion_block): this tick's motion-evidence flags, see the matched branch
+    bool dbg_speed_ok = false, dbg_kf_conf = false, dbg_vote = false, dbg_disocc = false;
+    double dbg_vote_ratio = -1.0;
     int dynamic_ticks = 0;   // consecutive ticks with (horizontal) speed >= track_dynamic_speed_thresh — see dynamic_confirm_ticks_
 
     // Semantic class: a majority vote across every tick that carried a YOLO class for this track (see
@@ -666,6 +671,15 @@ public:
         disocclusion_pos_hist_window_ = declare_parameter<int>("track_disocclusion_pos_hist_window", 10);
         disocclusion_min_cos_angle_ = declare_parameter<double>("track_disocclusion_min_cos_angle", 0.97);   // ~14 degrees
         disocclusion_min_range_margin_ = declare_parameter<double>("track_disocclusion_min_range_margin", 0.3);  // [m]
+        // [m] < 0 = off (only the fixed cone above). >= 0: the background revealed by a moving track can only lie
+        // behind that track's own silhouette, so the angular window is ALSO limited to the angle its footprint
+        // (half of max(size.x, size.y)) plus this lateral margin subtends at the recorded range. The fixed cone
+        // (~14 deg) is several metres wide at 10-20 m and, in a crowd, blocks any person walking behind another.
+        disocclusion_lateral_margin_ = declare_parameter<double>("track_disocclusion_lateral_margin", -1.0);
+        // true: a track matched on the previous tick is never a disocclusion artifact (it was visible, not hidden)
+        disocclusion_require_unseen_ = declare_parameter<bool>("track_disocclusion_require_unseen", false);
+        // [m] < 0 = no innovation condition on the rule above
+        disocclusion_seen_max_innov_ = declare_parameter<double>("track_disocclusion_seen_max_innovation", -1.0);
 
         // Dynamic-class whitelist (v1's own yoloDynamicClasses_, see dynamicDetector.cpp's own ingestion filter
         // — a detection whose class isn't in this list is never even considered a "YOLO candidate" there). v1
@@ -696,6 +710,9 @@ public:
         // dynamic/potentially-dynamic objects, so an object that settles for good should stop costing a track
         // slot and an id, not linger forever the way v1's own tracks do.
         track_publish_stationary_ = declare_parameter<bool>("track_publish_stationary", false);
+        // diagnostic only (default off): log every confirmed, unclassified, moving (KF speed >= the dynamic bar)
+        // track that is NOT labelled dynamic this tick, with the motion-evidence flags that held it back
+        log_motion_block_ = declare_parameter<bool>("track_log_motion_block", false);
         track_stationary_max_ticks_ = declare_parameter<int>("track_stationary_max_ticks", 50);
 
         // First-classification debounce (no v1 equivalent — see voteClass()'s own comment): how many CONSECUTIVE
@@ -1215,7 +1232,12 @@ private:
                 if (pRange < 1e-3) continue;
                 const double cosAngle = toCand.dot(toP) / (candRange * pRange);
                 if (cosAngle < disocclusion_min_cos_angle_) continue;
+                if (disocclusion_lateral_margin_ >= 0.0) {
+                    const double half = 0.5 * std::max(it->second.size.x, it->second.size.y) + disocclusion_lateral_margin_;
+                    if (cosAngle < std::cos(std::atan2(half, pRange))) continue;   // outside the occluder's silhouette
+                }
                 if (candRange <= pRange + disocclusion_min_range_margin_) continue;
+                dbg_occ_id_ = other_id; dbg_occ_p_ = P; dbg_occ_cand_ = cand_pos;   // diagnostic only
                 return true;
             }
         }
@@ -2007,9 +2029,11 @@ private:
                 } else {
                     ++tr.missed_in_a_row;
                 }
+                tr.matched_prev = tr.matched_last_tick; tr.matched_last_tick = false;
                 continue;
             }
             det_used[static_cast<size_t>(di)] = 1;
+            tr.matched_prev = tr.matched_last_tick; tr.matched_last_tick = true;
             tr.missed_in_a_row = 0;
             ++tr.hits;
             const auto& d = msg->detections[static_cast<size_t>(di)];
@@ -2190,12 +2214,41 @@ private:
             // AFTER this decision, so it still reads as "before this tick" here) is exactly that record.
             const bool had_dynamic_history = std::any_of(tr.dynamic_hist.begin(), tr.dynamic_hist.end(),
                                                           [](bool b) { return b; });
-            const bool blocked_by_disocclusion = disocclusion && !classified_now && !had_dynamic_history;
+            // An object the LiDAR saw on the previous tick was not hidden, so it cannot be background that has just
+            // become visible (track_disocclusion_require_unseen): in a crowd, the fixed cone otherwise blocks a
+            // person far behind every time a nearer walker crosses its line of sight.
+            // ...as long as this observation is where its own KF predicted it (track_disocclusion_seen_max_innovation):
+            // revealed background grabbed by an already-visible track (a static wall/fragment track) shows up as a
+            // jump away from the prediction, a person walking far behind does not.
+            const double disocc_innov = std::hypot(d.bbox.center.position.x - predicted_pos[ti].x(),
+                                                   d.bbox.center.position.y - predicted_pos[ti].y());
+            const bool seen_before = disocclusion_require_unseen_ && tr.matched_prev &&
+                                     (disocclusion_seen_max_innov_ < 0.0 || disocc_innov <= disocclusion_seen_max_innov_);
+            const bool blocked_by_disocclusion = disocclusion && !classified_now && !had_dynamic_history && !seen_before;
+            if (log_motion_block_ && disocclusion && !classified_now && !had_dynamic_history && seen_before) {
+                const auto oit = tracks_.find(dbg_occ_id_);
+                RCLCPP_WARN(get_logger(), "disocc_exempt: track #%d pos=[%.2f,%.2f] size=[%.2f,%.2f,%.2f] hits=%d innov=%.2f speed=%.2f "
+                    "occ=#%d occ_pos=[%.2f,%.2f] occ_size=[%.2f,%.2f] lidar=[%.2f,%.2f]", tr.id, d.bbox.center.position.x,
+                    d.bbox.center.position.y, d.bbox.size.x, d.bbox.size.y, d.bbox.size.z, tr.hits, disocc_innov, speed,
+                    dbg_occ_id_, dbg_occ_p_.x(), dbg_occ_p_.y(), oit != tracks_.end() ? oit->second.size.x : 0.0,
+                    oit != tracks_.end() ? oit->second.size.y : 0.0, lidar_origin_.x(), lidar_origin_.y());
+            }
+            if (blocked_by_disocclusion && log_motion_block_) {
+                const auto oit = tracks_.find(dbg_occ_id_);
+                RCLCPP_WARN(get_logger(), "disocc_hit: track #%d (hits=%d) cand=[%.2f,%.2f] by #%d (hits=%d dyn_ticks=%d best_class='%s' size=[%.2f,%.2f]) at P=[%.2f,%.2f] lidar=[%.2f,%.2f]",
+                    tr.id, tr.hits, dbg_occ_cand_.x(), dbg_occ_cand_.y(), dbg_occ_id_,
+                    oit != tracks_.end() ? oit->second.hits : -1, oit != tracks_.end() ? oit->second.dynamic_ticks : -1,
+                    oit != tracks_.end() ? oit->second.best_class.c_str() : "?",
+                    oit != tracks_.end() ? oit->second.size.x : 0.0, oit != tracks_.end() ? oit->second.size.y : 0.0,
+                    dbg_occ_p_.x(), dbg_occ_p_.y(), lidar_origin_.x(), lidar_origin_.y());
+            }
             if (blocked_by_disocclusion)
                 RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
                     "track #%d: suppressed as a probable disocclusion artifact (background revealed behind another track)",
                     tr.id);
             tr.dynamic_ticks = (motion_evidence && !blocked_by_disocclusion) ? tr.dynamic_ticks + 1 : 0;
+            tr.dbg_speed_ok = speed_ok; tr.dbg_kf_conf = kf_vel_confident; tr.dbg_vote = point_vote_evidence;
+            tr.dbg_disocc = blocked_by_disocclusion; tr.dbg_vote_ratio = voteRatio;
 
             // Position history for isDisocclusionArtifact()'s own use by OTHER tracks next tick.
             tr.pos_hist.push_back(Eigen::Vector3d(d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.center.position.z));
@@ -2357,6 +2410,19 @@ private:
                                     std::abs(tr.size.y - dynamic_target_size_.y()) < dynamic_size_tolerance_.y() &&
                                     std::abs(tr.size.z - dynamic_target_size_.z()) < dynamic_size_tolerance_.z();
                 if (!sizeOk) dynamic = false;
+            }
+            if (log_motion_block_ && !dynamic && tr.best_class.empty() && speed >= dynamic_speed_thresh_) {
+                bool size_ok = true;
+                if (dynamic_constrain_size_)
+                    size_ok = std::abs(tr.size.x - dynamic_target_size_.x()) < dynamic_size_tolerance_.x() &&
+                              std::abs(tr.size.y - dynamic_target_size_.y()) < dynamic_size_tolerance_.y() &&
+                              std::abs(tr.size.z - dynamic_target_size_.z()) < dynamic_size_tolerance_.z();
+                const Eigen::Vector3d p = tr.kf.pos();
+                RCLCPP_WARN(get_logger(), "motion_block: track #%d pos=[%.2f,%.2f] speed=%.2f fov=%d dyn_ticks=%d/%d "
+                    "speed_ok=%d kf_conf=%d vote=%d(%.2f) disocc=%d size_ok=%d size=[%.2f,%.2f,%.2f] hits=%d",
+                    tr.id, p.x(), p.y(), speed, insideAnyCameraFov(p) ? 1 : 0, tr.dynamic_ticks, confirm_ticks,
+                    tr.dbg_speed_ok, tr.dbg_kf_conf, tr.dbg_vote, tr.dbg_vote_ratio, tr.dbg_disocc, size_ok,
+                    tr.size.x, tr.size.y, tr.size.z, tr.hits);
             }
             // motion-earned PD (see track_motion_pd_min_dynamic_ticks): counts only the unclassified history
             if (!tr.best_class.empty()) {
@@ -2573,6 +2639,7 @@ private:
     int dynamic_kf_confidence_window_{5};
     double dynamic_kf_std_ratio_{0.50};
     bool dynamic_constrain_size_{true};
+    bool log_motion_block_{false};
     Eigen::Vector3d dynamic_target_size_{0.5, 0.5, 1.7}, dynamic_size_tolerance_{0.8, 0.8, 1.0};
     std::string fused_clusters_topic_;
     double point_vote_thresh_{0.7};
@@ -2583,6 +2650,12 @@ private:
     std::string lidar_frame_;
     int disocclusion_pos_hist_window_{10};
     double disocclusion_min_cos_angle_{0.97}, disocclusion_min_range_margin_{0.3};
+    double disocclusion_lateral_margin_{-1.0};
+    bool disocclusion_require_unseen_{false};
+    double disocclusion_seen_max_innov_{-1.0};
+    // diagnostic (track_log_motion_block): last disocclusion hit
+    mutable int dbg_occ_id_{-1};
+    mutable Eigen::Vector3d dbg_occ_p_{0, 0, 0}, dbg_occ_cand_{0, 0, 0};
     bool lidar_tf_ok_{false};
     Eigen::Vector3d lidar_origin_{0.0, 0.0, 0.0};
     bool track_publish_stationary_{false};
