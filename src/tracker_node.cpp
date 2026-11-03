@@ -467,6 +467,8 @@ struct Track {
     // the constructor's own comment for pos_hist (a short window of this track's own recent raw observations).
     std::vector<Eigen::Vector3f> prev_points;
     std::deque<Eigen::Vector3d> pos_hist;
+    // (stamp, raw xy) of this track's matched observations over the last track_disocclusion_travel_window s
+    std::deque<std::pair<double, Eigen::Vector2d>> travel_hist;
 };
 
 // Kuhn's algorithm augmenting-path search — mirrors jo_detector's own tryAugmentDetectionMatch/
@@ -680,6 +682,14 @@ public:
         disocclusion_require_unseen_ = declare_parameter<bool>("track_disocclusion_require_unseen", false);
         // [m] < 0 = no innovation condition on the rule above
         disocclusion_seen_max_innov_ = declare_parameter<double>("track_disocclusion_seen_max_innovation", -1.0);
+        // [s] < 0 = off. A track whose own matched observations, over this window, moved at least
+        // track_disocclusion_travel_min_dist in a nearly straight line (net/path >= ..._min_straightness) is not
+        // blocked as a disocclusion artifact: background revealed behind a passer-by, or a pole partly covered by
+        // one, only shifts its cluster centre by a fraction of its own width and then falls back, a person walking
+        // behind another covers metres in one direction.
+        disocclusion_travel_window_ = declare_parameter<double>("track_disocclusion_travel_window", -1.0);
+        disocclusion_travel_min_dist_ = declare_parameter<double>("track_disocclusion_travel_min_dist", 1.5);
+        disocclusion_travel_min_straightness_ = declare_parameter<double>("track_disocclusion_travel_min_straightness", 0.8);
 
         // Dynamic-class whitelist (v1's own yoloDynamicClasses_, see dynamicDetector.cpp's own ingestion filter
         // — a detection whose class isn't in this list is never even considered a "YOLO candidate" there). v1
@@ -2224,7 +2234,25 @@ private:
                                                    d.bbox.center.position.y - predicted_pos[ti].y());
             const bool seen_before = disocclusion_require_unseen_ && tr.matched_prev &&
                                      (disocclusion_seen_max_innov_ < 0.0 || disocc_innov <= disocclusion_seen_max_innov_);
-            const bool blocked_by_disocclusion = disocclusion && !classified_now && !had_dynamic_history && !seen_before;
+            // sustained straight travel (track_disocclusion_travel_window): see the parameter's own comment
+            bool travelled = false;
+            if (disocclusion_travel_window_ > 0.0) {
+                tr.travel_hist.emplace_back(stamp, Eigen::Vector2d(d.bbox.center.position.x, d.bbox.center.position.y));
+                while (tr.travel_hist.size() > 1 && tr.travel_hist.front().first < stamp - disocclusion_travel_window_)
+                    tr.travel_hist.pop_front();
+                if (tr.travel_hist.back().first - tr.travel_hist.front().first >= 0.8 * disocclusion_travel_window_) {
+                    double path = 0.0;
+                    for (size_t k = 1; k < tr.travel_hist.size(); ++k)
+                        path += (tr.travel_hist[k].second - tr.travel_hist[k - 1].second).norm();
+                    const double net = (tr.travel_hist.back().second - tr.travel_hist.front().second).norm();
+                    travelled = net >= disocclusion_travel_min_dist_ && net >= disocclusion_travel_min_straightness_ * path;
+                }
+            }
+            const bool blocked_by_disocclusion = disocclusion && !classified_now && !had_dynamic_history && !seen_before && !travelled;
+            if (log_motion_block_ && disocclusion && !classified_now && !had_dynamic_history && !seen_before && travelled)
+                RCLCPP_WARN(get_logger(), "disocc_travel: track #%d pos=[%.2f,%.2f] size=[%.2f,%.2f,%.2f] hits=%d speed=%.2f",
+                    tr.id, d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.size.x, d.bbox.size.y, d.bbox.size.z,
+                    tr.hits, speed);
             if (log_motion_block_ && disocclusion && !classified_now && !had_dynamic_history && seen_before) {
                 const auto oit = tracks_.find(dbg_occ_id_);
                 RCLCPP_WARN(get_logger(), "disocc_exempt: track #%d pos=[%.2f,%.2f] size=[%.2f,%.2f,%.2f] hits=%d innov=%.2f speed=%.2f "
@@ -2653,6 +2681,7 @@ private:
     double disocclusion_lateral_margin_{-1.0};
     bool disocclusion_require_unseen_{false};
     double disocclusion_seen_max_innov_{-1.0};
+    double disocclusion_travel_window_{-1.0}, disocclusion_travel_min_dist_{1.5}, disocclusion_travel_min_straightness_{0.8};
     // diagnostic (track_log_motion_block): last disocclusion hit
     mutable int dbg_occ_id_{-1};
     mutable Eigen::Vector3d dbg_occ_p_{0, 0, 0}, dbg_occ_cand_{0, 0, 0};
