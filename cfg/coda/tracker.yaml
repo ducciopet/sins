@@ -250,7 +250,7 @@ tracker_node:
     # debounce. A correctly-recognized but definitely-static object (e.g. "chair", "tv") behaves exactly as if
     # YOLO had never classified it at all for those purposes, same as v1 — it just still shows its class name in
     # the tracked-box label text.
-    track_semantic_dynamic_classes: [person, car, bus, truck, motorbike, bicycle, dog, cat, horse, cow, sheep]
+    track_semantic_dynamic_classes: ["person", "car", "bus", "truck", "motorbike", "bicycle", "horse"]  # coda (base: [person, car, bus, truck, motorbike, bicycle, dog, cat, horse, cow, sheep])
 
     # LIDAR-ONLY SEMANTIC FALLBACK (no v1 equivalent — see tracker_node.cpp's own header): a box built from LiDAR
     # points ONLY (no camera depth at all — e.g. a person beyond the depth camera's own range, which the LiDAR

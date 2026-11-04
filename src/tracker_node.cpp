@@ -275,6 +275,7 @@
 #include <Eigen/Dense>
 #include <algorithm>
 #include <cmath>
+#include <array>
 #include <cstdio>
 #include <deque>
 #include <limits>
@@ -469,6 +470,20 @@ struct Track {
     std::deque<Eigen::Vector3d> pos_hist;
     // (stamp, raw xy) of this track's matched observations over the last track_disocclusion_travel_window s
     std::deque<std::pair<double, Eigen::Vector2d>> travel_hist;
+    // Track breaks (track_publish_coasting_ticks / track_inherit_motion_*): consecutive unmatched ticks, whether the
+    // last publish labelled it dynamic, and whether it was retired because a new track took over its motion state.
+    // (stamp, object xy, lidar xy) of the matched observations over track_size_gate_travel_window s, and the result
+    std::deque<std::array<double, 5>> ego_hist;
+    bool large_travel = false;
+    int unmatched_streak = 0;
+    bool pub_dynamic = false;
+    bool retired = false;
+};
+
+// A dynamic track that just died, kept for track_inherit_motion_age s (see the parameter's own comment).
+struct Grave {
+    double stamp;
+    Track tr;
 };
 
 // Kuhn's algorithm augmenting-path search — mirrors jo_detector's own tryAugmentDetectionMatch/
@@ -699,6 +714,29 @@ public:
                                        declare_parameter<double>("track_disocclusion_person_max_height", 1.9)};
         disocclusion_person_footprint_ = {declare_parameter<double>("track_disocclusion_person_min_footprint", 0.3),
                                           declare_parameter<double>("track_disocclusion_person_max_footprint", 0.9)};
+        // TRACK BREAKS. A walker's track is lost for a tick when its cluster is briefly missing or merged with a
+        // neighbour's; the new track then repeats confirmation and the motion debounce (~1 s unpublished).
+        // track_publish_coasting_ticks: a confirmed track published dynamic on its last tick keeps being published
+        // (dynamic, at its KF prediction) for up to this many consecutive unmatched ticks. 0 = off (v1: never).
+        publish_coasting_ticks_ = declare_parameter<int>("track_publish_coasting_ticks", 0);
+        // SIZE GATE FOR LARGE MOVERS. The size gate (track_dynamic_constrain_size) keeps an unclassified object larger
+        // than the target from ever being dynamic, so a car, cart or bus outside every camera FOV is never reported as
+        // moving. track_size_gate_travel_window [s] (< 0 = off): an over-sized unclassified track passes the gate when,
+        // over this window, (a) its displacement NOT explained by the sensor's own displacement is at least
+        // track_size_gate_travel_min_dist (the centre of a wall or hedge seen side-on slides along WITH the robot), and
+        // (b) its path is straight: net/path >= min(max, base + slope * footprint) -- the larger an object, the
+        // straighter it moves, while a segmentation artifact's centre wanders back and forth.
+        size_travel_window_ = declare_parameter<double>("track_size_gate_travel_window", -1.0);
+        size_travel_min_dist_ = declare_parameter<double>("track_size_gate_travel_min_dist", 2.0);
+        size_travel_straight_ = {declare_parameter<double>("track_size_gate_travel_straightness_base", 0.7),
+                                 declare_parameter<double>("track_size_gate_travel_straightness_slope", 0.05),
+                                 declare_parameter<double>("track_size_gate_travel_straightness_max", 0.95)};
+        // track_inherit_motion_dist [m] (< 0 = off): a new track born within this distance of the KF prediction of a
+        // track that was published dynamic and is now unmatched, or died less than track_inherit_motion_age s ago,
+        // takes over its motion state (confirmed, dynamic streak/history, KF velocity, speed history); an unmatched
+        // donor is retired so the same object is not reported twice.
+        inherit_motion_dist_ = declare_parameter<double>("track_inherit_motion_dist", -1.0);
+        inherit_motion_age_ = declare_parameter<double>("track_inherit_motion_age", 1.0);
         disocclusion_travel_window_ = declare_parameter<double>("track_disocclusion_travel_window", -1.0);
         disocclusion_travel_min_dist_ = declare_parameter<double>("track_disocclusion_travel_min_dist", 1.5);
         disocclusion_travel_min_straightness_ = declare_parameter<double>("track_disocclusion_travel_min_straightness", 0.8);
@@ -2062,10 +2100,12 @@ private:
                     ++tr.missed_in_a_row;
                 }
                 tr.matched_prev = tr.matched_last_tick; tr.matched_last_tick = false;
+                ++tr.unmatched_streak;
                 continue;
             }
             det_used[static_cast<size_t>(di)] = 1;
             tr.matched_prev = tr.matched_last_tick; tr.matched_last_tick = true;
+            tr.unmatched_streak = 0;
             tr.missed_in_a_row = 0;
             ++tr.hits;
             const auto& d = msg->detections[static_cast<size_t>(di)];
@@ -2270,6 +2310,24 @@ private:
                     travelled = net >= disocclusion_travel_min_dist_ && net >= disocclusion_travel_min_straightness_ * path;
                 }
             }
+            // large-mover travel (track_size_gate_travel_window): see the parameter's own comment; used in publish()
+            if (size_travel_window_ > 0.0) {
+                tr.ego_hist.push_back({stamp, d.bbox.center.position.x, d.bbox.center.position.y,
+                                       lidar_origin_.x(), lidar_origin_.y()});
+                while (tr.ego_hist.size() > 1 && tr.ego_hist.front()[0] < stamp - size_travel_window_) tr.ego_hist.pop_front();
+                tr.large_travel = false;
+                if (lidar_tf_ok_ && tr.ego_hist.back()[0] - tr.ego_hist.front()[0] >= 0.8 * size_travel_window_) {
+                    const auto& a = tr.ego_hist.front(); const auto& b = tr.ego_hist.back();
+                    double path = 0.0;
+                    for (size_t k = 1; k < tr.ego_hist.size(); ++k)
+                        path += std::hypot(tr.ego_hist[k][1] - tr.ego_hist[k - 1][1], tr.ego_hist[k][2] - tr.ego_hist[k - 1][2]);
+                    const double net = std::hypot(b[1] - a[1], b[2] - a[2]);
+                    const double rel = std::hypot((b[1] - a[1]) - (b[3] - a[3]), (b[2] - a[2]) - (b[4] - a[4]));
+                    const double fp = std::max(d.bbox.size.x, d.bbox.size.y);
+                    const double need = std::min(size_travel_straight_[2], size_travel_straight_[0] + size_travel_straight_[1] * fp);
+                    tr.large_travel = rel >= size_travel_min_dist_ && path > 0.0 && net >= need * path;
+                }
+            }
             // walker-shaped at walking speed (track_disocclusion_person_exempt): see the parameter's own comment
             const double fp = std::max(d.bbox.size.x, d.bbox.size.y);
             const bool person_like = disocclusion_person_exempt_ &&
@@ -2376,6 +2434,39 @@ private:
             // engages for a just-spawned track regardless.
             voteClass(tr, eff_class, tr.last_obs, !detectionClass(d).empty());
             classAnchor(tr, eff_class, !detectionClass(d).empty(), stamp);
+            if (inherit_motion_dist_ >= 0.0) {   // see track_inherit_motion_dist's own comment
+                const auto& c = d.bbox.center.position;
+                double best = inherit_motion_dist_;
+                Track* donor = nullptr; const Track* gdonor = nullptr;
+                for (size_t ti = 0; ti < nt; ++ti) {
+                    Track& o = tracks_.at(track_ids[ti]);
+                    if (track_to_det[ti] >= 0 || !o.confirmed || !o.pub_dynamic || o.retired) continue;
+                    const double dist = std::hypot(predicted_pos[ti].x() - c.x, predicted_pos[ti].y() - c.y);
+                    if (dist < best) { best = dist; donor = &o; }
+                }
+                for (const auto& g : graves_) {
+                    const double age = stamp - g.stamp;
+                    if (age > inherit_motion_age_ || age < 0.0) continue;
+                    const Eigen::Vector3d pp = g.tr.kf.pos() + g.tr.kf.vel() * age;
+                    const double dist = std::hypot(pp.x() - c.x, pp.y() - c.y);
+                    if (dist < best) { best = dist; donor = nullptr; gdonor = &g.tr; }
+                }
+                const Track* src = donor ? donor : gdonor;
+                if (src) {
+                    tr.confirmed = true;
+                    tr.dynamic_ticks = src->dynamic_ticks;
+                    tr.dynamic_hist = src->dynamic_hist;
+                    tr.speed_hist = src->speed_hist;
+                    tr.kf.x_.segment<3>(3) = src->kf.vel();
+                    tr.kf.x_.segment<3>(6).setZero();
+                    tr.hits = std::max(tr.hits, src->hits);
+                    tr.pub_dynamic = true;
+                    if (debug_lifecycle_)
+                        RCLCPP_INFO(get_logger(), "[lifecycle] #%d inherits the motion state of %s #%d (%.2f m)", tr.id,
+                                    donor ? "unmatched" : "dead", src->id, best);
+                    if (donor) { donor->retired = true; donor->missed_in_a_row = 1 << 20; }
+                }
+            }
             tracks_.emplace(tr.id, std::move(tr));
         }
 
@@ -2385,6 +2476,8 @@ private:
             const int effective_max_missed = isDynamicClass(it->second.best_class) ? max_missed_classified_ : max_missed_;
             const bool dead = it->second.missed_in_a_row > effective_max_missed ||
                               it->second.stationary_ticks > track_stationary_max_ticks_;
+            if (dead && inherit_motion_dist_ >= 0.0 && it->second.pub_dynamic && !it->second.retired)
+                graves_.push_back(Grave{stamp, it->second});
             if (dead && debug_lifecycle_)
                 RCLCPP_INFO(get_logger(), "[lifecycle] delete #%d cls='%s' hits=%d missed=%d/%d stationary=%d/%d", it->first,
                             it->second.best_class.c_str(), it->second.hits, it->second.missed_in_a_row, effective_max_missed,
@@ -2398,6 +2491,8 @@ private:
             }
             it = dead ? tracks_.erase(it) : std::next(it);
         }
+        while (!graves_.empty() && (stamp - graves_.front().stamp > inherit_motion_age_ || stamp < graves_.front().stamp))
+            graves_.pop_front();
 
         publish(msg->header, matched_ids);
     }
@@ -2437,7 +2532,14 @@ private:
 
         for (auto& [id, tr] : tracks_) {
             if (!tr.confirmed) { dbgCsv(header, id, tr, matched_ids.count(id) > 0, -1, -1, true, "unconfirmed"); continue; }  // internal propagation only until confirmed — never published, matching v1
-            if (!matched_ids.count(id)) { dbgCsv(header, id, tr, false, -1, -1, true, "missed"); continue; }  // predicted-only this tick (missed) — never published either way, matching v1
+            // coasting publication (track_publish_coasting_ticks): a track published dynamic on its last tick stays
+            // published for a few unmatched ticks, at its KF prediction
+            const bool coasting = !matched_ids.count(id);
+            if (coasting && !(publish_coasting_ticks_ > 0 && tr.pub_dynamic && !tr.retired &&
+                              tr.unmatched_streak <= publish_coasting_ticks_)) {
+                dbgCsv(header, id, tr, false, -1, -1, true, "missed");
+                continue;
+            }  // predicted-only this tick (missed) — never published either way, matching v1
             const Eigen::Vector3d v = tr.kf.vel();
             const double speed = planarSpeed(v);        // vz excluded — see planarSpeed's own comment
             // A track with no semantic evidence of a dynamic class, INSIDE a camera's FOV, must keep up its motion
@@ -2466,10 +2568,15 @@ private:
                 const bool sizeOk = std::abs(tr.size.x - dynamic_target_size_.x()) < dynamic_size_tolerance_.x() &&
                                     std::abs(tr.size.y - dynamic_target_size_.y()) < dynamic_size_tolerance_.y() &&
                                     std::abs(tr.size.z - dynamic_target_size_.z()) < dynamic_size_tolerance_.z();
-                if (!sizeOk) dynamic = false;
-                dbg_size_ok = sizeOk;
+                if (!sizeOk && !tr.large_travel) dynamic = false;
+                dbg_size_ok = sizeOk || tr.large_travel;
             }
-            if (log_motion_block_ && !dynamic && tr.best_class.empty() && speed >= dynamic_speed_thresh_) {
+            if (coasting) {
+                if (!dynamic) { dbgCsv(header, id, tr, false, confirm_ticks, sticky_count, dbg_size_ok, "missed"); continue; }
+            } else {
+                tr.pub_dynamic = dynamic;
+            }
+            if (log_motion_block_ && !coasting && !dynamic && tr.best_class.empty() && speed >= dynamic_speed_thresh_) {
                 bool size_ok = true;
                 if (dynamic_constrain_size_)
                     size_ok = std::abs(tr.size.x - dynamic_target_size_.x()) < dynamic_size_tolerance_.x() &&
@@ -2486,7 +2593,7 @@ private:
             if (!tr.best_class.empty()) {
                 tr.motion_dynamic_ticks = 0;
                 tr.motion_pd = false;
-            } else if (dynamic && motion_pd_min_dynamic_ticks_ > 0 &&
+            } else if (!coasting && dynamic && motion_pd_min_dynamic_ticks_ > 0 &&
                        ++tr.motion_dynamic_ticks >= motion_pd_min_dynamic_ticks_) {
                 tr.motion_pd = true;
             }
@@ -2510,7 +2617,7 @@ private:
             // grant the potentially_dynamic exemption, same as v1.
             const bool potentially_dynamic = !dynamic && potentiallyDynamic(tr);
             const char* status = dynamic ? "dynamic" : (potentially_dynamic ? "potentially_dynamic" : "static");
-            dbgCsv(header, id, tr, true, confirm_ticks, sticky_count, dbg_size_ok, status);
+            dbgCsv(header, id, tr, !coasting, confirm_ticks, sticky_count, dbg_size_ok, coasting ? "coasting_pub" : status);
 
             vision_msgs::msg::Detection3D d;
             d.header = arr.header;
@@ -2727,6 +2834,11 @@ private:
     double disocclusion_lateral_margin_{-1.0};
     bool disocclusion_require_unseen_{false};
     double disocclusion_seen_max_innov_{-1.0};
+    int publish_coasting_ticks_{0};
+    double size_travel_window_{-1.0}, size_travel_min_dist_{2.0};
+    std::array<double, 3> size_travel_straight_{0.7, 0.05, 0.95};
+    double inherit_motion_dist_{-1.0}, inherit_motion_age_{1.0};
+    std::deque<Grave> graves_;
     bool disocclusion_person_exempt_{false};
     std::pair<double, double> disocclusion_person_speed_{0.8, 2.2}, disocclusion_person_height_{1.0, 1.9},
                               disocclusion_person_footprint_{0.3, 0.9};
