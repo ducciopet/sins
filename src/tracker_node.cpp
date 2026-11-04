@@ -687,6 +687,18 @@ public:
         // blocked as a disocclusion artifact: background revealed behind a passer-by, or a pole partly covered by
         // one, only shifts its cluster centre by a fraction of its own width and then falls back, a person walking
         // behind another covers metres in one direction.
+        // A walker-shaped observation (cluster height and footprint in the ranges below) moving at walking speed (KF
+        // planar speed in [min,max]) is not blocked as a disocclusion artifact: on CODa seq 10, of the blocked
+        // unclassified tracks that otherwise had motion evidence, 82% of those passing this test were annotated
+        // pedestrians, against 11% overall. Revealed background is a wall/fence/vegetation fragment of arbitrary
+        // shape; a pole partly covered by a passer-by is too thin. false = off.
+        disocclusion_person_exempt_ = declare_parameter<bool>("track_disocclusion_person_exempt", false);
+        disocclusion_person_speed_ = {declare_parameter<double>("track_disocclusion_person_min_speed", 0.8),
+                                      declare_parameter<double>("track_disocclusion_person_max_speed", 2.2)};
+        disocclusion_person_height_ = {declare_parameter<double>("track_disocclusion_person_min_height", 1.0),
+                                       declare_parameter<double>("track_disocclusion_person_max_height", 1.9)};
+        disocclusion_person_footprint_ = {declare_parameter<double>("track_disocclusion_person_min_footprint", 0.3),
+                                          declare_parameter<double>("track_disocclusion_person_max_footprint", 0.9)};
         disocclusion_travel_window_ = declare_parameter<double>("track_disocclusion_travel_window", -1.0);
         disocclusion_travel_min_dist_ = declare_parameter<double>("track_disocclusion_travel_min_dist", 1.5);
         disocclusion_travel_min_straightness_ = declare_parameter<double>("track_disocclusion_travel_min_straightness", 0.8);
@@ -723,6 +735,16 @@ public:
         // diagnostic only (default off): log every confirmed, unclassified, moving (KF speed >= the dynamic bar)
         // track that is NOT labelled dynamic this tick, with the motion-evidence flags that held it back
         log_motion_block_ = declare_parameter<bool>("track_log_motion_block", false);
+        // diagnostic: one CSV row per track per tick (every track, also unconfirmed/missed/suppressed) to this file; "" = off
+        {
+            const auto path = declare_parameter<std::string>("track_debug_csv", "");
+            if (!path.empty()) {
+                dbg_csv_ = std::fopen(path.c_str(), "w");
+                if (dbg_csv_) setvbuf(dbg_csv_, nullptr, _IOLBF, 0);
+                if (dbg_csv_) std::fprintf(dbg_csv_, "t,id,x,y,ox,oy,confirmed,matched,hits,missed,speed,dyn_ticks,confirm_ticks,"
+                                                     "speed_ok,kf_conf,vote,disocc,size_ok,sticky,fov,cls,status,sx,sy,sz\n");
+            }
+        }
         track_stationary_max_ticks_ = declare_parameter<int>("track_stationary_max_ticks", 50);
 
         // First-classification debounce (no v1 equivalent — see voteClass()'s own comment): how many CONSECUTIVE
@@ -2248,7 +2270,13 @@ private:
                     travelled = net >= disocclusion_travel_min_dist_ && net >= disocclusion_travel_min_straightness_ * path;
                 }
             }
-            const bool blocked_by_disocclusion = disocclusion && !classified_now && !had_dynamic_history && !seen_before && !travelled;
+            // walker-shaped at walking speed (track_disocclusion_person_exempt): see the parameter's own comment
+            const double fp = std::max(d.bbox.size.x, d.bbox.size.y);
+            const bool person_like = disocclusion_person_exempt_ &&
+                speed >= disocclusion_person_speed_.first && speed <= disocclusion_person_speed_.second &&
+                d.bbox.size.z >= disocclusion_person_height_.first && d.bbox.size.z <= disocclusion_person_height_.second &&
+                fp >= disocclusion_person_footprint_.first && fp <= disocclusion_person_footprint_.second;
+            const bool blocked_by_disocclusion = disocclusion && !classified_now && !had_dynamic_history && !seen_before && !travelled && !person_like;
             if (log_motion_block_ && disocclusion && !classified_now && !had_dynamic_history && !seen_before && travelled)
                 RCLCPP_WARN(get_logger(), "disocc_travel: track #%d pos=[%.2f,%.2f] size=[%.2f,%.2f,%.2f] hits=%d speed=%.2f",
                     tr.id, d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.size.x, d.bbox.size.y, d.bbox.size.z,
@@ -2408,8 +2436,8 @@ private:
         std::set<int> now_ids;
 
         for (auto& [id, tr] : tracks_) {
-            if (!tr.confirmed) continue;               // internal propagation only until confirmed — never published, matching v1
-            if (!matched_ids.count(id)) continue;       // predicted-only this tick (missed) — never published either way, matching v1
+            if (!tr.confirmed) { dbgCsv(header, id, tr, matched_ids.count(id) > 0, -1, -1, true, "unconfirmed"); continue; }  // internal propagation only until confirmed — never published, matching v1
+            if (!matched_ids.count(id)) { dbgCsv(header, id, tr, false, -1, -1, true, "missed"); continue; }  // predicted-only this tick (missed) — never published either way, matching v1
             const Eigen::Vector3d v = tr.kf.vel();
             const double speed = planarSpeed(v);        // vz excluded — see planarSpeed's own comment
             // A track with no semantic evidence of a dynamic class, INSIDE a camera's FOV, must keep up its motion
@@ -2430,6 +2458,7 @@ private:
             const bool sticky_dynamic = static_cast<int>(tr.dynamic_hist.size()) >= dynamic_sticky_window_ &&
                                         sticky_count >= dynamic_sticky_frames_ && speed >= dynamic_speed_thresh_;
             bool dynamic = debounced_dynamic || sticky_dynamic;
+            bool dbg_size_ok = true;
             // Size-sanity gate (v1: constrainSize_ — see the constructor's own comment on why this is scoped to
             // UNCLASSIFIED tracks only): an implausibly-sized moving blob never gets the DYNAMIC label, though
             // it still publishes as "static" rather than being suppressed outright by this check alone.
@@ -2438,6 +2467,7 @@ private:
                                     std::abs(tr.size.y - dynamic_target_size_.y()) < dynamic_size_tolerance_.y() &&
                                     std::abs(tr.size.z - dynamic_target_size_.z()) < dynamic_size_tolerance_.z();
                 if (!sizeOk) dynamic = false;
+                dbg_size_ok = sizeOk;
             }
             if (log_motion_block_ && !dynamic && tr.best_class.empty() && speed >= dynamic_speed_thresh_) {
                 bool size_ok = true;
@@ -2463,7 +2493,10 @@ private:
             const bool exempt = potentiallyDynamic(tr) || track_publish_stationary_;
             // Suppress only truly-stationary (below the LOWER bar), unclassified tracks — a track above that bar
             // but below the dynamic-label bar (e.g. 0.2 m/s) still publishes, it just isn't "dynamic".
-            if (!exempt && speed < stationary_speed_thresh_) continue;
+            if (!exempt && speed < stationary_speed_thresh_) {
+                dbgCsv(header, id, tr, true, confirm_ticks, sticky_count, dbg_size_ok, "suppressed");
+                continue;
+            }
             now_ids.insert(id);
 
             // Three-way status (v1 parity, framework_architecture.md's own "Marker color convention"/
@@ -2477,6 +2510,7 @@ private:
             // grant the potentially_dynamic exemption, same as v1.
             const bool potentially_dynamic = !dynamic && potentiallyDynamic(tr);
             const char* status = dynamic ? "dynamic" : (potentially_dynamic ? "potentially_dynamic" : "static");
+            dbgCsv(header, id, tr, true, confirm_ticks, sticky_count, dbg_size_ok, status);
 
             vision_msgs::msg::Detection3D d;
             d.header = arr.header;
@@ -2668,6 +2702,18 @@ private:
     double dynamic_kf_std_ratio_{0.50};
     bool dynamic_constrain_size_{true};
     bool log_motion_block_{false};
+    std::FILE* dbg_csv_{nullptr};
+    void dbgCsv(const std_msgs::msg::Header& h, int id, const Track& tr, bool matched, int confirm_ticks, int sticky,
+                bool size_ok, const char* status) const {
+        if (!dbg_csv_) return;
+        const Eigen::Vector3d p = tr.kf.pos();
+        std::fprintf(dbg_csv_, "%.3f,%d,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%.2f,%.2f,%.2f\n",
+            h.stamp.sec + h.stamp.nanosec * 1e-9, id, p.x(), p.y(), tr.last_obs.x, tr.last_obs.y, tr.confirmed ? 1 : 0,
+            matched ? 1 : 0, tr.hits, tr.missed_in_a_row, planarSpeed(tr.kf.vel()), tr.dynamic_ticks, confirm_ticks,
+            tr.dbg_speed_ok, tr.dbg_kf_conf, tr.dbg_vote, tr.dbg_disocc, size_ok ? 1 : 0, sticky,
+            insideAnyCameraFov(p) ? 1 : 0, tr.best_class.empty() ? "-" : tr.best_class.c_str(), status,
+            tr.size.x, tr.size.y, tr.size.z);
+    }
     Eigen::Vector3d dynamic_target_size_{0.5, 0.5, 1.7}, dynamic_size_tolerance_{0.8, 0.8, 1.0};
     std::string fused_clusters_topic_;
     double point_vote_thresh_{0.7};
@@ -2681,6 +2727,9 @@ private:
     double disocclusion_lateral_margin_{-1.0};
     bool disocclusion_require_unseen_{false};
     double disocclusion_seen_max_innov_{-1.0};
+    bool disocclusion_person_exempt_{false};
+    std::pair<double, double> disocclusion_person_speed_{0.8, 2.2}, disocclusion_person_height_{1.0, 1.9},
+                              disocclusion_person_footprint_{0.3, 0.9};
     double disocclusion_travel_window_{-1.0}, disocclusion_travel_min_dist_{1.5}, disocclusion_travel_min_straightness_{0.8};
     // diagnostic (track_log_motion_block): last disocclusion hit
     mutable int dbg_occ_id_{-1};

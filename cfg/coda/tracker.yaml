@@ -1,5 +1,6 @@
 tracker_node:
   ros__parameters:
+    track_disocclusion_person_exempt: true  # coda (not in base)
     global_frame: odom
 
     # Association gates (reject before scoring) — same names/values as jo_detector's own
