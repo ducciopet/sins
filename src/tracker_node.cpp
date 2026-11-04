@@ -926,6 +926,16 @@ public:
         max_natural_motion_dist_ = declare_parameter<double>("track_max_natural_motion_dist", 1.50);  // v1: maxNaturalMotionDist_
         max_natural_innovation_ = declare_parameter<double>("track_max_natural_innovation", 0.60);               // v1: maxNaturalInnovation_
         max_natural_innovation_outside_fov_ = declare_parameter<double>("track_max_natural_innovation_outside_fov", 1.00);  // v1: maxNaturalInnovationOutsideFov_
+        // Large-object association gates (default off). Every gate above is sized for people (8 m/s implied speed,
+        // 4 m/s outside FOV, 0.6 m innovation and 1.2 m/s velocity error before confirmation): a car passing at
+        // 5-14 m/s is rejected tick after tick and re-born as a new unconfirmed track (Marina di Pisa "street":
+        // 94% of moving-vehicle rows have a cluster, 20% a track). A pairing whose track AND detection both have a
+        // footprint >= track_large_object_footprint gets the wider bounds below; the size gate on "dynamic"
+        // (track_size_gate_travel_window) still decides whether such an object is published as moving.
+        large_object_footprint_ = declare_parameter<double>("track_large_object_footprint", -1.0);
+        large_object_max_match_speed_ = declare_parameter<double>("track_large_object_max_match_speed", 20.0);
+        large_object_max_veldir_error_ = declare_parameter<double>("track_large_object_max_veldir_error", 15.0);
+        large_object_max_natural_innovation_ = declare_parameter<double>("track_large_object_max_natural_innovation", 2.0);
 
         // Generic confirmed-track stability bonus (v1: confirmedTrackAssocBonus_, ported per explicit request) —
         // independent of class/FOV, simply rewards being matched to an already-established track so a newer or
@@ -1182,12 +1192,13 @@ private:
     // track not yet confirmed AND not semantically exempt (an already-confirmed or classified track has
     // stronger identity evidence and skips this gate entirely — see the association loop).
     bool isNaturalMotion(const Track& tr, const Eigen::Vector3d& obs_pos, const Eigen::Vector3d& pred_pos,
-                         bool inside_fov_curr) const {
+                         bool inside_fov_curr, bool large = false) const {
         const double obsDist = std::hypot(obs_pos.x() - tr.last_obs.x, obs_pos.y() - tr.last_obs.y);
         if (inside_fov_curr && !track_publish_stationary_ && obsDist < min_natural_motion_dist_) return false;
         if (obsDist > max_natural_motion_dist_) return false;
         const double innovation = std::hypot(obs_pos.x() - pred_pos.x(), obs_pos.y() - pred_pos.y());
-        const double maxInnovation = inside_fov_curr ? max_natural_innovation_ : max_natural_innovation_outside_fov_;
+        double maxInnovation = inside_fov_curr ? max_natural_innovation_ : max_natural_innovation_outside_fov_;
+        if (large) maxInnovation = std::max(maxInnovation, large_object_max_natural_innovation_);
         return innovation <= maxInnovation;
     }
 
@@ -1749,7 +1760,11 @@ private:
                 const bool lidar_only_outside_fov = !inside_fov_pred && !inside_fov_curr &&
                                                     det_class.empty() && tr.best_class.empty();
                 const double gate_dist = lidar_only_outside_fov ? outside_fov_max_match_dist_ : max_match_dist_;
-                const double gate_speed = lidar_only_outside_fov ? outside_fov_max_match_speed_ : max_match_speed_;
+                const bool large_pair = large_object_footprint_ > 0.0 &&
+                    std::max(tr.size.x, tr.size.y) >= large_object_footprint_ &&
+                    std::max(d.bbox.size.x, d.bbox.size.y) >= large_object_footprint_;
+                double gate_speed = lidar_only_outside_fov ? outside_fov_max_match_speed_ : max_match_speed_;
+                if (large_pair) gate_speed = std::max(gate_speed, large_object_max_match_speed_);
                 const double gate_size = lidar_only_outside_fov ? outside_fov_max_size_diff_ : max_size_diff_;
 
                 const double predDist = std::hypot(c.x - predicted_pos[ti].x(), c.y - predicted_pos[ti].y());
@@ -1808,6 +1823,7 @@ private:
                 const bool yolo_exempt = !det_class.empty() || !tr.best_class.empty();
                 double veldir_gate = tr.confirmed ? max_veldir_error_confirmed_ : max_veldir_error_unconfirmed_;
                 if (!inside_fov_pred || yolo_exempt) veldir_gate = std::max(veldir_gate, max_veldir_error_relaxed_);
+                if (large_pair) veldir_gate = std::max(veldir_gate, large_object_max_veldir_error_);
                 // Hard gate only for a candidate that is NOT already where the KF predicts the object to be: within
                 // track_veldir_gate_min_innovation of the prediction the implied velocity is dominated by centroid
                 // jitter (the same standing person alternates between a partial LiDAR-only box and the full fused
@@ -1822,7 +1838,7 @@ private:
                 // Natural-motion gate (v1: isNaturalMotion — see its own comment) — only for a track with no
                 // identity evidence of its own yet: not confirmed, not classified either side.
                 if (!tr.confirmed && !yolo_exempt &&
-                    !isNaturalMotion(tr, Eigen::Vector3d(c.x, c.y, c.z), predicted_pos[ti], inside_fov_curr)) {
+                    !isNaturalMotion(tr, Eigen::Vector3d(c.x, c.y, c.z), predicted_pos[ti], inside_fov_curr, large_pair)) {
                     noteReject(ti, di, "natural_motion");
                     continue;
                 }
@@ -2801,6 +2817,8 @@ private:
     double outside_fov_confirmed_bonus_{0.75}, outside_fov_tentative_bonus_{0.35};
     double min_natural_motion_dist_{0.08}, max_natural_motion_dist_{1.50};
     double max_natural_innovation_{0.60}, max_natural_innovation_outside_fov_{1.00};
+    double large_object_footprint_{-1.0}, large_object_max_match_speed_{20.0}, large_object_max_veldir_error_{15.0};
+    double large_object_max_natural_innovation_{2.0};
     double confirmed_track_bonus_{0.20};
     double duplicate_track_dist_thresh_{0.5}, duplicate_track_iou_thresh_{0.3}, duplicate_track_size_thresh_{0.5};
     double min_confirm_obs_speed_{-1.0};
