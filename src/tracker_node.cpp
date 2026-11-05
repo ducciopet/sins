@@ -299,6 +299,17 @@ public:
         P_ = Eigen::MatrixXd::Identity(9, 9) * p_init;
     }
 
+    // two-point initialisation (track_two_point_init): position and velocity from the first two observations
+    void initWithVelocity(const Eigen::Vector3d& pos, const Eigen::Vector3d& vel, double p_pos, double p_vel, double p_acc) {
+        x_ = Eigen::VectorXd::Zero(9);
+        x_.head<3>() = pos;
+        x_.segment<3>(3) = vel;
+        P_ = Eigen::MatrixXd::Zero(9, 9);
+        P_.diagonal().segment<3>(0).setConstant(p_pos);
+        P_.diagonal().segment<3>(3).setConstant(p_vel);
+        P_.diagonal().segment<3>(6).setConstant(p_acc);
+    }
+
     void predict(double dt, double q_pos, double q_vel, double q_acc) {
         Eigen::MatrixXd A = Eigen::MatrixXd::Identity(9, 9);
         const double dt2 = 0.5 * dt * dt;
@@ -475,6 +486,10 @@ struct Track {
     // (stamp, object xy, lidar xy) of the matched observations over track_size_gate_travel_window s, and the result
     std::deque<std::array<double, 5>> ego_hist;
     bool large_travel = false;
+    // birth position and whether the observed centre has ever left it (track_motion_min_net_footprints)
+    double birth_x = 0.0, birth_y = 0.0;
+    bool left_birth = false;
+    std::deque<std::array<double, 3>> cons_hist;   // (stamp, x, y) of the observed centre, track_motion_consistency_window
     int unmatched_streak = 0;
     bool pub_dynamic = false;
     bool retired = false;
@@ -731,6 +746,49 @@ public:
         size_travel_straight_ = {declare_parameter<double>("track_size_gate_travel_straightness_base", 0.7),
                                  declare_parameter<double>("track_size_gate_travel_straightness_slope", 0.05),
                                  declare_parameter<double>("track_size_gate_travel_straightness_max", 0.95)};
+        // track_size_gate_body_lengths (< 0 = off; needs track_size_gate_travel_window): the over-sized track passes as
+        // soon as its ego-compensated travel within the window reaches this many of its OWN footprints (same
+        // straightness test), instead of track_size_gate_travel_min_dist after a full window. Scale-free: a car has
+        // moved once it has covered its own length; the centre of a partly seen static object slides by a fraction of it.
+        size_travel_body_lengths_ = declare_parameter<double>("track_size_gate_body_lengths", -1.0);
+        // TWO-POINT INITIALISATION (track_two_point_init, default off). A new track has no velocity estimate (its KF
+        // starts at v = 0), so the velocity-based checks on its SECOND observation (implied speed against the
+        // prediction, velocity direction, natural-motion innovation) only test "is the object slower than the gate":
+        // anything faster than ~3 m/s (a cyclist, a car) was re-born on every scan and never confirmed. With this on,
+        // the second observation is checked only against the physical bound track_max_natural_motion_dist per scan,
+        // and the KF velocity is then initialised from the two observations (variance 2 R / dt^2): from the third
+        // observation on the usual gates test the innovation of a moving prediction, whatever the object's speed or size.
+        two_point_init_ = declare_parameter<bool>("track_two_point_init", false);
+        // MOTION ONLY AFTER LEAVING THE BIRTH SPOT (track_motion_min_net_footprints, < 0 = off). A track counts motion
+        // evidence only once its observed centre has been, at least once, farther from where the track was born than
+        // max(track_motion_min_net_floor, this many of its own footprints) (world frame, so ego-motion compensated).
+        // The centre of a partly seen static object (a wall fragment, a parked car seen from a moving robot) wanders
+        // within a fraction of its own footprint whatever its KF velocity says; a real mover leaves that zone.
+        // Scale-free like track_size_gate_body_lengths: the same rule for a person and a car.
+        motion_min_net_fp_ = declare_parameter<double>("track_motion_min_net_footprints", -1.0);
+        motion_min_net_floor_ = declare_parameter<double>("track_motion_min_net_floor", 0.3);
+        // PARTIAL-VIEW JITTER ALLOWANCE (track_jitter_footprint_scale, < 0 = off). The centre of a partly seen object
+        // (one face of a car, a car split by a glass window) can jump by up to half its footprint from one scan to the
+        // next while the object itself moves smoothly. The association gates that measure a jump against the
+        // prediction (distance, implied speed, velocity direction, natural-motion innovation, per-scan displacement) first
+        // subtract this allowance = scale * half the TRACK's footprint (the detection may be one fragment of it): ~0.15-0.3 m for
+        // a person, ~2 m for a car. Replaces the fixed large-object gates (track_large_object_*) with one scale-free rule.
+        jitter_fp_scale_ = declare_parameter<double>("track_jitter_footprint_scale", -1.0);
+        // FRAGMENT MERGE (track_fragment_merge_margin [m], < 0 = off). A moving object can reach the tracker in several
+        // clusters (a car split by its glass windows or by a parked car in front: 33% of the car frames on the Marina
+        // di Pisa street bag, half of them with gaps > 2x the DBSCAN eps), and the track then follows whichever piece
+        // wins, its centre jumping by metres. Before association, the detections whose centres lie inside the
+        // predicted footprint (grown by this margin) of a confirmed track that is MOVING (KF speed >= the dynamic bar:
+        // a wall or a parked car never absorbs a passer-by) are merged into one box, their points pooled. A piece
+        // carrying a dynamic class other than the track's own is never absorbed.
+        fragment_merge_margin_ = declare_parameter<double>("track_fragment_merge_margin", -1.0);
+        // DISPLACEMENT-CONFIRMED SPEED (track_motion_consistency_window [s], < 0 = off). The KF speed of a static
+        // object seen in part from a moving robot settles at a few tenths of m/s (its centre wanders), enough to pass
+        // track_dynamic_speed_thresh; a mover's observed centre actually covers its speed x time. A tick counts as
+        // motion evidence only if the net displacement of the observed centre over the last window (world frame,
+        // at least half the window covered) is >= track_motion_consistency_ratio x KF speed x elapsed time.
+        motion_cons_window_ = declare_parameter<double>("track_motion_consistency_window", -1.0);
+        motion_cons_ratio_ = declare_parameter<double>("track_motion_consistency_ratio", 0.5);
         // track_inherit_motion_dist [m] (< 0 = off): a new track born within this distance of the KF prediction of a
         // track that was published dynamic and is now unmatched, or died less than track_inherit_motion_age s ago,
         // takes over its motion state (confirmed, dynamic streak/history, KF velocity, speed history); an unmatched
@@ -1192,11 +1250,12 @@ private:
     // track not yet confirmed AND not semantically exempt (an already-confirmed or classified track has
     // stronger identity evidence and skips this gate entirely — see the association loop).
     bool isNaturalMotion(const Track& tr, const Eigen::Vector3d& obs_pos, const Eigen::Vector3d& pred_pos,
-                         bool inside_fov_curr, bool large = false) const {
+                         bool inside_fov_curr, bool large = false, bool no_vel = false, double jitter = 0.0) const {
         const double obsDist = std::hypot(obs_pos.x() - tr.last_obs.x, obs_pos.y() - tr.last_obs.y);
         if (inside_fov_curr && !track_publish_stationary_ && obsDist < min_natural_motion_dist_) return false;
-        if (obsDist > max_natural_motion_dist_) return false;
-        const double innovation = std::hypot(obs_pos.x() - pred_pos.x(), obs_pos.y() - pred_pos.y());
+        if (no_vel) return true;  // displacement bound already checked (elapsed-scaled); no prediction to innovate against
+        if (obsDist > max_natural_motion_dist_ + jitter) return false;
+        const double innovation = std::max(0.0, std::hypot(obs_pos.x() - pred_pos.x(), obs_pos.y() - pred_pos.y()) - jitter);
         double maxInnovation = inside_fov_curr ? max_natural_innovation_ : max_natural_innovation_outside_fov_;
         if (large) maxInnovation = std::max(maxInnovation, large_object_max_natural_innovation_);
         return innovation <= maxInnovation;
@@ -1708,7 +1767,91 @@ private:
         return !cls.empty() && semantic_dynamic_classes_.count(cls) > 0;
     }
 
-    void onFused(const vision_msgs::msg::Detection3DArray::ConstSharedPtr& msg) {
+    // track_fragment_merge_margin: see the parameter's own comment. Rewrites msg (a merged copy) and points_by_det.
+    void mergeFragments(vision_msgs::msg::Detection3DArray::ConstSharedPtr& msg,
+                        std::map<size_t, std::vector<Eigen::Vector3f>>& points_by_det,
+                        const std::vector<int>& track_ids, const std::vector<Eigen::Vector3d>& predicted_pos) const {
+        const size_t nd = msg->detections.size();
+        std::vector<int> owner(nd, -1);
+        // biggest moving tracks first: a car claims its pieces before a fragment track sitting on one of them
+        std::vector<size_t> order(track_ids.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        auto fpOf = [&](size_t ti) { const Track& t = tracks_.at(track_ids[ti]); return std::max(t.size.x, t.size.y); };
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return fpOf(a) > fpOf(b); });
+        bool any = false;
+        for (size_t ti : order) {
+            const Track& tr = tracks_.at(track_ids[ti]);
+            if (!tr.confirmed || planarSpeed(tr.kf.vel()) < dynamic_speed_thresh_) continue;
+            const double hx = 0.5 * tr.size.x + fragment_merge_margin_, hy = 0.5 * tr.size.y + fragment_merge_margin_;
+            std::vector<size_t> in;
+            for (size_t di = 0; di < nd; ++di) {
+                if (owner[di] >= 0) continue;
+                const auto& c = msg->detections[di].bbox.center.position;
+                if (std::abs(c.x - predicted_pos[ti].x()) > hx || std::abs(c.y - predicted_pos[ti].y()) > hy) continue;
+                const std::string cls = detectionClass(msg->detections[di]);
+                if (isDynamicClass(cls) && cls != tr.best_class) continue;
+                in.push_back(di);
+            }
+            if (in.size() < 2) continue;
+            for (size_t di : in) owner[di] = static_cast<int>(ti);
+            any = true;
+        }
+        if (!any) return;
+        auto out = std::make_shared<vision_msgs::msg::Detection3DArray>();
+        out->header = msg->header;
+        std::map<size_t, std::vector<Eigen::Vector3f>> pts;
+        std::map<int, size_t> merged_idx;   // track index -> index of its merged detection in out
+        for (size_t di = 0; di < nd; ++di) {
+            const auto& d = msg->detections[di];
+            const auto pit = points_by_det.find(di);
+            if (owner[di] < 0) {
+                const size_t k = out->detections.size(); out->detections.push_back(d);
+                if (pit != points_by_det.end()) pts[k] = pit->second;
+                continue;
+            }
+            const auto mit = merged_idx.find(owner[di]);
+            if (mit == merged_idx.end()) {
+                const size_t k = out->detections.size(); out->detections.push_back(d);
+                auto& b = out->detections.back().bbox;   // axis-aligned from here on (union of pieces)
+                const double ex = boxHalfExtentX(d.bbox), ey = boxHalfExtentY(d.bbox);
+                b.size.x = 2.0 * ex; b.size.y = 2.0 * ey;
+                b.center.orientation = geometry_msgs::msg::Quaternion();
+                merged_idx[owner[di]] = k;
+                if (pit != points_by_det.end()) pts[k] = pit->second;
+                continue;
+            }
+            auto& m = out->detections[mit->second];
+            auto& b = m.bbox;
+            const double ex = boxHalfExtentX(d.bbox), ey = boxHalfExtentY(d.bbox);
+            const double x0 = std::min(b.center.position.x - 0.5 * b.size.x, d.bbox.center.position.x - ex);
+            const double x1 = std::max(b.center.position.x + 0.5 * b.size.x, d.bbox.center.position.x + ex);
+            const double y0 = std::min(b.center.position.y - 0.5 * b.size.y, d.bbox.center.position.y - ey);
+            const double y1 = std::max(b.center.position.y + 0.5 * b.size.y, d.bbox.center.position.y + ey);
+            const double z0 = std::min(b.center.position.z - 0.5 * b.size.z, d.bbox.center.position.z - 0.5 * d.bbox.size.z);
+            const double z1 = std::max(b.center.position.z + 0.5 * b.size.z, d.bbox.center.position.z + 0.5 * d.bbox.size.z);
+            b.center.position.x = 0.5 * (x0 + x1); b.center.position.y = 0.5 * (y0 + y1); b.center.position.z = 0.5 * (z0 + z1);
+            b.size.x = x1 - x0; b.size.y = y1 - y0; b.size.z = z1 - z0;
+            if (m.results.empty() && !d.results.empty()) m.results = d.results;
+            if (pit != points_by_det.end()) { auto& v = pts[mit->second]; v.insert(v.end(), pit->second.begin(), pit->second.end()); }
+        }
+        msg = out;
+        points_by_det.swap(pts);
+    }
+    // world-frame half extents of a (yawed) box
+    static double boxHalfExtentX(const vision_msgs::msg::BoundingBox3D& b) {
+        const double yaw = yawOf(b.center.orientation);
+        return 0.5 * (std::abs(std::cos(yaw)) * b.size.x + std::abs(std::sin(yaw)) * b.size.y);
+    }
+    static double boxHalfExtentY(const vision_msgs::msg::BoundingBox3D& b) {
+        const double yaw = yawOf(b.center.orientation);
+        return 0.5 * (std::abs(std::sin(yaw)) * b.size.x + std::abs(std::cos(yaw)) * b.size.y);
+    }
+    static double yawOf(const geometry_msgs::msg::Quaternion& q) {
+        return std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    }
+
+    void onFused(const vision_msgs::msg::Detection3DArray::ConstSharedPtr& in_msg) {
+        vision_msgs::msg::Detection3DArray::ConstSharedPtr msg = in_msg;
         const double stamp = stampSec(msg->header.stamp);
         double dt = last_stamp_ > 0.0 ? stamp - last_stamp_ : 0.1;
         if (dt <= 0.0 || dt > 1.0) dt = 0.1;  // clock jump (bag loop) or first message: fall back to the nominal LiDAR period
@@ -1717,7 +1860,7 @@ private:
             [&](const ClassAnchor& an) { return stamp - an.last > class_anchor_ttl_; }), class_anchors_.end());
         refreshCameraTf();  // once per tick, not per track — see its own comment
         refreshLidarTf();
-        const std::map<size_t, std::vector<Eigen::Vector3f>> points_by_det = parsePointsByDetection(stamp);
+        std::map<size_t, std::vector<Eigen::Vector3f>> points_by_det = parsePointsByDetection(stamp);
 
         // Predicted position per track (this tick's Kalman prediction) + each track's own previous raw
         // observation — the same two reference points v1's computeAssociationScore compares a detection against.
@@ -1728,6 +1871,7 @@ private:
             track_ids.push_back(id);
             predicted_pos.push_back(tr.kf.pos());
         }
+        if (fragment_merge_margin_ >= 0.0) mergeFragments(msg, points_by_det, track_ids, predicted_pos);
 
         const size_t nt = track_ids.size(), nd = msg->detections.size();
         struct Cand { size_t det, track; double score; };
@@ -1768,9 +1912,20 @@ private:
                 const double gate_size = lidar_only_outside_fov ? outside_fov_max_size_diff_ : max_size_diff_;
 
                 const double predDist = std::hypot(c.x - predicted_pos[ti].x(), c.y - predicted_pos[ti].y());
-                if (predDist >= gate_dist) { noteReject(ti, di, "dist"); continue; }
-                const double reqSpeed = predDist / std::max(dt, 1e-3);
-                if (reqSpeed >= gate_speed) { noteReject(ti, di, "speed"); continue; }
+                // partial-view jitter allowance (track_jitter_footprint_scale): see the parameter's own comment
+                const double jitter = jitter_fp_scale_ > 0.0
+                    ? jitter_fp_scale_ * 0.5 * std::max(tr.size.x, tr.size.y) : 0.0;
+                if (predDist >= gate_dist + jitter) { noteReject(ti, di, "dist"); continue; }
+                // second observation of a track without a velocity estimate (track_two_point_init): only the physical
+                // per-scan displacement bound, scaled by the scans elapsed since the first observation
+                const bool no_vel = two_point_init_ && tr.hits == 1;
+                if (no_vel) {
+                    const double elapsed = tr.last_obs_stamp > 0.0 ? stamp - tr.last_obs_stamp : dt;
+                    const double bound = max_natural_motion_dist_ * std::max(1.0, elapsed / std::max(dt, 1e-3));
+                    if (std::hypot(c.x - tr.last_obs.x, c.y - tr.last_obs.y) > bound + jitter) { noteReject(ti, di, "speed"); continue; }
+                }
+                const double reqSpeed = std::max(0.0, predDist - jitter) / std::max(dt, 1e-3);
+                if (!no_vel && reqSpeed >= gate_speed) { noteReject(ti, di, "speed"); continue; }
                 const double sizeDiff = relSizeDiff(tr.size, d.bbox.size, min_size_diff_floor_);
                 if (sizeDiff >= gate_size) { noteReject(ti, di, "size"); continue; }
                 // HEIGHT: compare the candidate's TOP (box max z) with the track's smoothed top. Footprint size
@@ -1830,7 +1985,7 @@ private:
                 // box, whose centres differ by ~0.2-0.3 m = 2-3 m/s over one LiDAR tick), not by real motion, and
                 // rejecting it there spawned a duplicate track next to the real one. The soft velErr penalty in
                 // the score below still applies.
-                if (velErr > veldir_gate && predDist > veldir_gate_min_innovation_) {
+                if (!no_vel && velErr > veldir_gate && predDist > std::max(veldir_gate_min_innovation_, jitter)) {
                     noteReject(ti, di, "veldir");
                     continue;
                 }
@@ -1838,7 +1993,7 @@ private:
                 // Natural-motion gate (v1: isNaturalMotion — see its own comment) — only for a track with no
                 // identity evidence of its own yet: not confirmed, not classified either side.
                 if (!tr.confirmed && !yolo_exempt &&
-                    !isNaturalMotion(tr, Eigen::Vector3d(c.x, c.y, c.z), predicted_pos[ti], inside_fov_curr, large_pair)) {
+                    !isNaturalMotion(tr, Eigen::Vector3d(c.x, c.y, c.z), predicted_pos[ti], inside_fov_curr, large_pair, no_vel, jitter)) {
                     noteReject(ti, di, "natural_motion");
                     continue;
                 }
@@ -2148,7 +2303,14 @@ private:
                     if (track_publish_stationary_ || obsSpeed >= minSpeed) tr.confirmed = true;
                 }
             }
-            tr.kf.update(Eigen::Vector3d(d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.center.position.z), r_pos_);
+            if (two_point_init_ && tr.hits == 2) {   // second observation: velocity from the two points (track_two_point_init)
+                const double elapsed = std::max(tr.last_obs_stamp > 0.0 ? stamp - tr.last_obs_stamp : dt, 1e-3);
+                const Eigen::Vector3d z(d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.center.position.z);
+                const Eigen::Vector3d v((z.x() - tr.last_obs.x) / elapsed, (z.y() - tr.last_obs.y) / elapsed, 0.0);
+                tr.kf.initWithVelocity(z, v, r_pos_, 2.0 * r_pos_ / (elapsed * elapsed), p_init_);
+            } else {
+                tr.kf.update(Eigen::Vector3d(d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.center.position.z), r_pos_);
+            }
             tr.size = d.bbox.size;
             {
                 const double top = d.bbox.center.position.z + 0.5 * d.bbox.size.z;
@@ -2280,7 +2442,22 @@ private:
             // corroboration as an unclassified track
             const bool large = classified_corroboration_all_ || (classified_corroboration_min_size_ > 0.0 &&
                                std::max(tr.size.x, tr.size.y) >= classified_corroboration_min_size_);
-            const bool motion_evidence = (classified_now && !large) ? speed_ok : (speed_ok && (kf_vel_confident || point_vote_evidence));
+            if (motion_min_net_fp_ > 0.0 && !tr.left_birth) {
+                const double need = std::max(motion_min_net_floor_,
+                                             motion_min_net_fp_ * std::max(d.bbox.size.x, d.bbox.size.y));
+                tr.left_birth = std::hypot(d.bbox.center.position.x - tr.birth_x, d.bbox.center.position.y - tr.birth_y) >= need;
+            }
+            bool left_ok = motion_min_net_fp_ <= 0.0 || tr.left_birth;
+            if (motion_cons_window_ > 0.0) {
+                tr.cons_hist.push_back({stamp, d.bbox.center.position.x, d.bbox.center.position.y});
+                while (tr.cons_hist.size() > 1 && tr.cons_hist.front()[0] < stamp - motion_cons_window_) tr.cons_hist.pop_front();
+                const double el = tr.cons_hist.back()[0] - tr.cons_hist.front()[0];
+                const double net = std::hypot(tr.cons_hist.back()[1] - tr.cons_hist.front()[1],
+                                              tr.cons_hist.back()[2] - tr.cons_hist.front()[2]);
+                left_ok = left_ok && el >= 0.5 * motion_cons_window_ && net >= motion_cons_ratio_ * speed * el;
+            }
+            const bool motion_evidence = left_ok &&
+                ((classified_now && !large) ? speed_ok : (speed_ok && (kf_vel_confident || point_vote_evidence)));
             // Disocclusion only gates the UNCLASSIFIED (PATH3) case — see this check's own first attempt at
             // scoping (only an actively-moving OTHER track counts at all) and the comment above on why PATH1/
             // PATH3 exist as separate bars in the first place: a CLASSIFIED track already has strong, direct
@@ -2332,7 +2509,9 @@ private:
                                        lidar_origin_.x(), lidar_origin_.y()});
                 while (tr.ego_hist.size() > 1 && tr.ego_hist.front()[0] < stamp - size_travel_window_) tr.ego_hist.pop_front();
                 tr.large_travel = false;
-                if (lidar_tf_ok_ && tr.ego_hist.back()[0] - tr.ego_hist.front()[0] >= 0.8 * size_travel_window_) {
+                const bool body = size_travel_body_lengths_ > 0.0;
+                if (lidar_tf_ok_ && tr.ego_hist.size() >= 2 &&
+                    (body || tr.ego_hist.back()[0] - tr.ego_hist.front()[0] >= 0.8 * size_travel_window_)) {
                     const auto& a = tr.ego_hist.front(); const auto& b = tr.ego_hist.back();
                     double path = 0.0;
                     for (size_t k = 1; k < tr.ego_hist.size(); ++k)
@@ -2341,7 +2520,8 @@ private:
                     const double rel = std::hypot((b[1] - a[1]) - (b[3] - a[3]), (b[2] - a[2]) - (b[4] - a[4]));
                     const double fp = std::max(d.bbox.size.x, d.bbox.size.y);
                     const double need = std::min(size_travel_straight_[2], size_travel_straight_[0] + size_travel_straight_[1] * fp);
-                    tr.large_travel = rel >= size_travel_min_dist_ && path > 0.0 && net >= need * path;
+                    const double min_rel = body ? size_travel_body_lengths_ * fp : size_travel_min_dist_;
+                    tr.large_travel = rel >= min_rel && path > 0.0 && net >= need * path;
                 }
             }
             // walker-shaped at walking speed (track_disocclusion_person_exempt): see the parameter's own comment
@@ -2400,6 +2580,7 @@ private:
             if (isDuplicateOfExistingTrack(d, track_ids, predicted_pos)) continue;
             Track tr;
             tr.id = next_id_++;
+            tr.birth_x = d.bbox.center.position.x; tr.birth_y = d.bbox.center.position.y;
             {   // potential heir of a nearby classified track that passed this detection over (see handOverClass())
                 const auto& c = d.bbox.center.position;
                 double best = class_handover_dist_;
@@ -2473,6 +2654,8 @@ private:
                     tr.dynamic_ticks = src->dynamic_ticks;
                     tr.dynamic_hist = src->dynamic_hist;
                     tr.speed_hist = src->speed_hist;
+                    tr.left_birth = src->left_birth;
+                    tr.cons_hist = src->cons_hist;
                     tr.kf.x_.segment<3>(3) = src->kf.vel();
                     tr.kf.x_.segment<3>(6).setZero();
                     tr.hits = std::max(tr.hits, src->hits);
@@ -2855,6 +3038,12 @@ private:
     int publish_coasting_ticks_{0};
     double size_travel_window_{-1.0}, size_travel_min_dist_{2.0};
     std::array<double, 3> size_travel_straight_{0.7, 0.05, 0.95};
+    double size_travel_body_lengths_{-1.0};
+    bool two_point_init_{false};
+    double motion_min_net_fp_{-1.0}, motion_min_net_floor_{0.3};
+    double jitter_fp_scale_{-1.0};
+    double fragment_merge_margin_{-1.0};
+    double motion_cons_window_{-1.0}, motion_cons_ratio_{0.5};
     double inherit_motion_dist_{-1.0}, inherit_motion_age_{1.0};
     std::deque<Grave> graves_;
     bool disocclusion_person_exempt_{false};

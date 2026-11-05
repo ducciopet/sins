@@ -1,0 +1,42 @@
+yolo_seg_track_detector:
+  ros__parameters:
+    # -----------------------------------------------------------------------
+    # Phase 2 prototype (see ../../README.md's phase plan) — instance
+    # segmentation + tracking, run on every camera in camera_names (each with
+    # its own tracker instance — see yolo_seg_track_detector.py's file
+    # header). Does not yet feed preprocessing_node.
+    #
+    # camera_names below is only the standalone-run fallback:
+    # run_detector.launch.py overrides it with preprocessing.yaml's own list,
+    # same forwarding as static_structures_node, so every node agrees on which
+    # cameras exist.
+    #
+    # No values differ from cfg/indoor/detection.yaml yet (unlike
+    # preprocessing.yaml/static_structures.yaml's range/RANSAC thresholds, model
+    # confidence hasn't shown an indoor/outdoor split in testing) — kept as
+    # its own file anyway for the same reason as every other node here: one
+    # env switch (run_detector.launch.py's env:= arg) picks a consistent
+    # profile for the whole pipeline, not a per-node one.
+    # -----------------------------------------------------------------------
+    camera_names: ["front_camera"]  # mdp_street (base: ["front_camera", "back_camera"])
+    image_topic_template: '/{camera}/camera/color/image_raw'
+    detected_image_topic_template: 'yolo_seg_track/{camera}/detected_image'   # + '/compressed' for the JPEG counterpart
+    detected_masks_topic_template: 'yolo_seg_track/{camera}/instance_masks'   # 32SC1 label image, pixel value = track id (0 = background); raw only, see file header
+    detected_detections_topic_template: 'yolo_seg_track/{camera}/detections'  # vision_msgs/Detection2DArray, id = track id
+    inference_time_topic_template: 'yolo_seg_track/{camera}/inference_time'   # per-frame inference timing
+
+    weights_path: weights/yolo26s-seg.pt    # outdoor: same family/size as the box detector (yolo26s), segmentation head (shared across cameras)
+    class_names_path: cfg/coco.names
+    target_classes: [person, bicycle, car, motorbike, bus, truck, dog, cat, horse]   # outdoor: the box detector's own detection_target_classes (semantic_segmentation.yaml), so with yolo_leaf_method=mask every movable class gets a pixel-exact leaf
+    score_threshold: 0.5     # min confidence required to keep a detection/track
+    # outdoor: bicycles kept from 0.3. Parked bikes at 15-20 m packed in a rack score 0.3-0.5 with this model at 1280
+    # (CODa seq 0: 48 of 77 missed bike boxes); one inference at the lowest threshold, other classes still at 0.5
+    class_score_thresholds: ["bicycle:0.3"]
+    # No timer_period_sec: processing is worker-thread-driven per camera now
+    # (see yolo_seg_track_detector.py's file header), not timer-polled —
+    # a fixed-period timer measurably dropped ~18% of frames to phase
+    # misalignment against the camera's own publish jitter.
+    inference_size: 1280     # [px] outdoor: native camera width, as the box detector (objects at 10-25 m are 30-50 px tall)
+    queue_size: 10
+    jpeg_quality: 80          # compressed annotated-image quality (0-100)
+    tracker: bytetrack.yaml  # motion/IoU tracker, ships with ultralytics — see file header for why not botsort

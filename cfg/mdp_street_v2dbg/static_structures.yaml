@@ -1,0 +1,105 @@
+static_structures_node:
+  ros__parameters:
+    # -----------------------------------------------------------------------
+    # Topics / frames — camera_names/camera_frame_names MUST match
+    # cfg/outdoor/preprocessing.yaml's own camera_names (run_detector.launch.py
+    # passes preprocessing.yaml's list straight through as an override, so
+    # this file's own camera_names below is only the fallback default if
+    # run standalone).
+    # -----------------------------------------------------------------------
+    lidar_frame: velodyne
+    base_frame: base_link
+    global_frame: odom
+    odom_topic: /odometry/filtered
+    lidar_voxelized_topic: /sins/lidar/voxelized_sensor
+    camera_names: ["front_camera"]  # mdp_street (base: ["front_camera", "back_camera"])
+    # calibration_enabled: unset here on purpose — see
+    # cfg/indoor/static_structures.yaml's own comment on this.
+
+    # -----------------------------------------------------------------------
+    # Own range crop, applied to preprocessing_node's already-voxelized (not
+    # range-cropped) LiDAR centroids — see static_structures_node.cpp's file
+    # header. Cheap regardless of value.
+    # -----------------------------------------------------------------------
+    lidar_range_x: 15.0
+    lidar_range_y: 15.0
+
+    # -----------------------------------------------------------------------
+    # RANSAC (sensor frame, per source). Detection is split by source, not
+    # shared: LiDAR only ever detects walls, every camera only ever detects
+    # floor/ground (see static_structures_node.cpp's detect_walls/detect_floor
+    # flags) — the LiDAR's 360°, consistent-height scan suits vertical walls
+    # better, a downward-angled depth camera sees the floor immediately
+    # ahead at far higher density than the LiDAR's own sparse near-field
+    # rings, which matters for catching a slope early.
+    # -----------------------------------------------------------------------
+    max_planes: 6                    # max planes extracted per scan/source
+    ransac_max_iterations: 80        # RANSAC iterations per plane
+    ransac_inlier_threshold: 0.10    # [m] max point-to-plane distance to count as inlier — looser than indoor for sparser outdoor clouds
+    ransac_local_radius: 1.5         # [m] localized sampling: the 2nd/3rd RANSAC point of a triple come within this radius of the 1st (0 = uniform). Finds partitions/far walls that hold only a few % of the points
+    lidar_wall_mode: ransac2d         # LiDAR walls: "ransac2d" = lines in the top view (all rings of a wall vote together; wall = line with vertical extent), "ransac3d" = 3D plane RANSAC
+    wall2d_iterations: 150            # ransac2d: line hypotheses per round
+    wall2d_local_radius: 1.5          # [m] ransac2d: the 2nd point of a hypothesis comes within this of the 1st (top-view distance)
+    wall2d_min_vertical_extent: 1.8   # [m] ransac2d: a line is a wall only if its inliers span at least this height (rejects rows of low furniture)
+    wall2d_max_gap: 0.8               # [m] ransac2d: collinear inliers separated by more than this along the line become separate walls
+    wall2d_bin: 0.5                   # [m] ransac2d density trimming: bin size along the line
+    wall2d_min_bin_fraction: 0.25     # bins with fewer inliers than this fraction of the fullest bin are 'thin' and cut the wall there (0 = off)
+    wall2d_min_bin_points: 2          # ... and at least this many inliers per bin
+    wall2d_min_length: 2.0            # [m] ransac2d: a wall segment must be at least this long along the line
+    wall2d_suppress_dist: 0.3         # [m] ransac2d: leftover points this close to an accepted wall (over its span) are dropped, so its thickness / a near-parallel duplicate does not become another wall
+    wall2d_axis_align_tol_deg: 0.0    # [deg] ransac2d: walls must be parallel/perpendicular to the robot heading (normal within this of a multiple of 90); hypotheses that are not are never counted. 0 = off
+    wall_split_at_junctions: false    # published walls: where two (nearly) perpendicular walls cross, the one that runs through is cut there so each ends at the other (uses wall2d_perp_tol_deg / split_margin / split_half_gap / junction_reach)
+    wall2d_split_at_intersections: false   # ransac2d: a wall that runs THROUGH the junction with a (nearly) perpendicular wall is cut there, so each piece ends at the other wall
+    wall2d_perp_tol_deg: 20.0         # [deg] how far from perpendicular two walls may be to count as a junction
+    wall2d_split_margin: 0.5          # [m] a junction closer than this to a wall's end does not cut it
+    wall2d_split_half_gap: 0.3        # [m] half-width of the gap left at a cut, so the registry does not merge the pieces back
+    wall2d_junction_reach: 1.0        # [m] the crossing wall must reach within this of the junction point
+    marker_lifetime_sec: 0.0          # wall/floor markers stay in rviz until replaced (0), so a paused/stopped bag keeps them on screen
+    ransac_min_inliers: 20           # min inliers required to accept a plane — lower than indoor for sparser outdoor clouds
+    ransac_confidence: 0.99          # confidence used by the early-stop iteration-count formula
+    wall_vertical_angle_deg: 5.0     # [deg] max angle between plane normal and horizontal to classify as wall
+    wall_bbox_max_aspect_ratio: 5.0  # reject a wall box whose longest/2nd-longest side ratio exceeds this (not a real flat wall)
+    wall_min_thickness: 0.20         # [m] min along-normal extent of a published wall box (buildBoxFromPlane) — purely a rendering/downstream-geometry floor, decoupled from ransac_inlier_threshold (RANSAC fit tolerance)
+    nested_merge_iov_thresh: 0.5     # IOV threshold for merging nested/overlapping OBBs within a single scan, before registry update
+
+    # -----------------------------------------------------------------------
+    # Floor plane fit — near-horizontal (within floor_max_tilt_deg of level)
+    # planes from the SAME RANSAC pass above, EMA-tracked PER CAMERA (each
+    # camera keeps its own plane, never blended with another's — see
+    # static_structures_node.cpp's file header and CameraSource::floor_plane_global;
+    # real terrain slopes matter more outdoors than indoors). ground_height
+    # only bootstraps each camera's plane flat until that camera's own first
+    # real fit arrives.
+    # -----------------------------------------------------------------------
+    floor_max_tilt_deg: 25.0   # [deg] max angle between a candidate plane's normal and vertical to classify as floor (not a wall/ramp)
+    floor_ema_alpha: 0.3       # EMA blend weight — lower = smoother/slower to track a changing slope (0.3 at camera_process_hz 10 ~ same time constant as 0.1 at 30 Hz)
+    camera_process_hz: 10.0    # [Hz] max rate at which each camera cloud is processed (floor RANSAC); 0 = every message. Floor changes slowly, 30 Hz is wasted work
+    ground_height: -0.3        # [m] bootstrap floor Z in global_frame, before any real fit exists
+
+    # -----------------------------------------------------------------------
+    # GSeg3D ground estimate — see cfg/indoor/static_structures.yaml's own
+    # comment (identical here, no indoor/outdoor split yet).
+    # -----------------------------------------------------------------------
+    gseg3d_enabled: false                   # OFF for now (LiDAR and cameras alike): code kept for future use; see indoor yaml
+    gseg3d_cell_size_xy: 1.0
+    gseg3d_cell_size_z: 10.0
+    gseg3d_ground_inlier_threshold: 0.1
+    gseg3d_centroid_search_radius: 5.0
+    gseg3d_max_ground_height_deviation: 0.3
+    gseg3d_processing_phase: 1
+
+    # -----------------------------------------------------------------------
+    # Wall registry (persistent tracking across scans) — see
+    # include/sins/wall_registry.hpp. A fresh detection is
+    # merged into a matching registry entry (not replacing it); an existing
+    # entry unmatched this scan is NOT deleted immediately — missed_frames
+    # increments, only dropped once that exceeds wall_max_missed_frames.
+    # -----------------------------------------------------------------------
+    wall_overlap_threshold: 0.3       # IOU threshold above which a fresh detection is matched to an existing entry
+    wall_merge_weight: 0.3            # EMA weight for merging a matched detection's thickness into its registry entry
+    wall_enable_expiry: true          # if true, remove wall entries not seen for wall_max_missed_frames scans
+    wall_max_missed_frames: 20        # scans before an unmatched wall entry expires — shorter than indoor (sparser outdoor scans mean more natural misses)
+    wall_min_normal_dot: 0.9          # min dot product between normals to consider two planes the same wall
+    wall_plane_match_dist: 0.3        # [m] >0: a fresh wall matches a tracked one by PLANE (same normal, centre within this of its plane, faces overlapping or within wall_plane_match_gap) instead of by thin-box IoU, which jitter kept dropping under the threshold (duplicates of one wall piled up). 0 = old IoU matching
+    wall_plane_match_gap: 0.15         # [m] max in-plane gap between the two faces for them to be the same wall
+    wall_max_center_distance: 6.0     # [m] max center-to-center distance to consider two OBBs the same wall — larger than indoor for bigger outdoor walls
