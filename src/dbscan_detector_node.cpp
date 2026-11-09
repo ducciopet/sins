@@ -1266,30 +1266,8 @@ private:
             arr.detections.push_back(d);
             by_name[maskName(fused[i].mask)].push_back(b);
         }
-        fused_pub_->publish(arr);
-
-        // All fused boxes share ONE colour (fused_color); which sources built each is in the detection's class_id.
-        visualization_msgs::msg::MarkerArray markers;
-        if (fused.empty()) {
-            visualization_msgs::msg::Marker del;
-            del.header = arr.header;
-            del.ns = "fused";
-            del.id = 0;
-            del.action = visualization_msgs::msg::Marker::DELETE;
-            markers.markers.push_back(del);
-        } else {
-            std::vector<Obb> boxes;
-            for (const auto& f : fused) boxes.push_back(f.box);
-            visualization_msgs::msg::MarkerArray tmp;
-            appendMarkers(tmp, "fused", 0, boxes, arr.header);
-            for (auto& m : tmp.markers) {
-                m.scale.x = 0.05;
-                m.color.r = fused_color_[0]; m.color.g = fused_color_[1]; m.color.b = fused_color_[2];
-                markers.markers.push_back(m);
-            }
-        }
-        fused_markers_pub_->publish(markers);
-
+        // the per-point cloud goes out BEFORE the boxes: tracker_node processes a tick when the boxes arrive and reads
+        // the latest cloud by det_idx, so a cloud published after them paired every box with the previous tick's points
         if (fused_cloud_pub_->get_subscription_count() > 0) {
             sensor_msgs::msg::PointCloud2 cloud;
             cloud.header = arr.header;
@@ -1318,6 +1296,30 @@ private:
             }
             fused_cloud_pub_->publish(cloud);
         }
+        fused_pub_->publish(arr);
+
+        // All fused boxes share ONE colour (fused_color); which sources built each is in the detection's class_id.
+        visualization_msgs::msg::MarkerArray markers;
+        if (fused.empty()) {
+            visualization_msgs::msg::Marker del;
+            del.header = arr.header;
+            del.ns = "fused";
+            del.id = 0;
+            del.action = visualization_msgs::msg::Marker::DELETE;
+            markers.markers.push_back(del);
+        } else {
+            std::vector<Obb> boxes;
+            for (const auto& f : fused) boxes.push_back(f.box);
+            visualization_msgs::msg::MarkerArray tmp;
+            appendMarkers(tmp, "fused", 0, boxes, arr.header);
+            for (auto& m : tmp.markers) {
+                m.scale.x = 0.05;
+                m.color.r = fused_color_[0]; m.color.g = fused_color_[1]; m.color.b = fused_color_[2];
+                markers.markers.push_back(m);
+            }
+        }
+        fused_markers_pub_->publish(markers);
+
 
         fusion_stats_.refined += refined;
         fusion_stats_.nested += nested_absorbed;

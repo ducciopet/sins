@@ -429,6 +429,12 @@ struct Track {
     // diagnostic (track_log_motion_block): this tick's motion-evidence flags, see the matched branch
     bool dbg_speed_ok = false, dbg_kf_conf = false, dbg_vote = false, dbg_disocc = false;
     double dbg_vote_ratio = -1.0;
+    // diagnostic (track_debug_csv): rules N / C of this tick, and the point-to-surface displacement measure
+    // (pointSurfaceShift(): median distance of this tick's points from the track's own points >= baseline ago)
+    bool dbg_left_ok = true, dbg_cons_ok = true, dbg_motion_ev = false;
+    double dbg_pm_dist = -1.0, dbg_pm_dt = 0.0, dbg_pm_frac = -1.0;
+    int dbg_pm_n = 0;
+    std::deque<std::pair<double, std::vector<Eigen::Vector3f>>> pts_hist;   // (stamp, subsampled points), last ~1 s
     int dynamic_ticks = 0;   // consecutive ticks with (horizontal) speed >= track_dynamic_speed_thresh — see dynamic_confirm_ticks_
 
     // Semantic class: a majority vote across every tick that carried a YOLO class for this track (see
@@ -575,6 +581,14 @@ std::vector<int> hungarianMinCost(const std::vector<std::vector<double>>& cost) 
 // into (calibration_icp_node), refreshed once per tick (refreshCameraTf()), not per track.
 struct CamFov {
     std::string name, frame_id;
+    // the color CameraInfo's own frame (the camera's raw optical frame from the robot/bag TF chain): used when
+    // frame_id (<camera>_refined) has no TF, i.e. before calibration_icp_node converges or with enable_calibration
+    // false (CODa, JRDB), the same fallback preprocessing_node uses. Without it the camera was never usable there:
+    // no FOV test (every track "outside FOV") and no LiDAR-only pixel fallback.
+    std::string info_frame;
+    bool use_info_frame = false;   // which frame the pose came from this tick (logged once on change)
+    double last_2d_stamp = -1.0;   // stamp of the 2D YOLO message seen at the previous tick
+    bool fresh_2d = false;         // a new 2D YOLO frame arrived since the previous tick (track_decay_fresh_frames_only)
     double fx = 0.0, fy = 0.0, cx = 0.0, cy = 0.0;
     int width = 0, height = 0;
     bool has_info = false;
@@ -691,7 +705,22 @@ public:
         fused_clusters_topic_ = declare_parameter<std::string>("fused_clusters_topic", "/sins/dbscan_detector/fused/clusters");
         point_vote_thresh_ = declare_parameter<double>("track_point_vote_thresh", 0.7);         // v1: dynaVoteThresh_
         point_vote_max_points_ = declare_parameter<int>("track_point_vote_max_points", 500);    // cap — brute-force nearest-neighbor is O(n*m); v1 never capped this (its own clusters were smaller), this file's can be larger (LiDAR walls, etc.)
-        point_vote_max_age_ = declare_parameter<double>("point_vote_max_age", 0.5);  // [s] ignore a stale clusters cloud (same convention as yolo2d_max_age)
+        point_vote_max_age_ = declare_parameter<double>("point_vote_max_age", 0.5);
+        // POINT-TO-SURFACE MOTION EVIDENCE (track_point_shift_min_frac, < 0 = off: the v1 point vote is used). The
+        // track's points now are compared with its own points >= 0.5 s earlier (odom frame: the robot's motion is
+        // already removed). A point counts as moved when its nearest old point is farther than
+        // track_dynamic_speed_thresh x elapsed time (it moved faster than the dynamic bar); the tick is motion
+        // evidence when at least this fraction of the points moved. A still object seen from another angle keeps
+        // most of its points on its old surface. Replaces the v1 point vote as the corroboration of an unclassified
+        // track's KF speed (the vote compared consecutive scans, 0.035 m at the bar: sensor noise).
+        point_shift_min_frac_ = declare_parameter<double>("track_point_shift_min_frac", -1.0);
+        // ...and this evidence also lifts the C rule (displacement-confirmed speed) / the disocclusion block for the tick
+        point_shift_lifts_cons_ = declare_parameter<bool>("track_point_shift_lifts_consistency", false);
+        point_shift_lifts_disocc_ = declare_parameter<bool>("track_point_shift_lifts_disocclusion", false);
+        // ...or as a VETO (track_point_shift_veto): an unclassified track whose points are, for the most part, still on
+        // the surface they described >= 0.5 s ago gets no motion evidence this tick, whatever its KF speed says
+        // (ticks without the measure, e.g. a track younger than 0.3 s, are not vetoed)
+        point_shift_veto_ = declare_parameter<bool>("track_point_shift_veto", false);  // [s] ignore a stale clusters cloud (same convention as yolo2d_max_age)
 
         // Disocclusion-artifact detection — NOT from v1 (the user's own design, from a separate discussion, see
         // isDisocclusionArtifact()'s own comment): when a track moves away from a spot, whatever was BEHIND it
@@ -838,7 +867,8 @@ public:
                 dbg_csv_ = std::fopen(path.c_str(), "w");
                 if (dbg_csv_) setvbuf(dbg_csv_, nullptr, _IOLBF, 0);
                 if (dbg_csv_) std::fprintf(dbg_csv_, "t,id,x,y,ox,oy,confirmed,matched,hits,missed,speed,dyn_ticks,confirm_ticks,"
-                                                     "speed_ok,kf_conf,vote,disocc,size_ok,sticky,fov,cls,status,sx,sy,sz\n");
+                                                     "speed_ok,kf_conf,vote,disocc,size_ok,sticky,fov,cls,status,sx,sy,sz,"
+                                                     "vote_ratio,left_ok,cons_ok,large_travel,motion_ev,pm_dist,pm_dt,pm_frac,pm_n\n");
             }
         }
         track_stationary_max_ticks_ = declare_parameter<int>("track_stationary_max_ticks", 50);
@@ -1044,7 +1074,10 @@ public:
         camera_names_ = declare_parameter<std::vector<std::string>>("camera_names", {"front_camera", "back_camera"});
         camera_info_topic_template_ = declare_parameter<std::string>("camera_info_topic_template", "/{camera}/camera/color/camera_info");
         camera_frame_template_ = declare_parameter<std::string>("camera_frame_template", "{camera}_refined");
-        max_non_yolo_in_fov_frames_ = declare_parameter<int>("track_max_non_yolo_in_fov_frames", 5);     // v1: maxNonYoloInFovFrames_
+        // see CamFov::info_frame (false = the old behaviour: no camera at all until <camera>_refined exists)
+        camera_info_frame_fallback_ = declare_parameter<bool>("camera_info_frame_fallback", true);
+        max_non_yolo_in_fov_frames_ = declare_parameter<int>("track_max_non_yolo_in_fov_frames", 5);
+        decay_fresh_only_ = declare_parameter<bool>("track_decay_fresh_frames_only", false);     // v1: maxNonYoloInFovFrames_
         max_yolo_base_mismatch_frames_ = declare_parameter<int>("track_max_yolo_base_mismatch_frames", 5); // v1: maxYoloBaseMismatchFrames_
         yolo_base_mismatch_thresh_ = declare_parameter<double>("track_yolo_base_mismatch_thresh", 0.50);  // v1: yoloBaseMismatchThresh_
         // No v1 equivalent — re-added after being removed and then found to be worth keeping after all, now
@@ -1080,6 +1113,7 @@ public:
                     if (cam_ptr->has_info) return;  // intrinsics don't change at runtime — latch the first one
                     cam_ptr->fx = msg->k[0]; cam_ptr->fy = msg->k[4]; cam_ptr->cx = msg->k[2]; cam_ptr->cy = msg->k[5];
                     cam_ptr->width = static_cast<int>(msg->width); cam_ptr->height = static_cast<int>(msg->height);
+                    if (camera_info_frame_fallback_) cam_ptr->info_frame = msg->header.frame_id;
                     cam_ptr->has_info = true;
                     RCLCPP_INFO(get_logger(), "[%s] FOV intrinsics: fx=%.2f fy=%.2f cx=%.2f cy=%.2f %dx%d (frame=%s)",
                                 cam_ptr->name.c_str(), cam_ptr->fx, cam_ptr->fy, cam_ptr->cx, cam_ptr->cy,
@@ -1160,9 +1194,22 @@ private:
     void refreshCameraTf() {
         for (auto& cam : cams_) {
             cam.tf_ok = false;
+            {
+                const double s2d = cam.latest_2d ? stampSec(cam.latest_2d->header.stamp) : -1.0;
+                cam.fresh_2d = s2d >= 0.0 && s2d != cam.last_2d_stamp;
+                cam.last_2d_stamp = s2d;
+            }
             if (!cam.has_info) continue;
+            // <camera>_refined when it exists, else the camera's own optical frame (camera_info_frame_fallback)
+            std::string frame = cam.frame_id;
+            if (!cam.info_frame.empty() && !tf_buffer_.canTransform(cam.frame_id, global_frame_, tf2::TimePointZero))
+                frame = cam.info_frame;
+            if ((frame != cam.frame_id) != cam.use_info_frame) {
+                cam.use_info_frame = frame != cam.frame_id;
+                RCLCPP_INFO(get_logger(), "[%s] FOV pose from frame '%s'", cam.name.c_str(), frame.c_str());
+            }
             try {
-                const auto tf = tf_buffer_.lookupTransform(cam.frame_id, global_frame_, tf2::TimePointZero);
+                const auto tf = tf_buffer_.lookupTransform(frame, global_frame_, tf2::TimePointZero);
                 const auto& t = tf.transform;
                 Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
                 T.linear() = Eigen::Quaterniond(t.rotation.w, t.rotation.x, t.rotation.y, t.rotation.z).toRotationMatrix();
@@ -1205,9 +1252,10 @@ private:
     // border_frac > 0: the centre must also stay that fraction of the image width/height away from every border
     // — see decaySemanticEvidence(): near the border YOLO only sees part of the object and cannot be expected to
     // keep re-confirming it.
-    bool insideAnyCameraFov(const Eigen::Vector3d& pos_global, double border_frac = 0.0) const {
+    bool insideAnyCameraFov(const Eigen::Vector3d& pos_global, double border_frac = 0.0, bool fresh_only = false) const {
         for (const auto& cam : cams_) {
             if (!cam.has_info || !cam.tf_ok) continue;
+            if (fresh_only && !cam.fresh_2d) continue;
             const Eigen::Vector3d p = cam.T_cam_global * pos_global;  // p.z() = depth along the optical axis
             if (p.z() <= 1e-3) continue;  // behind the camera
             const double u = cam.fx * p.x() / p.z() + cam.cx;
@@ -1290,6 +1338,11 @@ private:
         std::map<size_t, std::vector<Eigen::Vector3f>> out;
         if (!latest_clusters_) return out;
         if (std::abs(now_sec - stampSec(latest_clusters_->header.stamp)) > point_vote_max_age_) return out;
+        // det_idx indexes THIS tick's detections only: a cloud of another tick would pair boxes with other objects' points
+        if (std::abs(now_sec - stampSec(latest_clusters_->header.stamp)) > 1e-4) { ++clusters_stamp_mismatch_; return out; }
+        ++clusters_stamp_match_;
+        RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000, "clusters cloud of the same tick: %ld, other tick: %ld",
+                             clusters_stamp_match_, clusters_stamp_mismatch_);
         sensor_msgs::PointCloud2ConstIterator<float> ix(*latest_clusters_, "x"), iy(*latest_clusters_, "y"),
             iz(*latest_clusters_, "z"), iidx(*latest_clusters_, "det_idx");
         for (; ix != ix.end(); ++ix, ++iy, ++iz, ++iidx) {
@@ -1309,6 +1362,42 @@ private:
     // one moving WITH it and fast enough votes "dynamic". Returns the vote ratio, or a negative value when
     // there isn't enough data to have an opinion (no previous points, too many points to bother, or the track
     // isn't moving at all) — the caller treats a negative return as "abstain", not "not dynamic".
+    // How far this tick's points of the track lie from
+    // the SURFACE its points described >= 0.5 s ago (both sets in the odom frame, so the robot's own motion is
+    // already removed). Median nearest-neighbour distance (robust to a part of the object seen for the first time)
+    // and the fraction of points farther than track_dynamic_speed_thresh x elapsed. A still object seen from another angle stays on its old
+    // surface; a mover at v m/s leaves it by ~v * dt. Points subsampled to <= 150 per set.
+    void pointSurfaceShift(Track& tr, const std::vector<Eigen::Vector3f>* pts, double stamp) const {
+        tr.dbg_pm_dist = -1.0; tr.dbg_pm_dt = 0.0; tr.dbg_pm_frac = -1.0; tr.dbg_pm_n = 0;
+        if (!pts || pts->empty()) return;
+        std::vector<Eigen::Vector3f> sub;
+        const size_t step = std::max<size_t>(1, pts->size() / 150);
+        for (size_t k = 0; k < pts->size(); k += step) sub.push_back((*pts)[k]);
+        // reference: the newest stored set at least 0.5 s old (else the oldest one if >= 0.3 s)
+        const std::vector<Eigen::Vector3f>* ref = nullptr; double ref_t = 0.0;
+        for (auto it = tr.pts_hist.rbegin(); it != tr.pts_hist.rend(); ++it)
+            if (stamp - it->first >= 0.5) { ref = &it->second; ref_t = it->first; break; }
+        if (!ref && !tr.pts_hist.empty() && stamp - tr.pts_hist.front().first >= 0.3) {
+            ref = &tr.pts_hist.front().second; ref_t = tr.pts_hist.front().first;
+        }
+        if (ref && !ref->empty()) {
+            std::vector<double> dmin; dmin.reserve(sub.size());
+            for (const auto& cp : sub) {
+                double best = std::numeric_limits<double>::max();
+                for (const auto& rp : *ref) best = std::min(best, static_cast<double>((cp - rp).squaredNorm()));
+                dmin.push_back(std::sqrt(best));
+            }
+            std::nth_element(dmin.begin(), dmin.begin() + dmin.size() / 2, dmin.end());
+            tr.dbg_pm_dist = dmin[dmin.size() / 2];
+            tr.dbg_pm_dt = stamp - ref_t; tr.dbg_pm_n = static_cast<int>(sub.size());
+            // moved = farther from the old surface than the dynamic bar covers in the elapsed time
+            const double moved = dynamic_speed_thresh_ * tr.dbg_pm_dt;
+            tr.dbg_pm_frac = static_cast<double>(std::count_if(dmin.begin(), dmin.end(), [moved](double v) { return v > moved; })) / dmin.size();
+        }
+        tr.pts_hist.emplace_back(stamp, std::move(sub));
+        while (!tr.pts_hist.empty() && stamp - tr.pts_hist.front().first > 1.0) tr.pts_hist.pop_front();
+    }
+
     double pointCloudVoteRatio(const std::vector<Eigen::Vector3f>& curr, const std::vector<Eigen::Vector3f>& prev,
                                const Eigen::Vector3d& box_vel, double dt) const {
         if (curr.empty() || prev.empty() || dt <= 1e-3) return -1.0;
@@ -1577,7 +1666,13 @@ private:
         // through it in well under a second, while an object that SITS there unconfirmed (e.g. a track that slid
         // onto static clutter at the image edge as the person left) must not keep its class forever.
         const int decay_limit = in_reliable_fov ? max_non_yolo_in_fov_frames_ : max_non_yolo_fov_border_frames_;
-        if (inside_fov && det_class_this_tick.empty()) {
+        // track_decay_fresh_frames_only: a tick counts only if a camera that sees the track produced a NEW YOLO
+        // frame since the previous tick (a camera slower than the LiDAR, or YOLO with a frame stride, gives YOLO
+        // no chance to confirm on the other ticks); otherwise the streak is left as it is
+        const bool yolo_looked = !decay_fresh_only_ || insideAnyCameraFov(tr.kf.pos(), 0.0, true);
+        if (inside_fov && det_class_this_tick.empty() && !yolo_looked) {
+            // no new YOLO frame this tick: neither counts nor resets
+        } else if (inside_fov && det_class_this_tick.empty()) {
             if (++tr.non_yolo_in_fov_streak >= decay_limit) {
                 tr.best_class.clear();
                 tr.class_votes.clear();
@@ -2420,6 +2515,10 @@ private:
                 ? pointCloudVoteRatio(pit->second, tr.prev_points, tr.kf.vel(), dt) : -1.0;
             const bool point_vote_evidence = voteRatio >= point_vote_thresh_;  // a negative (abstain) ratio never clears this
             tr.prev_points = pit != points_by_det.end() ? pit->second : std::vector<Eigen::Vector3f>{};
+            if (dbg_csv_ || point_shift_min_frac_ > 0.0) pointSurfaceShift(tr, pit != points_by_det.end() ? &pit->second : nullptr, stamp);
+            const bool point_shift_evidence = point_shift_min_frac_ > 0.0 && tr.dbg_pm_frac >= point_shift_min_frac_;
+            const bool point_shift_vetoed = point_shift_veto_ && point_shift_min_frac_ > 0.0 && tr.dbg_pm_frac >= 0.0 &&
+                                            tr.dbg_pm_frac < point_shift_min_frac_;
 
             // Disocclusion-artifact check (not from v1, see isDisocclusionArtifact()'s own comment) — if this
             // tick's position reads as "the wall behind where some OTHER track recently was, now visible",
@@ -2454,10 +2553,15 @@ private:
                 const double el = tr.cons_hist.back()[0] - tr.cons_hist.front()[0];
                 const double net = std::hypot(tr.cons_hist.back()[1] - tr.cons_hist.front()[1],
                                               tr.cons_hist.back()[2] - tr.cons_hist.front()[2]);
-                left_ok = left_ok && el >= 0.5 * motion_cons_window_ && net >= motion_cons_ratio_ * speed * el;
+                const bool cons = el >= 0.5 * motion_cons_window_ && net >= motion_cons_ratio_ * speed * el;
+                left_ok = left_ok && (cons || (point_shift_lifts_cons_ && point_shift_evidence));
             }
+            tr.dbg_left_ok = motion_min_net_fp_ <= 0.0 || tr.left_birth;
+            tr.dbg_cons_ok = left_ok || !tr.dbg_left_ok;
             const bool motion_evidence = left_ok &&
-                ((classified_now && !large) ? speed_ok : (speed_ok && (kf_vel_confident || point_vote_evidence)));
+                ((classified_now && !large) ? speed_ok
+                 : (speed_ok && !point_shift_vetoed &&
+                    (kf_vel_confident || (point_shift_min_frac_ > 0.0 && !point_shift_veto_ ? point_shift_evidence : point_vote_evidence))));
             // Disocclusion only gates the UNCLASSIFIED (PATH3) case — see this check's own first attempt at
             // scoping (only an actively-moving OTHER track counts at all) and the comment above on why PATH1/
             // PATH3 exist as separate bars in the first place: a CLASSIFIED track already has strong, direct
@@ -2530,7 +2634,8 @@ private:
                 speed >= disocclusion_person_speed_.first && speed <= disocclusion_person_speed_.second &&
                 d.bbox.size.z >= disocclusion_person_height_.first && d.bbox.size.z <= disocclusion_person_height_.second &&
                 fp >= disocclusion_person_footprint_.first && fp <= disocclusion_person_footprint_.second;
-            const bool blocked_by_disocclusion = disocclusion && !classified_now && !had_dynamic_history && !seen_before && !travelled && !person_like;
+            const bool blocked_by_disocclusion = disocclusion && !classified_now && !had_dynamic_history && !seen_before && !travelled && !person_like &&
+                                                 !(point_shift_lifts_disocc_ && point_shift_evidence);
             if (log_motion_block_ && disocclusion && !classified_now && !had_dynamic_history && !seen_before && travelled)
                 RCLCPP_WARN(get_logger(), "disocc_travel: track #%d pos=[%.2f,%.2f] size=[%.2f,%.2f,%.2f] hits=%d speed=%.2f",
                     tr.id, d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.size.x, d.bbox.size.y, d.bbox.size.z,
@@ -2558,7 +2663,7 @@ private:
                     tr.id);
             tr.dynamic_ticks = (motion_evidence && !blocked_by_disocclusion) ? tr.dynamic_ticks + 1 : 0;
             tr.dbg_speed_ok = speed_ok; tr.dbg_kf_conf = kf_vel_confident; tr.dbg_vote = point_vote_evidence;
-            tr.dbg_disocc = blocked_by_disocclusion; tr.dbg_vote_ratio = voteRatio;
+            tr.dbg_disocc = blocked_by_disocclusion; tr.dbg_vote_ratio = voteRatio; tr.dbg_motion_ev = motion_evidence;
 
             // Position history for isDisocclusionArtifact()'s own use by OTHER tracks next tick.
             tr.pos_hist.push_back(Eigen::Vector3d(d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.center.position.z));
@@ -3015,18 +3120,24 @@ private:
                 bool size_ok, const char* status) const {
         if (!dbg_csv_) return;
         const Eigen::Vector3d p = tr.kf.pos();
-        std::fprintf(dbg_csv_, "%.3f,%d,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%.2f,%.2f,%.2f\n",
+        std::fprintf(dbg_csv_, "%.3f,%d,%.2f,%.2f,%.2f,%.2f,%d,%d,%d,%d,%.2f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%.2f,%.2f,%.2f,"
+                               "%.2f,%d,%d,%d,%d,%.3f,%.2f,%.2f,%d\n",
             h.stamp.sec + h.stamp.nanosec * 1e-9, id, p.x(), p.y(), tr.last_obs.x, tr.last_obs.y, tr.confirmed ? 1 : 0,
             matched ? 1 : 0, tr.hits, tr.missed_in_a_row, planarSpeed(tr.kf.vel()), tr.dynamic_ticks, confirm_ticks,
             tr.dbg_speed_ok, tr.dbg_kf_conf, tr.dbg_vote, tr.dbg_disocc, size_ok ? 1 : 0, sticky,
             insideAnyCameraFov(p) ? 1 : 0, tr.best_class.empty() ? "-" : tr.best_class.c_str(), status,
-            tr.size.x, tr.size.y, tr.size.z);
+            tr.size.x, tr.size.y, tr.size.z,
+            tr.dbg_vote_ratio, tr.dbg_left_ok ? 1 : 0, tr.dbg_cons_ok ? 1 : 0, tr.large_travel ? 1 : 0,
+            tr.dbg_motion_ev ? 1 : 0, tr.dbg_pm_dist, tr.dbg_pm_dt, tr.dbg_pm_frac, tr.dbg_pm_n);
     }
     Eigen::Vector3d dynamic_target_size_{0.5, 0.5, 1.7}, dynamic_size_tolerance_{0.8, 0.8, 1.0};
     std::string fused_clusters_topic_;
     double point_vote_thresh_{0.7};
     int point_vote_max_points_{500};
     double point_vote_max_age_{0.5};
+    mutable long clusters_stamp_match_{0}, clusters_stamp_mismatch_{0};
+    double point_shift_min_frac_{-1.0};
+    bool point_shift_lifts_cons_{false}, point_shift_lifts_disocc_{false}, decay_fresh_only_{false}, point_shift_veto_{false};
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_clusters_;
     sensor_msgs::msg::PointCloud2::ConstSharedPtr latest_clusters_;
     std::string lidar_frame_;
@@ -3062,6 +3173,7 @@ private:
 
     std::vector<std::string> camera_names_;
     std::string camera_info_topic_template_, camera_frame_template_, yolo2d_topic_template_;
+    bool camera_info_frame_fallback_{true};
     double yolo2d_max_age_{0.5}, yolo2d_min_iou_{0.2};
     int max_non_yolo_in_fov_frames_{5};
     int max_yolo_base_mismatch_frames_{5};
