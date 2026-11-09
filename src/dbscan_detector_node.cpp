@@ -246,6 +246,12 @@ public:
         fusion_margin_ = declare_parameter<double>("fusion_margin", 0.05);
         fusion_stamp_tolerance_ = declare_parameter<double>("fusion_stamp_tolerance", 0.08);
         fusion_timeout_sec_ = declare_parameter<double>("fusion_timeout_sec", 0.12);
+        // ADAPTIVE WAIT (fusion_adaptive_wait, default false): every camera source's arrival delay after its scan is
+        // measured all the time (also when nobody waits for it); a scan waits only for the sources whose median delay
+        // over the last 30 arrivals is within fusion_timeout_sec. A camera that always comes too late (a slow YOLO,
+        // a frame rate below the LiDAR's) no longer costs the full timeout on every scan for nothing; its data is
+        // still fused whenever it is already there.
+        fusion_adaptive_wait_ = declare_parameter<bool>("fusion_adaptive_wait", false);
         fusion_voxel_near_ = declare_parameter<double>("fusion_voxel_near", 0.05);
         fusion_voxel_far_ = declare_parameter<double>("fusion_voxel_far", 0.03);
         fusion_voxel_split_ = declare_parameter<double>("fusion_voxel_split_range", 6.0);
@@ -616,6 +622,7 @@ private:
         if (fusion_enabled_) {
             const double stamp = stampSec(cloud->header.stamp);
             last_cam_[cam.name] = {stamp, res};
+            noteArrival(cam.name, stamp);
             if (pending_.active && !pending_.cams.count(cam.name) && std::abs(stamp - pending_.stamp) <= fusion_stamp_tolerance_)
                 pending_.cams[cam.name] = res;
             tryFuse();
@@ -672,6 +679,7 @@ private:
         if (fusion_enabled_) {
             const double stamp = stampSec(cloud->header.stamp);
             last_cam_[name] = {stamp, res};
+            noteArrival(name, stamp);
             if (pending_.active && !pending_.cams.count(name) && std::abs(stamp - pending_.stamp) <= fusion_stamp_tolerance_)
                 pending_.cams[name] = res;
             tryFuse();
@@ -693,6 +701,8 @@ private:
             pending_.header = lidar->header;
             pending_.lidar = res;
             pending_.arrived = std::chrono::steady_clock::now();
+            scan_arrivals_.emplace_back(pending_.stamp, pending_.arrived);
+            while (scan_arrivals_.size() > 20) scan_arrivals_.pop_front();
             for (const auto& [name, sc] : last_cam_)
                 if (std::abs(sc.first - pending_.stamp) <= fusion_stamp_tolerance_) pending_.cams[name] = sc.second;
             tryFuse();
@@ -701,6 +711,28 @@ private:
     }
 
     // ---- fusion -------------------------------------------------------------------------------------------
+
+    bool fusion_adaptive_wait_{false};
+    std::deque<std::pair<double, std::chrono::steady_clock::time_point>> scan_arrivals_;   // (scan stamp, arrival)
+    std::map<std::string, std::deque<double>> src_delay_;                                   // source -> recent delays [s]
+    void noteArrival(const std::string& name, double stamp) {
+        const auto now = std::chrono::steady_clock::now();
+        double best = fusion_stamp_tolerance_; const std::chrono::steady_clock::time_point* at = nullptr;
+        for (const auto& sa : scan_arrivals_)
+            if (std::abs(sa.first - stamp) <= best) { best = std::abs(sa.first - stamp); at = &sa.second; }
+        if (!at) return;
+        auto& d = src_delay_[name];
+        d.push_back(std::chrono::duration<double>(now - *at).count());
+        while (d.size() > 30) d.pop_front();
+    }
+    bool sourceExpected(const std::string& name) const {
+        if (!fusion_adaptive_wait_) return true;
+        const auto it = src_delay_.find(name);
+        if (it == src_delay_.end() || it->second.size() < 10) return true;   // not enough evidence yet: wait for it
+        std::vector<double> v(it->second.begin(), it->second.end());
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        return v[v.size() / 2] <= fusion_timeout_sec_;
+    }
 
     struct Pending {
         bool active = false;
@@ -715,9 +747,16 @@ private:
         if (!pending_.active) return;
         // expected: every camera, plus the YOLO leaves of each camera whose leaves are alive (seen in the last second)
         const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
-        size_t expected = cameras_.size();
-        for (const auto& kv : cameras_) if (wall - kv.second.leaves_seen < 1.0) ++expected;
-        const bool complete = pending_.cams.size() >= expected;
+        size_t expected = 0, present = 0;
+        for (const auto& kv : cameras_) {
+            for (const std::string& src : {kv.first, kv.first + "_yolo"}) {
+                if (src != kv.first && !(wall - kv.second.leaves_seen < 1.0)) continue;   // leaves not alive
+                if (!sourceExpected(src)) continue;
+                ++expected;
+                if (pending_.cams.count(src)) ++present;
+            }
+        }
+        const bool complete = present >= expected;
         const double waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - pending_.arrived).count();
         if (complete || waited > fusion_timeout_sec_) {
             fuseAndPublish();

@@ -331,6 +331,8 @@ public:
         // (scan_trigger), not for every camera frame — the detection tick is the scan, so the other
         // ~2 of every 3 frames would be processed and never used.
         depth_process_on_scan_trigger_ = this->declare_parameter("depth_process_on_scan_trigger", false);
+        // at most this many points read from a native depth cloud (every k-th point); 0 = all
+        depth_input_max_points_ = this->declare_parameter("depth_input_max_points", 0);
         // "box" (default): crop each detection's (inflated) 2D box out of the depth cloud, then isolate the
         // detected object's own depth cluster within that crop (mode + valley-bounded window — see
         // depthModeValleyWindow()). Works with ANY plain object-detection model (the existing COCO detection
@@ -767,6 +769,8 @@ private:
     bool has_odom_{false};
     Eigen::Matrix4d T_global_base_latest_{Eigen::Matrix4d::Identity()};
     bool calibration_enabled_{true};
+    std::vector<double> lidar_age_ms_;
+    int depth_input_max_points_{0};
 
     std::mt19937 rng_;
 
@@ -1389,6 +1393,19 @@ private:
 
     // A LiDAR scan arrived: every native-cloud camera will process the frame closest to its stamp,
     // as soon as a frame at/after that stamp exists (camera clouds arrive ~30 ms after their stamp).
+    // per camera: [frame age at processing start, processing time] samples, logged as medians every 10 s
+    std::map<std::string, std::vector<std::array<double, 3>>> cam_timing_;
+    void noteCamTiming(CameraStream& cam, double age_ms, double proc_ms, size_t pts) {
+        auto& v = cam_timing_[cam.name];
+        v.push_back({age_ms, proc_ms, static_cast<double>(pts)});
+        if (v.size() < 50) return;
+        auto med = [&v](int k) { std::vector<double> x; for (const auto& a : v) x.push_back(a[k]);
+                                 std::nth_element(x.begin(), x.begin() + x.size() / 2, x.end()); return x[x.size() / 2]; };
+        RCLCPP_INFO(this->get_logger(), "[%s] camera timing (median of %zu frames): frame age at start %.1f ms, processing %.1f ms, %.0f input points",
+                    cam.name.c_str(), v.size(), med(0), med(1), med(2));
+        v.clear();
+    }
+
     void queueDepthTargets(const builtin_interfaces::msg::Time& scan_stamp) {
         if (!depth_process_on_scan_trigger_) return;
         const double t = stampSec(scan_stamp);
@@ -1744,8 +1761,27 @@ private:
     }
 
     void onNativeDepthCloud(CameraStream& cam, const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) {
+        // timing diagnostic: how old the frame is when its processing starts, and how long the processing takes
+        const double t_in = (this->now() - rclcpp::Time(msg->header.stamp)).seconds() * 1000.0;
+        const auto t0 = std::chrono::steady_clock::now();
+        struct Done {
+            PreprocessingNode* n; CameraStream& c; double in; std::chrono::steady_clock::time_point t0; size_t pts;
+            ~Done() { n->noteCamTiming(c, in, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), pts); }
+        } done{this, cam, t_in, t0, static_cast<size_t>(msg->width) * msg->height};
+        // depth_input_max_points: read every k-th point (k = ceil(n / max)) straight from the message instead of
+        // converting the whole cloud; a stereo/RGB-D cloud is far denser than the 5-10 cm voxels used downstream
+        const size_t n_in = static_cast<size_t>(msg->width) * msg->height;
+        const size_t step = depth_input_max_points_ > 0 && n_in > static_cast<size_t>(depth_input_max_points_)
+            ? (n_in + depth_input_max_points_ - 1) / depth_input_max_points_ : 1;
         pcl::PointCloud<pcl::PointXYZ> raw_cloud;
-        pcl::fromROSMsg(*msg, raw_cloud);
+        if (step == 1) {
+            pcl::fromROSMsg(*msg, raw_cloud);
+        } else {
+            raw_cloud.points.reserve(n_in / step + 1);
+            sensor_msgs::PointCloud2ConstIterator<float> ix(*msg, "x"), iy(*msg, "y"), iz(*msg, "z");
+            for (size_t i = 0; ix != ix.end(); ++ix, ++iy, ++iz, ++i)
+                if (i % step == 0) raw_cloud.points.emplace_back(*ix, *iy, *iz);
+        }
 
         pcl::PointCloud<pcl::PointXYZ> cloud;
         cloud.points.reserve(raw_cloud.points.size());
@@ -2018,8 +2054,20 @@ private:
     void onLidarOdom(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& lidar_msg,
                       const nav_msgs::msg::Odometry::ConstSharedPtr& odom_msg) {
         const auto scan_t0 = std::chrono::steady_clock::now();
+        lidar_age_ms_.push_back((this->now() - rclcpp::Time(lidar_msg->header.stamp)).seconds() * 1000.0);
+        if (lidar_age_ms_.size() >= 50) {
+            std::nth_element(lidar_age_ms_.begin(), lidar_age_ms_.begin() + 25, lidar_age_ms_.end());
+            RCLCPP_INFO(this->get_logger(), "lidar timing: scan age at processing start %.1f ms (median of 50)", lidar_age_ms_[25]);
+            lidar_age_ms_.clear();
+        }
         pub_scan_trigger_->publish(lidar_msg->header);
-        queueDepthTargets(lidar_msg->header.stamp);
+        // the camera frames waiting for this scan are processed AFTER the LiDAR cloud is published (on every exit
+        // of this callback): run first, a frame already here put its whole depth processing (40-60 ms for a dense
+        // stereo cloud) in front of the LiDAR, and the camera crop used the previous scan's ground and leaf cloud
+        struct AfterScan {
+            PreprocessingNode* n; builtin_interfaces::msg::Time st;
+            ~AfterScan() { n->queueDepthTargets(st); }
+        } after_scan{this, lidar_msg->header.stamp};
         if (!ensureStaticTf()) {
             return;
         }

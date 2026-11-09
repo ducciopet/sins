@@ -1945,7 +1945,33 @@ private:
         return std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
     }
 
+    // tick timing diagnostic: [prep, association, class fallback, matched updates, spawn, publish] ms, medians every 50 ticks
+    std::vector<std::array<double, 7>> tick_ms_;
+    double tick_age_ms_ = 0.0;
+    std::vector<double> tick_ages_;
+    std::chrono::steady_clock::time_point tick_t_[7];
+    void tickMark(int k) { tick_t_[k] = std::chrono::steady_clock::now(); }
+    void tickReport(size_t ntracks) {
+        std::array<double, 7> v{};
+        for (int k = 1; k < 7; ++k) v[k - 1] = std::chrono::duration<double, std::milli>(tick_t_[k] - tick_t_[k - 1]).count();
+        v[6] = static_cast<double>(ntracks);
+        tick_ms_.push_back(v);
+        tick_ages_.push_back(tick_age_ms_);
+        if (tick_ms_.size() < 50) return;
+        std::nth_element(tick_ages_.begin(), tick_ages_.begin() + tick_ages_.size() / 2, tick_ages_.end());
+        RCLCPP_INFO(get_logger(), "tick timing: detections age at callback start %.1f ms (median)", tick_ages_[tick_ages_.size() / 2]);
+        tick_ages_.clear();
+        auto med = [this](int k) { std::vector<double> x; for (const auto& a : tick_ms_) x.push_back(a[k]);
+                                   std::nth_element(x.begin(), x.begin() + x.size() / 2, x.end()); return x[x.size() / 2]; };
+        auto mx = [this](int k) { double m = 0; for (const auto& a : tick_ms_) m = std::max(m, a[k]); return m; };
+        RCLCPP_INFO(get_logger(), "tick timing (median/max of 50, ms): prep %.1f/%.1f assoc %.1f/%.1f fallback %.1f/%.1f "
+                    "matched %.1f/%.1f spawn %.1f/%.1f publish %.1f/%.1f | tracks %.0f",
+                    med(0), mx(0), med(1), mx(1), med(2), mx(2), med(3), mx(3), med(4), mx(4), med(5), mx(5), med(6));
+        tick_ms_.clear();
+    }
     void onFused(const vision_msgs::msg::Detection3DArray::ConstSharedPtr& in_msg) {
+        tickMark(0);
+        tick_age_ms_ = (now() - rclcpp::Time(in_msg->header.stamp)).seconds() * 1000.0;
         vision_msgs::msg::Detection3DArray::ConstSharedPtr msg = in_msg;
         const double stamp = stampSec(msg->header.stamp);
         double dt = last_stamp_ > 0.0 ? stamp - last_stamp_ : 0.1;
@@ -1975,6 +2001,7 @@ private:
         auto noteReject = [&](size_t ti, size_t di, const char* why) {
             if (debug_lifecycle_) reject_reason[{ti, di}] = why;
         };
+        tickMark(1);
         std::vector<Cand> candidates;
         for (size_t ti = 0; ti < nt; ++ti) {
             Track& tr = tracks_.at(track_ids[ti]);
@@ -2273,6 +2300,7 @@ private:
             // right in front of it, within the camera's depth coverage, was ALREADY correctly matched through the
             // normal depth-leaf route. Found by the SAME projection this fallback itself uses, so a depth-classified
             // detection's own box is excluded by whichever 2D YOLO box IT projects into best, not by position alone.
+            tickMark(2);
             std::set<std::pair<int, size_t>> claimed_by_depth;
             for (size_t di = 0; di < nd; ++di) {
                 const auto& d = msg->detections[di];
@@ -2344,6 +2372,7 @@ private:
         std::vector<char> det_used(nd, 0);
         std::set<int> matched_ids;  // tracks matched THIS tick — v1's own output gate: a track propagated only by
                                     // prediction (no match this tick) is never published, matched or not
+        tickMark(3);
         for (size_t ti = 0; ti < nt; ++ti) {
             Track& tr = tracks_.at(track_ids[ti]);
             const int di = track_to_det[ti];
@@ -2675,6 +2704,7 @@ private:
             while (static_cast<int>(tr.dynamic_hist.size()) > dynamic_sticky_window_) tr.dynamic_hist.pop_front();
         }
 
+        tickMark(4);
         for (size_t di = 0; di < nd; ++di) {
             if (det_used[di]) continue;
             const auto& d = msg->detections[di];
@@ -2798,7 +2828,10 @@ private:
         while (!graves_.empty() && (stamp - graves_.front().stamp > inherit_motion_age_ || stamp < graves_.front().stamp))
             graves_.pop_front();
 
+        tickMark(5);
         publish(msg->header, matched_ids);
+        tickMark(6);
+        tickReport(tracks_.size());
     }
 
     // OUTPUT BOX COMPLETION for person tracks (published box only — association keeps using the observed box).
