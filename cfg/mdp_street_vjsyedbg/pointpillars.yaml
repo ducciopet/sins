@@ -1,0 +1,26 @@
+pointpillars_detector:
+  ros__parameters:
+    # -----------------------------------------------------------------------
+    # 3D object detection — see cfg/indoor/pointpillars.yaml's own comment.
+    # No values differ from indoor yet — outdoor is actually the closer
+    # domain match for a street-scene-pretrained (nuScenes) checkpoint, same
+    # reasoning as cfg/outdoor/semantic_segmentation.yaml's own comment.
+    # -----------------------------------------------------------------------
+    cloud_topic: '/velodyne_points'
+    odom_topic: '/odometry/filtered'
+    cloud_frame_mode: 'static_tf'
+    use_point_features: true
+    detections_topic: 'pointpillars/detections'
+    markers_topic: 'pointpillars/bbox_markers'
+    inference_time_topic: 'pointpillars/inference_time'
+    global_frame: odom
+    base_frame: base_link
+
+    openpcdet_path: /home/ros/thirdparty/OpenPCDet
+    config_path: tools/cfgs/nuscenes_models/cbgs_pp_multihead.yaml
+    checkpoint_path: /home/ros/thirdparty/checkpoints/pointpillar_nuscenes_cbgs_multihead.pth
+
+    score_thresh: 0.3
+    max_voxels: 30000
+    queue_size: 5
+    stats_log_period_sec: 5.0

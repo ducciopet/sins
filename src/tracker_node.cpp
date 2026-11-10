@@ -411,6 +411,7 @@ struct Track {
     int id = 0;
     TrackKF kf;
     vision_msgs::msg::BoundingBox3D::_size_type size;   // latest matched detection's own size (no smoothing)
+    std::deque<std::pair<double, double>> extent_hist;   // (stamp, footprint long side) of the recent matches (track_jitter_extent_memory)
     geometry_msgs::msg::Quaternion orientation;          // latest matched detection's own orientation (unfiltered)
     geometry_msgs::msg::Point last_obs;                  // last matched detection's RAW position (v1's "previous observation" reference)
     double last_obs_stamp = 0.0;                         // [s] stamp of last_obs — see velocityDirectionError()
@@ -805,6 +806,11 @@ public:
         // subtract this allowance = scale * half the TRACK's footprint (the detection may be one fragment of it): ~0.15-0.3 m for
         // a person, ~2 m for a car. Replaces the fixed large-object gates (track_large_object_*) with one scale-free rule.
         jitter_fp_scale_ = declare_parameter<double>("track_jitter_footprint_scale", -1.0);
+        // track_jitter_extent_memory [s] (<= 0 = off): the footprint in the allowance above is the LARGEST one the track
+        // showed in this window, not the latest detection's. A car seen in pieces (1.3 m boxes of a 3.9 m car on the
+        // street) gave a fragment-sized allowance (~0.65 m) instead of the ~2 m the rule is meant for, and its track
+        // broke and respawned ~8 times per passage (velocity-direction / implied-speed gates).
+        jitter_extent_memory_ = declare_parameter<double>("track_jitter_extent_memory", -1.0);
         // FRAGMENT MERGE (track_fragment_merge_margin [m], < 0 = off). A moving object can reach the tracker in several
         // clusters (a car split by its glass windows or by a parked car in front: 33% of the car frames on the Marina
         // di Pisa street bag, half of them with gaps > 2x the DBSCAN eps), and the track then follows whichever piece
@@ -2095,7 +2101,7 @@ private:
                 const double predDist = std::hypot(c.x - predicted_pos[ti].x(), c.y - predicted_pos[ti].y());
                 // partial-view jitter allowance (track_jitter_footprint_scale): see the parameter's own comment
                 const double jitter = jitter_fp_scale_ > 0.0
-                    ? jitter_fp_scale_ * 0.5 * std::max(tr.size.x, tr.size.y) : 0.0;
+                    ? jitter_fp_scale_ * 0.5 * trackExtent(tr) : 0.0;
                 if (predDist >= gate_dist + jitter) { noteReject(ti, di, "dist"); continue; }
                 // second observation of a track without a velocity estimate (track_two_point_init): only the physical
                 // per-scan displacement bound, scaled by the scans elapsed since the first observation
@@ -2496,6 +2502,7 @@ private:
                 tr.kf.update(Eigen::Vector3d(d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.center.position.z), r_pos_);
             }
             tr.size = d.bbox.size;
+            noteExtent(tr, stamp);
             {
                 const double top = d.bbox.center.position.z + 0.5 * d.bbox.size.z;
                 tr.top_z = tr.top_samples == 0 ? top : (1.0 - height_ema_alpha_) * tr.top_z + height_ema_alpha_ * top;
@@ -2807,6 +2814,7 @@ private:
             }
             tr.kf.init(Eigen::Vector3d(d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.center.position.z), p_init_);
             tr.size = d.bbox.size;
+            noteExtent(tr, stamp);
             {
                 const double top = d.bbox.center.position.z + 0.5 * d.bbox.size.z;
                 tr.top_z = tr.top_samples == 0 ? top : (1.0 - height_ema_alpha_) * tr.top_z + height_ema_alpha_ * top;
@@ -3247,6 +3255,22 @@ private:
     bool two_point_init_{false};
     double motion_min_net_fp_{-1.0}, motion_min_net_floor_{0.3};
     double jitter_fp_scale_{-1.0};
+    double jitter_extent_memory_{-1.0};
+    // footprint long side used by the jitter allowance: the latest, or the largest within track_jitter_extent_memory
+    double trackExtent(const Track& tr) const {
+        double e = std::max(tr.size.x, tr.size.y);
+        if (jitter_extent_memory_ > 0.0)
+            for (const auto& h : tr.extent_hist)
+                if (last_stamp_ - h.first <= jitter_extent_memory_) e = std::max(e, h.second);
+        return e;
+    }
+    void noteExtent(Track& tr, double stamp) const {
+        if (jitter_extent_memory_ <= 0.0) return;
+        tr.extent_hist.emplace_back(stamp, std::max(tr.size.x, tr.size.y));
+        while (!tr.extent_hist.empty() && (stamp - tr.extent_hist.front().first > jitter_extent_memory_ ||
+                                           tr.extent_hist.front().first > stamp + 1.0))
+            tr.extent_hist.pop_front();
+    }
     double fragment_merge_margin_{-1.0};
     double motion_cons_window_{-1.0}, motion_cons_ratio_{0.5};
     double inherit_motion_dist_{-1.0}, inherit_motion_age_{1.0};
