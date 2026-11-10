@@ -1482,7 +1482,7 @@ private:
             const double newest = stampSec(cam.native_ring.back()->header.stamp);
             // depth_trigger_early: the newest frame is before the scan but within half a camera period of it, so the
             // next frame (one period later) cannot be nearer: process now instead of waiting a whole period for it
-            const double half_period = depth_trigger_early_ ? 0.5 * medianPeriod(cam.native_ring) : 0.0;
+            const double half_period = depth_trigger_early_ ? 0.5 * minPeriod(cam.native_ring) : 0.0;
             if (newest >= target || (half_period > 0.0 && target - newest <= half_period)) {
                 sensor_msgs::msg::PointCloud2::ConstSharedPtr best = cam.native_ring.front();
                 double best_dt = std::abs(stampSec(best->header.stamp) - target);
@@ -1840,9 +1840,9 @@ private:
     // stamp (one stamped at/after the frame has arrived, and its mask too with the mask method). YOLO silent for more
     // than 1 s, or more than 4 frames waiting: build them with what there is (no detection within the tolerance =
     // empty leaves, so the consumers still see the camera alive).
-    // median stamp gap of a message ring (0 when fewer than 3 messages)
+    // shortest recent stamp gap of a message ring (0 when fewer than 3 messages)
     template <typename Ring>
-    static double medianPeriod(const Ring& ring) {
+    static double minPeriod(const Ring& ring) {
         if (ring.size() < 3) return 0.0;
         std::vector<double> d;
         for (size_t i = 1; i < ring.size(); ++i) {
@@ -1850,8 +1850,9 @@ private:
             if (g > 0.0) d.push_back(g);
         }
         if (d.empty()) return 0.0;
-        std::nth_element(d.begin(), d.begin() + d.size() / 2, d.end());
-        return d[d.size() / 2];
+        return *std::min_element(d.begin(), d.end());   // the SHORTEST recent gap: a throttled stream is irregular
+                                                         // (street: 100 ms on average, 33-133 ms gaps), and the next
+                                                         // frame may come after the shortest gap, not the typical one
     }
 
     void resolvePendingLeaves(CameraStream& cam) {
@@ -1863,7 +1864,7 @@ private:
             for (const auto& m : cam.yolo_mask_ring) newest_mask = std::max(newest_mask, stampSec(m->header.stamp));
             // decidable: a detection at/after the frame arrived, or the newest one is within half a YOLO period
             // before it (the next detection, at least one period later, cannot be nearer)
-            const double half_period = 0.5 * medianPeriod(cam.yolo_ring);
+            const double half_period = 0.5 * minPeriod(cam.yolo_ring);
             const bool det_ok = newest_det >= t - 1e-4 || (half_period > 0.0 && t - newest_det <= half_period);
             const bool mask_ok = yolo_leaf_method_ != "mask" || newest_mask >= newest_det - 1e-4;   // the newest detection's mask is here too
             const bool yolo_dead = newest_det < t - 1.0 && stampSec(cam.pending_leaf_frames.back().stamp) - t >= 0.0;
