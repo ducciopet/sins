@@ -407,7 +407,9 @@ def _launch_setup(context, *args, **kwargs):
             parameters=[
                 ParameterFile(os.path.join(pkg_dir, 'cfg', env_str, 'tracker.yaml'), allow_substs=True),
                 {'use_sim_time': use_sim_time, 'camera_names': camera_names,
-                 'track_debug_lifecycle': LaunchConfiguration('tracker_debug_lifecycle').perform(context) == 'true',
+                 # only when the launch arg turns it on: a constant false here silently overrode the profile's own
+                 # track_debug_lifecycle (cfg/<env>/tracker.yaml)
+                 **({'track_debug_lifecycle': True} if LaunchConfiguration('tracker_debug_lifecycle').perform(context) == 'true' else {}),
                  # mask leaves: the LiDAR-only fallback reads the same (instance-segmentation) detections as the leaves
                  **({'yolo2d_topic_template': '/' + str(detection_yaml_params.get('detected_detections_topic_template', '')).lstrip('/')}
                     if (yolo_leaf_method == 'mask' and detection_yaml_params.get('detected_detections_topic_template')

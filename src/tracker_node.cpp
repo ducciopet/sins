@@ -2791,17 +2791,18 @@ private:
                 std::string near;
                 for (size_t ti = 0; ti < nt; ++ti) {
                     const double dist = std::hypot(predicted_pos[ti].x() - c.x, predicted_pos[ti].y() - c.y);
-                    if (dist > 1.5) continue;
+                    if (dist > 4.0) continue;   // vehicles: a fragment centroid can jump 2-3 m
                     const Track& o = tracks_.at(track_ids[ti]);
                     const auto r = reject_reason.find({ti, di});
                     const bool matched_other = track_to_det[ti] >= 0;
-                    near += " | #" + std::to_string(o.id) + " d=" + std::to_string(dist).substr(0, 4) +
+                    near += " | #" + std::to_string(o.id) + " hits=" + std::to_string(o.hits) + " conf=" + std::to_string(o.confirmed ? 1 : 0) +
+                            " spd=" + std::to_string(planarSpeed(o.kf.vel())).substr(0, 4) + " d=" + std::to_string(dist).substr(0, 4) +
                             " cls='" + o.best_class + "' size=" + std::to_string(o.size.x).substr(0, 4) + "x" +
                             std::to_string(o.size.y).substr(0, 4) + " base=" + std::to_string(o.yolo_x_width).substr(0, 4) +
                             "x" + std::to_string(o.yolo_y_width).substr(0, 4) + " why=" +
                             (r != reject_reason.end() ? r->second : (matched_other ? "matched_other" : "candidate_unassigned"));
                 }
-                RCLCPP_INFO(get_logger(), "[lifecycle] spawn #%d det_class='%s' size=%.2fx%.2f at (%.2f,%.2f)%s", tr.id,
+                RCLCPP_INFO(get_logger(), "[lifecycle] spawn #%d t=%.3f det_class='%s' size=%.2fx%.2f at (%.2f,%.2f)%s", tr.id, stamp,
                             detectionClass(d).c_str(), d.bbox.size.x, d.bbox.size.y, c.x, c.y, near.c_str());
             }
             tr.kf.init(Eigen::Vector3d(d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.center.position.z), p_init_);

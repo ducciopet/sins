@@ -1,0 +1,279 @@
+tracker_node:
+  ros__parameters:
+    track_debug_lifecycle: true  # mdp_street_vjsydbg (not in base)
+    yolo2d_time_compensation: true  # mdp_street_vjsy (not in base)
+    track_jitter_footprint_scale: 1.0  # mdp_street_vj (not in base)
+    track_point_shift_veto: true  # mdp_street_v (not in base)
+    track_point_shift_min_frac: 0.5  # mdp_street_v (not in base)
+    global_frame: odom
+
+    # Association gates (reject before scoring) — same names/values as jo_detector's own
+    # max_match_range / max_match_speed / max_relative_size_diff_match.
+    track_max_match_dist: 2.0        # [m] max distance between a detection and a track's KALMAN-PREDICTED position
+    track_max_match_speed: 8.0       # [m/s] max implied speed (pred distance / dt) to accept a match
+    track_max_size_diff: 0.8         # max relative size difference (see relSizeDiff) to accept a match
+    track_min_size_diff_floor: 0.15  # [m] absolute floor for relSizeDiff's denominator — a purely relative diff punishes small objects far more than large ones for the same absolute jitter (unsmoothed per-tick box size), spuriously rejecting the true match and risking a fallback to a nearby wrong candidate. No v1 equivalent (v1's objects were rarely this small).
+
+    # Association score weights — same names/values as jo_detector's own match_*_score_weight.
+    track_match_pos_weight: 1.0        # distance to the Kalman-predicted position
+    track_match_size_weight: 0.35      # relative size difference
+    track_match_iou_weight: 0.15       # 2D IoU (axis-aligned footprint) vs the predicted position
+    track_match_prev_pos_weight: 0.25  # distance to the track's own PREVIOUS raw observation
+    track_match_prev_iou_weight: 0.10  # 2D IoU vs the previous raw observation
+    track_match_height_weight: 0.5     # score penalty per metre between the candidate box TOP and the track's smoothed top (footprint alone cannot tell a person from a table)
+    track_max_top_diff: 1.0            # [m] hard reject beyond this top-height difference
+    track_height_min_samples: 5        # matched ticks before the track's top is trusted
+    track_height_ema_alpha: 0.3        # smoothing of the track's top height
+    track_min_match_score: -2.5        # candidates scoring below this are dropped before the global assignment
+    track_assignment_method: hungarian # global assignment: hungarian (max total score) | greedy_kuhn (v1 heuristic, max pair count; ablation)
+
+    # ID-swap guard (v1's own match_yolo_class_consistency_weight/yolo_track_assoc_bonus): a candidate pairing a
+    # detection classified as X against a track already carrying a DIFFERENT class is a HARD reject in the
+    # association loop (not controlled by this weight — see tracker_node.cpp), agreement gets this bonus so the
+    # correct pairing wins the global assignment over an unclassified competitor at similar distance.
+    track_class_match_bonus: 0.25      # v1: yolo_track_assoc_bonus
+
+    # Far more common than an outright class conflict: exactly ONE side of a pairing carries semantic evidence
+    # this tick (YOLO only refines a fraction of ticks) — track_class_match_bonus is neutral on that, so it
+    # can't protect it either direction: (a) an already-classified track's TRUE match is itself unclassified
+    # this tick, or (b) the mirror — a freshly classified DETECTION gets absorbed into a nearby long-lived
+    # UNCLASSIFIED track (this is how a generic object "inherits" a semantic label that was never its own).
+    # This adds extra weight on the TRACK's own last raw observation for any such cross-class pairing — a
+    # nearby object must be considerably closer to where THIS track really was (not just to the noisy Kalman
+    # prediction) to win the assignment. Soft/graded, not a hard cutoff, so genuinely fast motion still
+    # degrades gracefully.
+    track_class_continuity_weight: 0.5
+    track_camera_fragment_dist: 0.6    # [m] drop a camera-only candidate when the same track has a LiDAR-backed one this close (fusion split, YOLO-mask depth on the background); 0 disables
+    track_class_ownership: true        # a detection carrying a class is kept from any unclassified track that scores it lower than the best track of that class
+    # FOV-gated: only applied when the TRACK's predicted position is inside a camera's FOV — outside it, YOLO
+    # could not have confirmed anything anyway, so absence of fresh evidence there isn't suspicious (v1: this
+    # is exactly when match_yolo_class_consistency_weight applies too, see tracker_node.cpp).
+
+    # Velocity-direction gate + soft penalty (v1: computeVelocityDirectionError/passesVelocityDirectionGate) — a
+    # candidate whose IMPLIED motion (track's last raw observation -> this candidate) points in a very different
+    # direction/magnitude than the KF's own PREDICTED velocity is suspicious, independent of position/size/IoU/
+    # class. Collapsed from v1's five threshold tiers to three: strict before confirmation, looser once
+    # confirmed, and a single further-relaxed tier whenever EITHER side is semantically classified (a YOLO-
+    # confirmed object can legitimately turn more abruptly) OR the track is outside every camera's FOV (noisier
+    # LiDAR-only tracking there, harder to tell a real sharp turn from noise).
+    track_match_veldir_weight: 0.12            # v1: matchVelocityDirectionScoreWeight_
+    track_max_veldir_error_unconfirmed: 1.20   # v1: maxVelocityDirectionErrorConfirm_
+    track_max_veldir_error_confirmed: 2.50     # v1: maxVelocityDirectionErrorTracked_
+    track_max_veldir_error_relaxed: 3.00       # v1: the "Dynamic"/outside-FOV tiers, collapsed into one
+    track_veldir_gate_min_innovation: 0.30     # [m] no hard veldir rejection this close to the KF prediction (box-centroid jitter, not motion)
+
+    # LiDAR-only-outside-FOV relaxation (v1: isLidarOnlyOutsideFovAssociation) — when BOTH the predicted and
+    # current position are outside every camera's FOV AND neither side is classified (pure LiDAR, nothing to
+    # corroborate against, DBSCAN's centroid noisier there): WIDER position/size tolerance, but NARROWER speed
+    # tolerance (a large implied speed there is more likely a bad match than real fast motion), plus a
+    # stability bonus so ordinary centroid jitter doesn't cost a legitimate track its identity. v1's own numbers
+    # are relative to its own (fixed-dt, much smaller) base gates; these keep v1's RATIOS (~2.4x wider distance,
+    # ~0.5x narrower speed, ~1.4x wider size) applied to this file's own already-recalibrated base gates above.
+    track_outside_fov_max_match_dist: 3.5      # [m] v1 ratio: ~2.4x track_max_match_dist
+    track_outside_fov_max_match_speed: 4.0     # [m/s] v1 ratio: ~0.5x track_max_match_speed (TIGHTER, not looser)
+    track_outside_fov_max_size_diff: 1.2       # v1 ratio: ~1.4x track_max_size_diff
+    track_outside_fov_confirmed_bonus: 0.75    # v1: outsideFovConfirmedAssocBonus_ (same value — pure score-space, scale-independent)
+    track_outside_fov_tentative_bonus: 0.35    # v1: outsideFovTentativeAssocBonus_
+
+    # Natural-motion gate (v1: isNaturalMotion) — only for a track not yet confirmed AND not classified either
+    # side (no identity evidence of its own yet): the implied move must clear a minimum (inside FOV only) and
+    # never exceed an outright-implausible maximum, and the KF's own prediction innovation must stay within an
+    # adaptive bound. v1's own per-tick-distance values at a comparable tick rate, kept as-is (not a ratio).
+    track_min_natural_motion_dist: 0.08              # [m] v1: minNaturalMotionDist_
+    track_max_natural_motion_dist: 1.50              # [m] v1: maxNaturalMotionDist_
+    track_max_natural_innovation: 0.60               # [m] v1: maxNaturalInnovation_ (inside FOV)
+    track_max_natural_innovation_outside_fov: 1.00   # [m] v1: maxNaturalInnovationOutsideFov_
+
+    # Generic confirmed-track stability bonus (v1: confirmedTrackAssocBonus_) — independent of class/FOV, on
+    # top of the outside-FOV-specific bonus above.
+    track_confirmed_bonus: 0.20
+
+    # Duplicate-track suppression (v1: isCloseToExistingTrack, found during the broader v1 review): before
+    # spawning a new track for an unmatched detection, check it isn't a second, fragmented candidate for an
+    # object that already has a track (only one such candidate can win the global one-to-one assignment).
+    # v1 ships duplicate_size_rel_thresh=0, which makes that leg of the check permanently false — a working
+    # value is used here instead (see tracker_node.cpp's own comment).
+    track_duplicate_dist_thresh: 0.5   # [m] v1: duplicateTrackDistThresh_
+    track_duplicate_iou_thresh: 0.3    # v1: duplicateTrackIou2DThresh_
+    track_duplicate_size_thresh: 0.5   # v1 ships 0 (effectively disabled) — see tracker_node.cpp's own comment
+
+    # Lifecycle — same names/values as jo_detector's own min_confirm_hits / max_missed_frames. Confirmation
+    # is now MOTION-GATED for a non-classified track (v1: shouldConfirmTrack, a deliberate behavior change —
+    # see the file header's own LIFECYCLE section): hits alone are no longer enough unless the track shows
+    # actual observed motion, or is classified (which still confirms immediately).
+    track_min_hits: 4                # matches (not necessarily consecutive) needed before a track is CONFIRMED and published; stays confirmed once reached
+    track_max_missed: 7              # consecutive missed ticks before a track is dropped — raised from v1's own 5 to survive a brief total occlusion (no detection at all for a few ticks) without losing the track id; doesn't loosen any matching gate, just patience, so low false-positive risk
+    # Classified (whitelisted) tracks coast longer before dying — v1: maxMissedFramesYolo_ vs maxMissedFrames_,
+    # a 3x ratio there, applied here to THIS file's own track_max_missed above (21 = 7*3): a known dynamic-class
+    # object (isDynamicClass(), same whitelist used everywhere else) that briefly leaves the FOV or gets
+    # occluded deserves more patience than generic unclassified clutter. Still purely internal coasting — see
+    # tracker_node.cpp's own header: a coasting (unmatched-this-tick) track is never published/visible in RViz
+    # regardless, matched or not.
+    track_max_missed_classified: 21
+    track_min_confirm_obs_speed: -1.0  # [m/s] < 0 = reuse track_stationary_speed_thresh below (v1: stationarySpeedThresh_)
+
+    # TWO separate speed bars, matching v1's own two separate params (collapsing them into one earlier let a lot
+    # of ordinary position jitter cross straight into "dynamic" — this is the main fix for that). Both are
+    # horizontal-only (vz excluded — see planarSpeed's own comment, z is dominated by sensor shadow-cone noise).
+    track_dynamic_speed_thresh: 0.25     # [m/s] the DYNAMIC label bar — lowered from v1's own 0.35 so a slower-moving object still earns the label (v1: dynamic_velocity_threshold)
+    track_dynamic_confirm_ticks: 3       # consecutive ticks >= the bar above before the label actually flips to "dynamic" (debounce against single-tick noise; v1 PATH 3c anti-flicker check)
+    track_dynamic_confirm_ticks_unclassified: 8  # same, for a track with no semantic evidence of a dynamic class INSIDE a camera FOV
+    track_dynamic_confirm_ticks_unclassified_out_fov: 5  # same, unclassified and OUTSIDE every camera FOV (nothing can classify it there)
+    track_motion_pd_min_dynamic_ticks: 20  # an unclassified track published dynamic this many ticks is potentially_dynamic when it stops (revoked in FOV without YOLO, like a class); 0 disables
+    track_stationary_speed_thresh: 0.07  # [m/s] the much lower "not moving at all" bar — below this AND unclassified, a track is suppressed/aged toward death — lowered from v1's own 0.10, same ratio to the bar above (v1: stationarySpeedThresh_)
+
+    # WNC rules (outdoor default since 09/11/2026; profile frozen on CODa tuning seqs 0/10/16 + Marina di Pisa street,
+    # checked on held-out CODa 11/12: MOTA moving 41.8 -> 43.5 and 19.8 -> 19.6). Same rule for every object type.
+    # The pre-WNC outdoor reference is kept as profiles coda_k0 / mdp_street_k0 (these keys back to their defaults).
+    track_two_point_init: true             # W1: 2nd observation gated only by a physical bound (1.5 m/scan), KF velocity initialised from the two points
+    track_size_gate_travel_window: 3.0     # [s] W2: a large size change splits a track only if it did not travel...
+    track_size_gate_body_lengths: 1.0      # ...this many of its own body lengths in that window
+    track_motion_min_net_footprints: 0.5   # N: motion counts only once the centre has left its birth spot by this many footprints...
+    track_motion_min_net_floor: 0.3        # [m] ...and at least this far
+    track_motion_consistency_window: 1.0   # [s] C: net displacement over this window must be at least...
+    track_motion_consistency_ratio: 0.5    # ...this fraction of what the KF speed predicts
+
+    # Classification robustness (v1's classificationCB PATHs 1-3, see tracker_node.cpp's own header) — three
+    # pieces beyond the plain debounce above:
+    # (1) KF-velocity confidence (v1 PATH 3a): a track's recent speed samples with a mean above the dynamic bar
+    #     AND a small std relative to that mean count as dynamic-ticks evidence too, not just this tick's own
+    #     instantaneous speed — a single noisy dip doesn't reset the streak.
+    track_dynamic_kf_confidence_window: 5   # ticks of speed history kept for the mean/std check
+    track_dynamic_kf_std_ratio: 0.50        # max std/mean ratio to count as "confident" — v1: dynaKfVelStdRatio_
+    # (2) Sticky dynamic / historical continuity (v1 PATH 2): once enough of a track's recent history was
+    #     dynamic, re-confirm on continued motion evidence without re-running the full fresh debounce.
+    track_dynamic_sticky_frames: 20   # v1: forceDynaFrames_ — min dynamic ticks within the window below to re-confirm immediately
+    track_dynamic_sticky_window: 30   # v1: forceDynaCheckRange_ — ticks of dynamic/static history kept
+    # (3) Size-sanity gate (v1: constrainSize_/targetObjectSize_, OFF by default in v1, ON here — this
+    #     session's whole arc has been about false "dynamic" positives). Scoped to UNCLASSIFIED tracks only — a
+    #     track YOLO has already identified doesn't need a generic size heuristic second-guessing it.
+    track_dynamic_constrain_size: true
+    track_dynamic_target_size_x: 0.5    # [m] default target: a standing person (v1's own example)
+    track_dynamic_target_size_y: 0.5
+    track_dynamic_target_size_z: 1.7
+    track_dynamic_size_tolerance_x: 0.8  # [m] v1's own literal tolerance
+    track_dynamic_size_tolerance_y: 0.8
+    track_dynamic_size_tolerance_z: 1.0
+
+    # Point-cloud motion voting (v1 PATH 3b, see tracker_node.cpp's own header) — per-point nearest-neighbor
+    # voting between this track's own points now and from the last matched tick, corroborating the KF estimate
+    # for an UNCLASSIFIED track (see the PATH 1/3 split above). Needs dbscan_detector_node's fused/clusters
+    # cloud (det_idx field) — subscribing here is what turns its publishing on (it's otherwise lazy).
+    fused_clusters_topic: /sins/dbscan_detector/fused/clusters
+    track_point_vote_thresh: 0.7        # min vote ratio to count as corroborating evidence — v1: dynaVoteThresh_
+    track_point_vote_max_points: 500    # safety cap: brute-force nearest-neighbor is O(n*m); v1 never capped this (its own clusters were smaller)
+    point_vote_max_age: 0.5             # [s] ignore a stale clusters cloud
+
+    # Disocclusion-artifact suppression (not from v1 — see tracker_node.cpp's own header): when a track moves
+    # away from a spot, whatever was behind it along the LiDAR's line of sight becomes newly visible and can
+    # read as an apparent jump/velocity for something that is actually static. lidar_frame is the sensor origin
+    # for the ray-alignment test.
+    lidar_frame: velodyne
+    track_disocclusion_pos_hist_window: 10     # ticks of each track's own recent position history kept
+    track_disocclusion_min_cos_angle: 0.97     # ~14 degrees — how tightly aligned with the same LiDAR ray counts
+    track_disocclusion_min_range_margin: 0.3   # [m] how much farther than the other track's own recent position counts as "behind" it
+
+    # This detector's job is finding dynamic/potentially-dynamic objects: a track that settles for good must stop
+    # being published and eventually die, not linger forever (v1's own trigger, but v1 never deletes — see the
+    # file header's own "STATIC TRACKS MUST DIE" section). A track is exempt from suppression once it has ANY
+    # semantic evidence of a potentially-dynamic class (a YOLO leaf ever refined it — a person standing still is
+    # still a person).
+    track_publish_stationary: false   # true = publish static/unclassified tracks too (v1's trackSteadyObjects_) — disables suppression AND death entirely
+    track_stationary_max_ticks: 50    # consecutive suppressed ticks (below track_stationary_speed_thresh AND no class evidence) before the track is actually deleted (~5s at the 10Hz LiDAR tick)
+
+    # First-classification debounce (no v1 equivalent — see tracker_node.cpp's own voteClass() comment): how many
+    # CONSECUTIVE ticks the SAME class must be voted before a NEVER-before-classified track accepts it as
+    # best_class at all. 1 = old immediate behavior. Guards against a single contaminated tick (e.g. a person
+    # briefly merged with nearby static clutter by dbscan_detector_node's own nested-cluster logic) painting a
+    # long-lived static object green after the person has already moved on.
+    track_first_class_confirm_ticks: 2
+    # Established-track motion corroboration on top of the debounce above (no v1 equivalent): empirically, the
+    # plain debounce alone was NOT enough, and neither was a first attempt that gated each INDIVIDUAL tick's raw
+    # jump — a long-lived static track (hundreds of matched ticks) was observed repeatedly winning a fresh class
+    # across several consecutive ticks, each one individually clearing a per-tick jump threshold, while the NET
+    # displacement across the whole window stayed under 30cm over 5 real SECONDS (ordinary centroid jitter, not
+    # a walking person — confirmed on a live bag). Fixed by checking NET displacement over the whole debounce
+    # window instead: a track with at least track_first_class_established_hits matched ticks (still
+    # unclassified) uses the LONGER track_first_class_established_confirm_ticks window (not the plain one
+    # above), and by the time that many ticks pass, the NET position change since the streak began must clear
+    # track_first_class_min_jump — if it hasn't, the window just restarts from here instead of accepting.
+    track_first_class_established_hits: 10            # matched ticks before a still-unclassified track counts as "established"
+    track_first_class_established_confirm_ticks: 2    # debounce window (ticks) for an established track — same as the plain one above now, but still with its own NET displacement requirement on top (track_first_class_min_jump). Lowered from 5, then 3: the actual root cause this mechanism was compensating for (preprocessing_node's depth-leaf extraction occasionally bleeding into a nearby static object, see its own yolo_leaf_valley_fraction/yolo_leaf_depth_tolerance comments) is fixed upstream, so this secondary safety net no longer needs to be as conservative — the displacement check, not the tick count, is what actually guards against jitter-vs-real-motion now
+    track_first_class_min_jump: 0.08                  # [m] NET raw-observation displacement required across that whole window — reuses track_min_natural_motion_dist's own bar
+    track_first_class_static_confirm_ticks: 5         # ...waived when depth-corroborated (depth-leaf-direct) evidence repeats on this many consecutive votes: a person already standing there when first seen becomes potentially_dynamic without having to walk
+    track_first_class_weak_keeps_streak: false        # true = a weak (pixel-fallback) vote of the SAME class does not restart that streak (tried on CODa: no clear gain, more false PD)
+
+    # Kalman filter (state per axis x,y,z: position, velocity, acceleration; only position observed) — v1's own
+    # REAL defaults (found in dynamicDetector.cpp's parameter loading, not its sample yaml, which never overrides
+    # them): this file's own earlier defaults (0.5/1.0 process noise, guessed without checking those) left the
+    # filter far more reactive to ordinary per-tick centroid jitter than v1's, a second source of false
+    # "dynamic" tracks on top of the collapsed thresholds above. Q/R are NOT scaled by dt, matching v1.
+    track_kf_pos_process_var: 0.05   # [m^2] position process noise                          (v1: eQPos_v2_)
+    track_kf_vel_process_var: 0.15   # [(m/s)^2] velocity process noise                      (v1: eQVel_v2_)
+    track_kf_acc_process_var: 0.10   # [(m/s^2)^2] acceleration process noise                (v1: eQAcc_v2_)
+    track_kf_pos_meas_var: 0.02      # [m^2] measurement noise on the fused box's position   (v1: eRPos_v2_)
+    track_kf_pos_init_var: 0.25      # [m^2] initial uncertainty for a brand new track       (v1: eP_v2_)
+
+    marker_lifetime_sec: 0.0         # 0 = box/arrow/label markers stay in rviz until replaced (a paused/stopped bag keeps them on screen)
+
+    # SEMANTIC DECAY (v1's own isInCameraFOV + the two YOLO-decay streak limits, dynamicDetector.cpp — see
+    # tracker_node.cpp's own header): a classified track must keep EARNING its label, not just keep it from a
+    # single old vote. Camera list/topic/frame follow dbscan_detector_node's own camera_names + {camera} template
+    # convention. insideAnyCameraFov is PIXEL-frustum only, no depth-range gate (see its own code comment) — a
+    # classified track must be reconfirmable (depth-leaf OR the raw-2D fallback below) all the way out to
+    # wherever YOLO can still see it on the color image, not just within the depth camera's own shorter range.
+    camera_names: ["front_camera"]  # mdp_street (base: [front_camera, back_camera])
+    camera_info_topic_template: /{camera}/camera/color/camera_info
+    camera_frame_template: "{camera}_refined"
+    # (1) Inside any camera's FOV: a classified track with NO fresh YOLO evidence for this many CONSECUTIVE
+    # matched ticks has its class cleared outright (vote history too) — it cannot keep "being semantic" on old
+    # evidence alone while plainly visible and YOLO keeps not confirming it.
+    track_max_non_yolo_in_fov_frames: 3   # in camera FOV, clear the class after this many consecutive matched ticks with no fresh YOLO evidence (was 9: kept the class through brief in-FOV occlusions, but also kept it on non-persons) — v1: max_non_yolo_in_fov_frames
+    track_decay_fov_border_frac: 0.10     # ...counting only ticks with the track centre at least this fraction of the image away from its border (partial views at the edge are routinely missed by YOLO)
+    track_max_non_yolo_fov_border_frames: 15  # ...but in that border band the class still clears after this many unconfirmed ticks (a person crosses it in < 1 s; clutter sitting there must not keep a class)
+    track_class_handover_dist: 0.5          # [m] class handover: a track born this close to a classified track's prediction, from a detection that track passed over...
+    track_class_handover_window: 3.0        # [s] ...inherits the class if the classified track gives it up (identity swap) or dies within this time
+    track_class_anchor_ttl: 5.0             # [s] class memory of still objects (0 = off): a still track inherits the class repeatedly seen at its spot by YOLO until this long without a new sighting — far parked objects get a YOLO vote only every ~2 s and their tracks fragment; 5 s = the life of an unclassified still track (track_stationary_max_ticks)
+    track_class_anchor_min_votes: 2         # strong (depth-leaf) votes at the spot before it passes the class on (3 tried on CODa: fewer parked bikes found, no fewer false PD on bollards)
+    track_class_anchor_radius: 0.6          # [m] same spot
+    track_class_min_height_classes: [car, truck, bus, bicycle]   # LiDAR-only fallback: a class only for an object at least this tall (as dbscan yolo_class_min_height_*)
+    track_class_min_height_values: [1.1, 1.1, 1.5, 0.6]     # [m]
+    track_classified_corroboration_min_size: 2.0  # [m] a CLASSIFIED track this long (vehicles, not people or bikes) also needs KF-confidence or point-vote corroboration to be dynamic: its partly seen cluster centre slides with the viewpoint (0 = never)
+    track_classified_corroboration_all: true      # every classified track needs that corroboration to be dynamic (CODa: 4% of the still-object moments were labelled D, bikes at 12-15 m whose partial cluster centre slides with the viewpoint)
+    track_lidar_fallback: true                    # LiDAR-only pixel fallback (3D box projected onto the 2D YOLO boxes). Candidate to switch off with single_yolo masks: the many small bike boxes of the segmentation model give its class to bollards (NOT yet tested)
+    track_person_box_completion: true       # published box of a "person" track: stood on the floor, at least track_person_min_height tall, centre pushed along the LiDAR ray (sensors only see the near surface; the VLP-16 cone cuts legs and head up close)
+    floor_frame: base_footprint            # its z in global_frame is the floor height used above
+    track_person_min_height: 1.7            # [m] adult prior (conservative for navigation)
+    track_person_ray_offset: 0.07           # [m] mean visible-surface bias measured vs motion capture on the lab bags (7-12 cm far, ~1 cm at 1-1.5 m)
+    # (2) Outside every camera's FOV, no 2D re-confirmation is possible at all: watch the box size against the
+    # largest size ever seen WITH real YOLO evidence (a high-water mark, never shrunk) and flag GROWTH past it
+    # as an ID swap onto a bigger object (wall, vehicle, noisy merged cluster) — modest shrinkage alone is a
+    # normal LiDAR-only-outside-FOV artifact (sparsity/self-occlusion), not flagged by this one.
+    track_yolo_base_mismatch_thresh: 0.50   # relative growth (vs. the high-water mark) that counts as suspicious — v1: yolo_base_mismatch_thresh
+    # Shrink-side trigger, no v1 equivalent — removed once (a live-bag diagnostic traced it clearing "person"
+    # off a track that was still the same real person, just momentarily smaller) then re-added gated on the
+    # YOLO 2D track id instead of running unconditionally: a shrink is only trusted as a real ID swap when
+    # YOLO's own 2D tracker ALSO disagrees (a different/absent track id this tick vs. the one the baseline was
+    # built on) — see tracker_node.cpp's decaySemanticEvidence() for the full account.
+    track_yolo_base_shrink_thresh: 0.60      # relative shrink (vs. the high-water mark) that counts as suspicious, when the YOLO 2D track id isn't a known match
+    track_max_yolo_base_mismatch_frames: 5  # consecutive suspicious (growth or id-mismatched shrink) ticks before the class is cleared — v1: max_yolo_base_mismatch_frames
+
+    # Dynamic-class whitelist (v1: yolo_dynamic_classes — see tracker_node.cpp's own semantic_dynamic_classes_
+    # comment). Any class YOLO reports is still voted on/displayed (tracker_node.cpp's voteClass()), but only a
+    # class in this list counts as "potentially-dynamic" semantic EVIDENCE — i.e. grants the potentially_dynamic
+    # label, the static-track-death exemption, and the classified-track fast paths for confirmation/dynamic-label
+    # debounce. A correctly-recognized but definitely-static object (e.g. "chair", "tv") behaves exactly as if
+    # YOLO had never classified it at all for those purposes, same as v1 — it just still shows its class name in
+    # the tracked-box label text.
+    track_semantic_dynamic_classes: [person, car, bus, truck, motorbike, bicycle, dog, cat, horse, cow, sheep]
+
+    # LIDAR-ONLY SEMANTIC FALLBACK (no v1 equivalent — see tracker_node.cpp's own header): a box built from LiDAR
+    # points ONLY (no camera depth at all — e.g. a person beyond the depth camera's own range, which the LiDAR
+    # still sees) can never get a depth leaf for dbscan_detector_node to refine with, no matter how confidently
+    # YOLO sees it on the plain color image. For exactly that case, the box's own OBB (all 8 corners, properly
+    # accounting for orientation — not just its center or a flattened size estimate) is projected straight into
+    # the raw 2D YOLO boxes instead, bypassing the depth-leaf step entirely, resolved GLOBALLY one YOLO box <->
+    # one 3D box at most.
+    yolo2d_topic_template: /yolo_semantic_seg/{camera}/detections   # vision_msgs/Detection2DArray, same topic preprocessing_node's own leaf mechanism reads
+    yolo2d_max_age: 0.5   # [s] ignore a camera's latest 2D detections once this stale (camera stalled, or the detection has moved on)
+    yolo2d_min_iou: 0.2    # min IoU between the box's PROJECTED pixel footprint and a YOLO box to count as a candidate at all — rejects a wrong-size/shape object that merely overlaps by coincidence

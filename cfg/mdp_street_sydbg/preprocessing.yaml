@@ -1,0 +1,166 @@
+preprocessing_node:
+  ros__parameters:
+    depth_trigger_early: true  # mdp_street_sy (not in base)
+    yolo_leaf_aligned_path: true  # mdp_street_sy (not in base)
+    yolo_leaf_sync_tol: 0.07  # mdp_street_sy (not in base)
+    yolo_leaf_sync: true  # mdp_street_sy (not in base)
+    camera_pose_at_stamp: true  # mdp_street_sy (not in base)
+    # -----------------------------------------------------------------------
+    # Topics
+    # -----------------------------------------------------------------------
+    lidar_topic: /velodyne_points
+    odom_topic: /odometry/filtered
+
+    # -----------------------------------------------------------------------
+    # Frames
+    # -----------------------------------------------------------------------
+    lidar_frame: velodyne          # TF frame of the LiDAR
+    base_frame: base_link          # rigid base->lidar TF is looked up once and cached
+    global_frame: odom             # frame the processed LiDAR cloud is published in
+
+    # calibration_enabled: unset here on purpose — see
+    # cfg/indoor/preprocessing.yaml's own comment on this. Forwarded from
+    # run_detector.launch.py's own enable_calibration arg (default false).
+
+    # -----------------------------------------------------------------------
+    # Cameras — an arbitrary list, not just one. Each name below gets its
+    # own parameter sub-tree (<name>.depth_topic, <name>.aligned_depth_topic,
+    # <name>.refined_camera_frame, ...); any key left unset for a camera
+    # falls back to preprocessing_node.cpp's own default, which is already
+    # built from that camera's name (e.g. /<name>/camera/depth/image_rect_raw,
+    # <name>_refined) — this robot's front_camera and back_camera both
+    # publish under that exact topic-naming convention, so only the actual
+    # per-bag override (aligned_depth_transport — this bag only has aligned
+    # depth as zstd, not the compressedDepth the live camera would use)
+    # needs setting explicitly for either one. See preprocessing_node.cpp's
+    # file header. static_structures_node (see cfg/outdoor/static_structures.yaml)
+    # must be given this SAME list at launch — see run_detector.launch.py.
+    #
+    # <name>.aligned_depth_cloud_topic (set here, same as indoor — native
+    # cloud is the geometry source, ~22% vs ~78% of a core): if set, skip decoding+deprojecting aligned_depth_topic
+    # entirely and read an already-deprojected PointCloud2 straight from
+    # that topic instead — e.g. RealSense's own "pointcloud" filter output,
+    # "<name>/camera/depth/color/points". Arrives in
+    # <name>_depth_optical_frame, not _color_optical_frame like the
+    # deprojected path — see onNativeDepthCloud()/finishDepthCloud()'s own
+    # comments for how that's accounted for.
+    # -----------------------------------------------------------------------
+    camera_names: ["front_camera"]  # mdp_street (base: ["front_camera", "back_camera"])
+    front_camera: {"aligned_depth_transport": "compressedDepth", "aligned_depth_cloud_topic": ""}  # mdp_street (base: )
+    back_camera:
+      aligned_depth_transport: zstd
+      aligned_depth_cloud_topic: /back_camera/camera/depth/color/points
+
+    depth_scale_factor: 1000.0     # raw_value / scale = meters (1000 for Intel RealSense 16-bit), same for every camera
+    depth_min_value: 0.5           # [m] points closer than this are discarded
+    depth_max_value: 4.5           # [m] points farther than this are discarded
+    depth_skip_pixel: 2            # subsample every N pixels to reduce computation
+
+    # Depth-side counterpart of lidar_processed_voxel_size/downsample_threshold
+    # above — but a different mechanism (density gate + centroid, not
+    # adaptive voxel grid). Same parameter names/values as jo_detector's
+    # dynamicDetector::voxelFilter (voxel_size/voxel_occupied_thresh there,
+    # identical indoor/outdoor there too), but not quite the same rule: a
+    # voxel with fewer than the threshold's worth of points still contributes
+    # nothing, but a qualifying voxel emits the CENTROID of all its points,
+    # not one arbitrary raw one — see occupancyVoxelFilter()'s own comment.
+    depth_processed_voxel_size: 0.05            # [m] voxel size for the density gate
+    depth_processed_voxel_occupied_thresh: 3.0 # points a voxel needs before it contributes one point to the output
+    # Range-dependent occupancy gate: the two keys above are the NEAR band (camera range < depth_processed_split_range);
+    # the native cloud is decimated, so points get sparser with distance and the far band uses a larger voxel
+    # (and usually a lower threshold) so distant voxels can still gather enough points.
+    depth_processed_voxel_size_far: 0.1            # [m] voxel size beyond the split range
+    depth_processed_voxel_occupied_thresh_far: 2.0  # points a far voxel needs
+    depth_processed_split_range: 2.0               # [m] camera-frame distance separating the bands
+
+    # true: native depth clouds are processed only for the frame closest to each LiDAR scan (scan_trigger),
+    # not for every camera frame — the detection tick is the scan, the other frames would never be used.
+    depth_process_on_scan_trigger: true
+    # YOLO 2D detections -> 3D semantic leaves (topic /sins/<camera>/semantic_leaves): the depth points inside each
+    # detection's box, foreground only, with the detection's track id per point. The detections topic per camera is forwarded from
+    # semantic_segmentation.yaml by run_detector.launch.py.
+    #
+    yolo_leaf_method: mask            # read by run_detector.launch.py when its yolo_leaf_method arg is empty: pixel-exact instance masks (cfg/outdoor/detection.yaml): far thin objects, e.g. a parked bike behind a bollard, whose 2D box holds other things
+    # (older note) yolo_leaf_method: unset here on purpose, same reasoning as calibration_enabled above — run_detector.launch.py's
+    # own yolo_leaf_method arg (default "box") forwards it, single source of truth shared with which topics get
+    # wired into yolo_detections_topic/yolo_mask_topic below. "box" = the box-crop + mode/valley extraction this
+    # file's own yolo_leaf_* params below tune; "mask" = yolo_seg_track_node's own per-pixel instance masks
+    # instead — pixel-exact object membership in image space, but STILL goes through the same depth mode/valley
+    # window below (a silhouette edge can have a background point reproject into the mask's own footprint from
+    # depth<->color parallax alone; the mask method only skips the box/inflate heuristics, not the depth one) —
+    # see preprocessing_node.cpp's own depthModeValleyWindow()/yolo_leaf_method_ comments and the launch arg's
+    # own description.
+    yolo_leaf_box_inflate: 0.05        # each 2D box side grows by this fraction (the YOLO frame is a few tens of ms older than the depth frame) — only used by yolo_leaf_method=="box"
+    yolo_leaf_min_points: 10           # a leaf needs at least this many depth points
+    yolo_leaf_depth_tolerance: 0.3     # [m] ABSOLUTE SAFETY CAP on the valley-bounded window below (not the primary boundary — see depthModeValleyWindow's own comment on why mode+valley, not nearest-depth or a fixed +/- window) — used by both yolo_leaf_method values. Lowered from 0.5 after a confirmed live-bag failure: a person's own leaf bled along the camera's RANGE axis (leaf_size.x grew to ~1.2m, a person-shaped box is normally ~0.5m there) far enough to win yolo_refine's IoU competition against a separate, never-merged, well-formed nearby object's own box — 0.3m still comfortably covers a standing person's own front-to-back depth (clothing/arms included)
+    yolo_leaf_depth_bin: 0.3           # [m] depth-histogram bin width used to find the dominant depth cluster (mode) — used by both yolo_leaf_method values
+    yolo_leaf_valley_fraction: 0.08    # the depth window expands from the mode bin until density drops below this fraction of the peak — i.e. stops at the real gap between the object and whatever's adjacent to it in depth — used by both yolo_leaf_method values. Lowered from 0.15 alongside yolo_leaf_depth_tolerance above (same confirmed failure): a shallower required valley stops the window sooner when a second object's own depth cluster sits close behind/beside the detected one, without changing anything for a cleanly isolated object (its own histogram tapers to ~0 past its real extent regardless of this threshold)
+    yolo_class_names_path: cfg/coco.names   # same class list the YOLO detection nodes use, loaded to turn each leaf's class STRING into a small numeric index for the leaves cloud (see publishSemanticLeaves)
+    yolo_leaf_max_age: 0.3             # [s] ignore detections older than this
+    yolo_leaf_lidar_beyond_depth: true   # true = the latest LiDAR scan's points beyond depth_max_value also feed each detection's leaf (a YOLO detection farther than the depth camera sees still labels its LiDAR cluster)
+    yolo_leaf_nearest_cluster: true      # true = a leaf made mostly of LiDAR points beyond depth_max_value takes the NEAREST depth cluster in its box with >= yolo_leaf_min_points points, not the most populated one: a thin far object (parked bike) has fewer LiDAR returns in its YOLO box than the wall behind it
+    yolo_leaf_min_box_coverage: 0.5      # ...and that cluster must span at least this fraction of the box width in the image: the object fills its own box sideways, a bollard in front of a parked bike does not
+    yolo_leaf_mask_box_fallback: true # mask method: a detection whose mask yields no leaf (coarse mask of a thin far object, too few points) falls back to its own box
+    depth_trigger_max_wait_sec: 0.15   # give up on a scan if no camera frame reaches it within this
+
+    # -----------------------------------------------------------------------
+    # LiDAR — sensor-frame filtering (applied before the global transform,
+    # to the general-purpose cloud only — see preprocessing_node.cpp's file
+    # header. The voxelized_sensor cloud static_structures_node reads from is
+    # NOT range-cropped here at all; that node does its own, via
+    # cfg/outdoor/static_structures.yaml's own lidar_range_x/y).
+    # -----------------------------------------------------------------------
+    lidar_range_x: 15.0             # [m] ±X around the sensor
+    lidar_range_y: 15.0             # [m] ±Y around the sensor
+    # LiDAR general-purpose cloud thinning: deterministic voxel centroids (mean of the raw points in each
+    # voxel, no minimum count) in two range bands — coarser near the robot where the scan is very dense,
+    # finer beyond lidar_voxel_split_range where points are already sparser than the leaf.
+    lidar_voxel_near: 0.075          # [m] leaf up to the split range
+    lidar_voxel_far: 0.045           # [m] leaf beyond it
+    lidar_voxel_split_range: 8.0   # [m] distance from the sensor separating the two bands
+
+    # -----------------------------------------------------------------------
+    # LiDAR — global-frame floor/roof filtering. Neither value is fit here
+    # anymore (see preprocessing_node.cpp's file header) — floor_plane_global_
+    # arrives asynchronously from static_structures_node (onWallMarkers()).
+    # ground_height only bootstraps it flat until the first real (possibly
+    # tilted) fit lands; ground_roof_offset sets the roof margin above
+    # whatever the CURRENT floor fit is, measured perpendicular to the
+    # (possibly tilted) plane, not to world Z.
+    # -----------------------------------------------------------------------
+    ground_height: -0.3             # [m] bootstrap floor Z in global_frame, before static_structures_node's first fit arrives
+    ground_roof_offset: 3.0         # [m] roof = floor_plane_global_ + this
+    # Ground model for every floor/roof crop: "grid" = terrain-following height map grown from the robot (cameras near
+    # it, the full LiDAR scan where it reaches, the robot's base plane in the LiDAR's blind cone; include/sins/ground_grid.hpp),
+    # "planes" = the per-camera floor planes (min over them). On CODa terrain labels (w2/w3, eval/diagnostics/
+    # coda_ground_eval.py) the planes cut 49% of the people's legs in w2 and left 4-8% of hard ground.
+    ground_model: grid
+    ground_grid_cell: 0.25          # [m]
+    ground_grid_tol: 0.15           # [m] |surface - height predicted along the local slope|: sensor noise + pebble size
+    ground_grid_max_slope_deg: 40.0 # [deg] steepest terrain the grid follows
+    ground_grid_memory_s: 30.0      # [s] ground seen earlier stays known under whatever covers it
+
+    # -----------------------------------------------------------------------
+    # LiDAR — final downsample (after transform + crop)
+    # -----------------------------------------------------------------------
+    voxel_resolution: 0.20          # [m] voxel leaf size — coarser than indoor for sparser outdoor clouds — ALSO what pub_lidar_voxelized_/pub_depth_voxelized publish at, since static_structures_node reuses this exact grid (see the file header)
+
+    # Wall-detection input (lidar/voxelized_sensor -> static_structures_node): floor/ceiling points are cut (margin
+    # above the local ground / below the roof) and the voxel is range-dependent — coarse near, fine far — so a far
+    # wall is not outvoted by near ones. One more size than band edges; empty sizes = plain voxel_resolution.
+    wall_input_height_margin: 0.4       # [m] 0 = no height crop
+    wall_input_voxel_sizes: [0.40, 0.30, 0.20]   # [m] leaf per range band (sensor-frame range)
+    wall_input_band_edges: [4.0, 8.0]                # [m] band boundaries
+
+    # pub_lidar_processed_'s own voxel step (separate from voxel_resolution
+    # above, which stays static_structures_node/calibration_icp_node's shared
+    # stage) — same values jo_detector's dynamicDetector used
+    # (voxel starts at 0.1 m, downsample_threshold=7000 points), identical
+    # indoor/outdoor there too. See preprocessing_node.cpp's own comment on
+    # lidar_processed_voxel_size_ for the adaptive-growth mechanism.
+    lidar_processed_voxel_size: 0.1   # [m] starting voxel leaf size for the general-purpose/detection LiDAR cloud
+    lidar_processed_voxel_max_range: 0.0   # [m] 0 = whole cloud. Tried 8.0 on CODa (far points untouched): more fragments of far objects, PD precision 59% -> 48%, IDF1 60% -> 49% (3 reps): off. With >0 the adaptive voxel above only thins points closer than this (= lidar_voxel_split_range); farther ones are already sparser than the leaf (OS1-128 at 13 m: ~8 cm) and a far bike lost ~40% of its returns to it. 0 = whole cloud
+    downsample_threshold: 30000        # points — leaf size only grows (by 10%, re-filtering) while still above this
+
+    wall_removal_margin: 0.15       # [m] points within this distance of a static_structures_node-reported wall/floor plane are dropped
+    wall_removal_extent_margin: 0.20 # [m] ...and only within the wall's own tracked extent plus this (the plane alone is unbounded: points on a wall's far extension were stripped too)
