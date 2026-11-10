@@ -252,6 +252,11 @@ public:
         // a frame rate below the LiDAR's) no longer costs the full timeout on every scan for nothing; its data is
         // still fused whenever it is already there.
         fusion_adaptive_wait_ = declare_parameter<bool>("fusion_adaptive_wait", false);
+        // > 0: YOLO leaves are built when the detections of their own image arrive (preprocessing yolo_leaf_sync), often
+        // after their scan was fused. A leaf up to this old [s] that no scan has used yet joins the NEXT scan instead
+        // of being dropped, and the fusion no longer waits for leaves (only for the camera clouds). The leaf is a
+        // region prior (class + extent), not geometry: a person moves ~15 cm in 100 ms, the overlap still holds.
+        fusion_late_leaves_max_age_ = declare_parameter<double>("fusion_late_leaves_max_age", 0.0);
         fusion_voxel_near_ = declare_parameter<double>("fusion_voxel_near", 0.05);
         fusion_voxel_far_ = declare_parameter<double>("fusion_voxel_far", 0.03);
         fusion_voxel_split_ = declare_parameter<double>("fusion_voxel_split_range", 6.0);
@@ -680,8 +685,14 @@ private:
             const double stamp = stampSec(cloud->header.stamp);
             last_cam_[name] = {stamp, res};
             noteArrival(name, stamp);
-            if (pending_.active && !pending_.cams.count(name) && std::abs(stamp - pending_.stamp) <= fusion_stamp_tolerance_)
-                pending_.cams[name] = res;
+            if (pending_.active && leafUsable(name, stamp)) {
+                const auto it = pending_.cam_stamp.find(name);
+                if (!pending_.cams.count(name) || (fusion_late_leaves_max_age_ > 0.0 && it != pending_.cam_stamp.end() &&
+                                                  std::abs(stamp - pending_.stamp) < std::abs(it->second - pending_.stamp))) {
+                    pending_.cams[name] = res;      // none yet, or this one is nearer the scan
+                    pending_.cam_stamp[name] = stamp;
+                }
+            }
             tryFuse();
         }
     }
@@ -704,7 +715,10 @@ private:
             scan_arrivals_.emplace_back(pending_.stamp, pending_.arrived);
             while (scan_arrivals_.size() > 20) scan_arrivals_.pop_front();
             for (const auto& [name, sc] : last_cam_)
-                if (std::abs(sc.first - pending_.stamp) <= fusion_stamp_tolerance_) pending_.cams[name] = sc.second;
+                if (isLeafSource(name) ? leafUsable(name, sc.first) : std::abs(sc.first - pending_.stamp) <= fusion_stamp_tolerance_) {
+                    pending_.cams[name] = sc.second;
+                    pending_.cam_stamp[name] = sc.first;
+                }
             tryFuse();
         }
         logStats();
@@ -713,6 +727,21 @@ private:
     // ---- fusion -------------------------------------------------------------------------------------------
 
     bool fusion_adaptive_wait_{false};
+    double fusion_late_leaves_max_age_{0.0};
+    std::vector<double> late_leaf_age_ms_;
+    std::map<std::string, double> leaf_used_stamp_;   // newest leaf stamp already fused, per "<camera>_yolo" source
+    static bool isLeafSource(const std::string& name) { return name.size() > 5 && name.compare(name.size() - 5, 5, "_yolo") == 0; }
+    // a leaf joins the pending scan: in stamp tolerance, or (late leaves on) older than the scan within the max age
+    // and newer than the last one fused
+    bool leafUsable(const std::string& name, double stamp) const {
+        if (std::abs(stamp - pending_.stamp) <= fusion_stamp_tolerance_) {
+            const auto u = leaf_used_stamp_.find(name);
+            return fusion_late_leaves_max_age_ <= 0.0 || u == leaf_used_stamp_.end() || stamp > u->second;
+        }
+        if (fusion_late_leaves_max_age_ <= 0.0 || stamp > pending_.stamp || pending_.stamp - stamp > fusion_late_leaves_max_age_) return false;
+        const auto u = leaf_used_stamp_.find(name);
+        return u == leaf_used_stamp_.end() || stamp > u->second;
+    }
     std::deque<std::pair<double, std::chrono::steady_clock::time_point>> scan_arrivals_;   // (scan stamp, arrival)
     std::map<std::string, std::deque<double>> src_delay_;                                   // source -> recent delays [s]
     void noteArrival(const std::string& name, double stamp) {
@@ -740,6 +769,7 @@ private:
         std_msgs::msg::Header header;
         std::shared_ptr<SourceResult> lidar;
         std::map<std::string, std::shared_ptr<SourceResult>> cams;
+        std::map<std::string, double> cam_stamp;
         std::chrono::steady_clock::time_point arrived;
     };
 
@@ -751,6 +781,7 @@ private:
         for (const auto& kv : cameras_) {
             for (const std::string& src : {kv.first, kv.first + "_yolo"}) {
                 if (src != kv.first && !(wall - kv.second.leaves_seen < 1.0)) continue;   // leaves not alive
+                if (src != kv.first && fusion_late_leaves_max_age_ > 0.0) continue;       // late leaves: never waited for
                 if (!sourceExpected(src)) continue;
                 ++expected;
                 if (pending_.cams.count(src)) ++present;
@@ -806,6 +837,19 @@ private:
     }
 
     void fuseAndPublish() {
+        for (const auto& [name, st] : pending_.cam_stamp)
+            if (isLeafSource(name)) {
+                auto& u = leaf_used_stamp_[name];
+                if (st < u - 1.0) u = st;          // clock jumped back (bag loop)
+                u = std::max(u, st);
+                late_leaf_age_ms_.push_back((pending_.stamp - st) * 1000.0);
+            }
+        if (late_leaf_age_ms_.size() >= 100) {
+            std::sort(late_leaf_age_ms_.begin(), late_leaf_age_ms_.end());
+            RCLCPP_INFO(get_logger(), "fused leaves: scan - leaf stamp median %.1f ms, p90 %.1f ms (100 leaf sets)",
+                        late_leaf_age_ms_[50], late_leaf_age_ms_[90]);
+            late_leaf_age_ms_.clear();
+        }
         struct Item { unsigned src; const SourceResult* res; size_t idx; };
         std::vector<Item> items;
         if (pending_.lidar) for (size_t i = 0; i < pending_.lidar->boxes.size(); ++i) items.push_back({0, pending_.lidar.get(), i});

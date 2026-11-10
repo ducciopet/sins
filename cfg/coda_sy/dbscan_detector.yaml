@@ -1,0 +1,100 @@
+dbscan_detector_node:
+  ros__parameters:
+    fusion_late_leaves_max_age: 0.3  # coda_sy (not in base)
+    fusion_adaptive_wait: true  # coda_lt2 (not in base)
+    stereo_camera: {"eps_scale": 1.0}  # coda (not in base)
+    # -----------------------------------------------------------------------
+    # DBSCAN + 3D OBB detection on the processed LiDAR cloud and on every
+    # camera's processed depth cloud (see src/dbscan_detector_node.cpp), each
+    # clustered when it arrives (cameras: one cloud per scan, chosen upstream). camera_names is overridden by run_detector.launch.py from
+    # preprocessing.yaml, so all nodes agree on the same list.
+    # -----------------------------------------------------------------------
+    global_frame: odom
+    lidar_topic: /sins/lidar/processed
+    camera_topic_template: /sins/{camera}/depth/processed
+    odom_topic: /odometry/filtered  # only used for the robot position (range for the adaptive eps)
+
+    # "yaw": box whose z axis is the LOCAL up (the normal of the nearest floor plane fitted by
+    #   static_structures_node, world Z when none is known yet) and whose x/y axes are rotated about it
+    #   by the yaw of the cluster's footprint. On a slope the box stands on the slope; height = size.z.
+    # "pca3d": full 3D orientation from the covariance eigenvectors (tightest box, may tilt)
+    obb_mode: yaw
+
+    # DBSCAN. eps is RANGE-ADAPTIVE: it grows linearly from *_eps_near (at the robot) to *_eps_far (at
+    # *_eps_range_far), because the LiDAR spacing grows with distance — small eps up close (objects
+    # that touch stay separate), larger far away (sparse objects don't fragment). near == far = fixed eps.
+    # min_points counts the point itself. The input clouds are voxel-downsampled
+    # (voxel_resolution in preprocessing.yaml), so eps must be larger than the voxel;
+    # LiDAR is sparser than the depth cameras, hence the larger eps far away.
+    lidar_eps_near: 0.18            # [m] eps at the sensor
+    lidar_eps_far: 0.45             # [m] eps at lidar_eps_range_far and beyond (linear in between)
+    lidar_eps_range_far: 15.0       # [m]
+    lidar_eps_vertical_angle_deg: 0.33  # coda (base: 2.0)    # VLP-16: 2.0 deg between rings (measured 1.97-1.99) = 0.31 m at 9 m; 0 = isotropic eps
+    lidar_eps_vertical_margin: 1.4       # vertical eps = max(eps, margin * range * tan(angle)) so the rows of a wall connect
+    lidar_min_points: 8
+    camera_eps_near: 0.135           # [m]
+    camera_eps_far: 0.27            # [m] near == far = constant eps
+    camera_eps_range_far: 5.0       # [m]
+    # Per-camera multiplier on camera_eps_near/far. The two cameras have the same point spacing at equal range
+    # (measured ~4.4 cm at 2 m, ~7.4 cm at 3 m, ~9 cm beyond), so this only tunes how much each camera's boxes are
+    # merged given what it looks at.
+    front_camera:
+      eps_scale: 1.0
+    back_camera:
+      eps_scale: 1.2
+    camera_min_points: 8
+
+    # Box filtering (a cluster whose box breaks any of these is discarded)
+    max_box_extent: [6.0, 6.0, 3.5]  # outdoor: the largest movable class in the YOLO list we expect next to a sidewalk robot (van / light truck ~5-6 m, 3 m tall); indoor [3.0, 3.0, 2.5] — a 3.2 m service vehicle was discarded whole on CODa  # [m] yaw: footprint (x,y, compared sorted) and height above the local ground (z); pca3d: three extents compared sorted + world-z range
+    max_box_volume: 40.0             # [m^3] outdoor: van/light truck (indoor 12)
+    min_box_volume: 0.02             # [m^3] smaller boxes are dropped: half of all boxes were under 0.03 m^3 (fragments of 9-12 points); raising min_points instead removed real camera objects
+
+    # Fusion of the three sources into one box per object (see the node's header). Overlapping boxes of DIFFERENT
+    # sources are matched one-to-one (mutual best IoU), nested boxes resolved as a parent/child hierarchy (see the node's
+    # header); merged points are voxel-filtered with the same range-banded centroid scheme as the
+    # LiDAR (fusion_voxel_* are forwarded from preprocessing.yaml's lidar_voxel_* by run_detector.launch.py).
+    # Geometric split of over-merged clusters: a tall part sticking out of a low plateau (a person walking past boxes) is separated
+    # from the rest. Heights are above the local floor plane; needs obb_mode: yaw and a floor plane from static_structures_node.
+    split_enabled: true
+    split_min_footprint: 0.8          # [m^2] only clusters with a footprint at least this big are examined
+    split_height: 0.7                 # [m] above this height a point is part of the "tall" layer
+    split_tall_height: 1.0            # [m] a tall component must reach this height to be an object of its own
+    split_column_margin: 0.15         # [m] low points this close (horizontally) to a tall component belong to its column
+    # YOLO refinement: each YOLO leaf (depth points of a detection, foreground only) marks a REGION; the fused object overlapping it most
+    # is cut to its own points inside that region (plus the margin) — the person's box — and the rest is re-clustered into other objects.
+    # Boxes can only shrink or split, never grow: the leaf's own points are not added.
+    yolo_refine_enabled: true
+    yolo_refine_min_iou: 0.12         # 3D IoU between the leaf's box and the object needed to refine it — a genuinely correct match for a non-rectangular object (person) via a plain 2D box tops out around 0.15-0.3, not near 1.0, since the box always includes some same-depth background around the silhouette; the distance-sanity check below is the REAL correctness guard, not this threshold
+    yolo_refine_margin: 0.10          # [m] the leaf's oriented box is grown by this before cutting
+    yolo_class_min_height_classes: [car, truck, bus, bicycle]   # bicycle 0.6: annotated bikes 0.98-1.14 m tall, OBSERVED (racked, occluded) mostly above 0.6 (median 0.80); the U-shaped rack hoops that took the bike class median 0.55 (CODa w1: 0.6 keeps 88% of bikes, drops 87% of those); a YOLO class is given only to an object at least this tall (physical minimum of the class): a bollard in front of a van falls inside its box/mask
+    yolo_class_min_height_values: [1.1, 1.1, 1.5, 0.6]     # [m] same order: OBSERVED cluster height (above the floor crop, roof partly unseen) — a 1.9 m van shows 1.36-1.46 m on CODa, bollards 0.55-0.9 m
+    yolo_refine_nested: false         # tried on CODa (3 reps): +1.6 pts PD found, PD precision 69% -> 60%, false PD 97 -> 143/min: off. true = a YOLO leaf lying INSIDE a larger cluster (a parked bike merged with its rack and neighbours) cuts that cluster to the leaf even when their IoU is below yolo_refine_min_iou (no retention floor, the cut is a part by construction)
+    yolo_refine_assoc: iou    # GP1 (02/11, with the 0.6 m bicycle height): PD 52.0% but false PD 133/min vs 63 with iou (GH3): off. "points" tried on CODa (3 runs incomplete, single runs: many more false PD on bollards, also when ranked by shared leaf points): off. points = a YOLO leaf goes to the fused object sharing most of its points (same scan) and that object is cut to them; "iou" = leaf/object box 3D IoU with ambiguity/distance/retention tests (a bike merged with its rack shares all its leaf points with the merged cluster, but their box IoU is far below threshold)
+    yolo_refine_min_iou_margin: 0.05  # misattribution guard: min IoU lead the winning fused object needs over the runner-up, else skip as ambiguous (a person close to another object can make its box a near-tie) — also rejects a winner whose center is not near-coincident with the leaf's own box, so a nearby object never inherits the person's class. Lowered alongside yolo_refine_min_iou: a fixed 0.08 was disproportionately strict once typical correct-match IoU dropped to ~0.15-0.3
+    yolo_refine_min_retention: 0.35   # the leaf-bounded cut must keep at least this fraction of the fused object's own pre-cut points, on top of the absolute camera_min_points floor — rejects a match that only grabs a thin, barely-representative sliver of the object (v1 equivalent in spirit: dynamicDetector.cpp's yoloPointFractionThresh_/sparseLargeBox)
+    yolo_refine_keep_rest: true       # false = drop the points outside the region instead of re-clustering them
+    leaves_enabled: true              # YOLO leaves (preprocessing_node) are used as region priors to refine the fused boxes
+    leaves_topic_template: /sins/{camera}/semantic_leaves
+    fusion_enabled: true
+    # Matching / nesting metric. "footprint" (in use): mutual best match by footprint IoU (rotated rectangles, each inflated by
+    # fusion_margin, gated by the height overlap fusion_z_overlap), nested = footprint containment >= fusion_nest_thresh AND height
+    # containment >= fusion_nest_z. "volume": jo_detector's 3D IoU / IOV thresholds (fusion_iou_thresh 0.6, fusion_iou_same 0.4,
+    # fusion_iov_cross 0.7, fusion_iov_same 0.5) — with those the mutual match almost never fires and more overlapping boxes remain.
+    fusion_metric: footprint
+    fusion_iou_thresh: 0.2            # mutual best-match IoU between two sensors
+    fusion_iou_same: 0.0              # >0 also matches peers of one sensor (metric volume: jo_detector's samegroupIOU 0.4); 0 = off
+    fusion_margin: 0.05               # [m] each footprint is inflated by this before the overlap test
+    fusion_z_overlap: 0.3             # footprint metric: fraction of the shorter box's height that must overlap for a match
+    fusion_nest_thresh: 0.8           # footprint metric: fraction of a box's footprint inside the other to be nested
+    fusion_nest_z: 0.6                # footprint metric: fraction of its height that overlaps the other's height range
+    fusion_iov_cross: 0.7             # volume metric: IOV between sensors
+    fusion_iov_same: 0.5              # volume metric: IOV within one sensor
+    fusion_stamp_tolerance: 0.08      # [s] a camera result joins a LiDAR scan if their stamps differ less than this
+    fusion_nest_attach_dist: 0.4      # [m] extra evidence for a same-source nested box (not in v1): its points must come this close to the bigger cluster's points, else it is a separate object inside the notch of the bigger one
+    fusion_child_overlap: 0.1         # >=2 nested children count as distinct objects if their pairwise footprint IoU is below this
+    fusion_nested_multi_child: leaves # parent with >=2 disjoint children: "leaves" = replace it by them (over-merged cluster), "absorb" = merge all
+    fusion_timeout_sec: 0.05  # coda_lt3 (base: 0.12)          # [s] publish the fused tick even if a camera never arrived
+    yolo_class_names_path: cfg/coco.names   # same file preprocessing_node loads, to decode a leaf's class_idx back into a name
+    marker_lifetime_sec: 0.0          # box markers stay in rviz until replaced (0), so a paused/stopped bag keeps them on screen
+    fused_color: [1.0, 1.0, 0.0]      # colour of ALL fused boxes (r, g, b)
+    stats_log_period_sec: 5.0

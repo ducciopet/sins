@@ -596,6 +596,8 @@ struct CamFov {
     // per-tick cache
     bool tf_ok = false;
     Eigen::Isometry3d T_cam_global = Eigen::Isometry3d::Identity();  // maps a GLOBAL-frame point into this camera's frame
+    Eigen::Isometry3d T_cam_global_2d = Eigen::Isometry3d::Identity();  // the same at the stamp of latest_2d (yolo2d_time_compensation)
+    bool tf_2d_at_stamp = false;
 
     // Raw 2D YOLO detections (pixel boxes, no depth involved) — see yoloClassAtPixel()'s own comment for why
     // this exists alongside the depth-leaf mechanism. Just the latest message, like preprocessing_node's own
@@ -1092,6 +1094,11 @@ public:
         // RAW 2D YOLO boxes directly, bypassing the depth-leaf step entirely for this one case.
         yolo2d_topic_template_ = declare_parameter<std::string>("yolo2d_topic_template", "/yolo_semantic_seg/{camera}/detections");
         yolo2d_max_age_ = declare_parameter<double>("yolo2d_max_age", 0.5);  // [s] ignore a camera's latest 2D detections once this stale
+        // The raw 2D boxes come from an image taken BEFORE this tick (YOLO time + transport: ~0-50 ms on CODa, ~190 ms
+        // on the robot's compressed topics). true: a LiDAR box is projected with the camera pose AT THE IMAGE STAMP (TF
+        // history) and moved back to that instant with the velocity of the nearest confirmed track, so the IoU compares
+        // the same instant. false: current pose and position (previous behaviour).
+        yolo2d_time_compensation_ = declare_parameter<bool>("yolo2d_time_compensation", false);
         yolo2d_min_iou_ = declare_parameter<double>("yolo2d_min_iou", 0.2);  // min IoU between the box's PROJECTED footprint and a YOLO box — see pixelCandidates()'s own comment
 
         cams_.reserve(camera_names_.size());  // each camera's subscription callback captures &cams_.back() below —
@@ -1216,6 +1223,22 @@ private:
                 T.translation() = Eigen::Vector3d(t.translation.x, t.translation.y, t.translation.z);
                 cam.T_cam_global = T;
                 cam.tf_ok = true;
+                cam.T_cam_global_2d = T;
+                cam.tf_2d_at_stamp = false;
+                if (yolo2d_time_compensation_ && cam.latest_2d) {
+                    try {
+                        const auto tf2d = tf_buffer_.lookupTransform(frame, global_frame_, rclcpp::Time(cam.latest_2d->header.stamp),
+                                                                     rclcpp::Duration::from_seconds(0.0));
+                        const auto& u = tf2d.transform;
+                        Eigen::Isometry3d T2 = Eigen::Isometry3d::Identity();
+                        T2.linear() = Eigen::Quaterniond(u.rotation.w, u.rotation.x, u.rotation.y, u.rotation.z).toRotationMatrix();
+                        T2.translation() = Eigen::Vector3d(u.translation.x, u.translation.y, u.translation.z);
+                        cam.T_cam_global_2d = T2;
+                        cam.tf_2d_at_stamp = true;
+                    } catch (const tf2::TransformException&) {
+                        // no TF history at that instant (startup, or a gap): the current pose
+                    }
+                }
             } catch (const tf2::TransformException&) {
                 // not yet available (e.g. calibration_icp_node hasn't published "<camera>_refined" yet) — skip
             }
@@ -1544,6 +1567,20 @@ private:
     // candidate — rather than picking one itself — and lets the CALLER resolve this globally across every
     // fallback-eligible detection this tick, awarding each (camera, 2D box) pair to its single HIGHEST-IoU
     // candidate only (see onFused()'s own resolution block).
+    // KF velocity of the confirmed track nearest to p (within 1.5 m), zero if none: the motion of a detection that is
+    // not associated yet (yolo2d_time_compensation)
+    Eigen::Vector3d nearestTrackVelocity(const Eigen::Vector3d& p) const {
+        double best = 1.5 * 1.5;
+        Eigen::Vector3d v = Eigen::Vector3d::Zero();
+        for (const auto& [id, t] : tracks_) {
+            if (!t.confirmed) continue;
+            const Eigen::Vector3d d = t.kf.pos() - p;
+            const double d2 = d.x() * d.x() + d.y() * d.y();
+            if (d2 < best) { best = d2; v = t.kf.vel(); }
+        }
+        return v;
+    }
+
     std::vector<PixelCandidate> pixelCandidates(const geometry_msgs::msg::Point& center,
                                                 const geometry_msgs::msg::Quaternion& q,
                                                 const vision_msgs::msg::BoundingBox3D::_size_type& size,
@@ -1567,10 +1604,20 @@ private:
             if (!cam.has_info || !cam.tf_ok || !cam.latest_2d) continue;
             if (std::abs(now_sec - stampSec(cam.latest_2d->header.stamp)) > yolo2d_max_age_) continue;  // stale
 
+            // yolo2d_time_compensation: the box where it was when the image was taken, seen from where the camera was
+            Eigen::Vector3d back = Eigen::Vector3d::Zero();
+            if (yolo2d_time_compensation_) {
+                const double age = now_sec - stampSec(cam.latest_2d->header.stamp);
+                if (age > 0.0) {
+                    back = -nearestTrackVelocity(c) * age;
+                    back.z() = 0.0;
+                }
+            }
+            const Eigen::Isometry3d& T_cg = yolo2d_time_compensation_ ? cam.T_cam_global_2d : cam.T_cam_global;
             double ax0 = 1e18, ax1 = -1e18, ay0 = 1e18, ay1 = -1e18;
             bool behind = false;
             for (const auto& corner : corners) {
-                const Eigen::Vector3d p = cam.T_cam_global * corner;
+                const Eigen::Vector3d p = T_cg * (corner + back);
                 if (p.z() <= 1e-3) { behind = true; break; }  // box straddles/behind the camera plane — skip
                 ax0 = std::min(ax0, cam.fx * p.x() / p.z() + cam.cx);
                 ax1 = std::max(ax1, cam.fx * p.x() / p.z() + cam.cx);
@@ -3208,6 +3255,8 @@ private:
     std::string camera_info_topic_template_, camera_frame_template_, yolo2d_topic_template_;
     bool camera_info_frame_fallback_{true};
     double yolo2d_max_age_{0.5}, yolo2d_min_iou_{0.2};
+    bool yolo2d_time_compensation_{false};
+    std::vector<double> comp_shift_;   // diagnostic: |back-prediction| of compensated candidates [m]
     int max_non_yolo_in_fov_frames_{5};
     int max_yolo_base_mismatch_frames_{5};
     double yolo_base_mismatch_thresh_{0.50};

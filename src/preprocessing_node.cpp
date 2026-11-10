@@ -395,6 +395,19 @@ public:
                         coco_class_names_.size(), class_names_path.c_str());
         }
         depth_trigger_max_wait_sec_ = this->declare_parameter("depth_trigger_max_wait_sec", 0.15);
+        // Time coherence of the camera products (all default off = previous behaviour):
+        // camera_pose_at_stamp: a depth frame goes into global_frame with the robot pose AT ITS OWN STAMP (interpolated
+        //   between the LiDAR-synced odometry poses, extrapolated by at most one interval), not with the latest scan's
+        //   pose. Camera frames reach the node 10-150 ms after capture (150 ms on the robot's compressed topics), the
+        //   latest pose belongs to another instant and the moving robot shifts every camera point.
+        // yolo_leaf_sync: the semantic leaves of a depth frame are built only once the YOLO detections of the same
+        //   instant are here (a detection stamped at/after the frame arrived, so none can come closer), from the
+        //   detection nearest in stamp within yolo_leaf_sync_tol. Before, the leaves were built on the depth frame's
+        //   arrival, when its own detections were still in YOLO: the boxes of the PREVIOUS image (100-130 ms older on
+        //   CODa, 1-2 frames on the street) cut the depth of the current one — background inside, the object outside.
+        camera_pose_at_stamp_ = this->declare_parameter("camera_pose_at_stamp", false);
+        yolo_leaf_sync_ = this->declare_parameter("yolo_leaf_sync", false);
+        yolo_leaf_sync_tol_ = this->declare_parameter("yolo_leaf_sync_tol", 0.07);
         depth_processed_voxel_size_ = this->declare_parameter("depth_processed_voxel_size", 0.1);
         depth_processed_voxel_occupied_thresh_ = this->declare_parameter("depth_processed_voxel_occupied_thresh", 5.0);
 
@@ -654,6 +667,10 @@ private:
         rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_yolo_mask;
         std::deque<sensor_msgs::msg::Image::ConstSharedPtr> yolo_mask_ring;
         rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_semantic_leaves;
+        // yolo_leaf_sync: depth frames whose leaves wait for the YOLO detections of their own instant
+        struct PendingLeafFrame { pcl::PointCloud<pcl::PointXYZ> cloud; builtin_interfaces::msg::Time stamp; std::string frame_id; };
+        std::deque<PendingLeafFrame> pending_leaf_frames;
+        std::vector<double> leaf_dt_ms;   // |depth - detection| stamp gap of the leaves built (diagnostic)
     };
 
     std::vector<std::string> camera_names_;
@@ -768,6 +785,28 @@ private:
     // available (this was tried first and empirically was NOT).
     bool has_odom_{false};
     Eigen::Matrix4d T_global_base_latest_{Eigen::Matrix4d::Identity()};
+    bool camera_pose_at_stamp_{false}, yolo_leaf_sync_{false};
+    double yolo_leaf_sync_tol_{0.07};
+    std::deque<std::pair<double, Eigen::Matrix4d>> pose_hist_;   // (stamp, T_global_base) of the last LiDAR-synced poses
+
+    // T_global_base at time t (camera_pose_at_stamp): interpolation between the two bracketing LiDAR-synced poses
+    // (translation linear, rotation along the relative axis), extrapolation by at most one pose interval.
+    Eigen::Matrix4d poseAt(double t) const {
+        if (!camera_pose_at_stamp_ || t <= 0.0 || pose_hist_.size() < 2) return T_global_base_latest_;
+        size_t i = 1;
+        while (i + 1 < pose_hist_.size() && pose_hist_[i].first < t) ++i;
+        const auto& a = pose_hist_[i - 1];
+        const auto& b = pose_hist_[i];
+        const double span = b.first - a.first;
+        if (span < 1e-6) return b.second;
+        const double s = std::clamp((t - a.first) / span, -1.0, 2.0);
+        const Eigen::Matrix3d Ra = a.second.topLeftCorner<3, 3>(), Rb = b.second.topLeftCorner<3, 3>();
+        const Eigen::AngleAxisd d(Ra.transpose() * Rb);
+        Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+        T.topLeftCorner<3, 3>() = Ra * Eigen::AngleAxisd(d.angle() * s, d.axis()).toRotationMatrix();
+        T.topRightCorner<3, 1>() = a.second.topRightCorner<3, 1>() + s * (b.second.topRightCorner<3, 1>() - a.second.topRightCorner<3, 1>());
+        return T;
+    }
     bool calibration_enabled_{true};
     std::vector<double> lidar_age_ms_;
     int depth_input_max_points_{0};
@@ -861,9 +900,10 @@ private:
         if (!cam->yolo_detections_topic.empty()) {
             cam->sub_yolo = this->create_subscription<vision_msgs::msg::Detection2DArray>(
                 cam->yolo_detections_topic, rclcpp::QoS(10),
-                [cam](const vision_msgs::msg::Detection2DArray::ConstSharedPtr& msg) {
+                [this, cam](const vision_msgs::msg::Detection2DArray::ConstSharedPtr& msg) {
                     cam->yolo_ring.push_back(msg);
-                    while (cam->yolo_ring.size() > 3) cam->yolo_ring.pop_front();
+                    while (cam->yolo_ring.size() > 6) cam->yolo_ring.pop_front();
+                    if (yolo_leaf_sync_) resolvePendingLeaves(*cam);
                 });
             cam->pub_semantic_leaves = this->create_publisher<sensor_msgs::msg::PointCloud2>(
                 "/sins/" + name + "/semantic_leaves", qos);
@@ -871,9 +911,10 @@ private:
         if (!cam->yolo_mask_topic.empty()) {
             cam->sub_yolo_mask = this->create_subscription<sensor_msgs::msg::Image>(
                 cam->yolo_mask_topic, rclcpp::SensorDataQoS(),
-                [cam](const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
+                [this, cam](const sensor_msgs::msg::Image::ConstSharedPtr& msg) {
                     cam->yolo_mask_ring.push_back(msg);
-                    while (cam->yolo_mask_ring.size() > 3) cam->yolo_mask_ring.pop_front();
+                    while (cam->yolo_mask_ring.size() > 6) cam->yolo_mask_ring.pop_front();
+                    if (yolo_leaf_sync_) resolvePendingLeaves(*cam);
                 });
         }
         // Semantic ground works on BOTH depth paths (per-pixel masking of the
@@ -1217,7 +1258,7 @@ private:
     // own (unchanged) comment for the full reasoning behind this specific
     // composition — not repeated here.
     bool computeGlobalDepthTransform(CameraStream& cam, const std::string& frame_id,
-                                      bool is_native_depth_frame, Eigen::Matrix4d& T_global_depth) {
+                                      bool is_native_depth_frame, Eigen::Matrix4d& T_global_depth, double stamp = -1.0) {
         const bool have_depth_color_tf = !is_native_depth_frame || cam.has_depth_color_matrix;
         const bool have_calibration_tf = calibration_enabled_ && have_depth_color_tf &&
             ensureStaticTf() && ensureCameraCalibrationTf(cam);
@@ -1244,9 +1285,10 @@ private:
             // p_lidar = T_lidar_camera * p_color = T_lidar_camera * T_color_depth * p_depth
             T_lidar_frame = Eigen::Matrix4d(T_lidar_frame * cam.T_color_depth);
         }
+        const Eigen::Matrix4d T_global_base = poseAt(stamp);
         T_global_depth = have_calibration_tf
-            ? Eigen::Matrix4d(T_global_base_latest_ * T_base_lidar_ * T_lidar_frame)
-            : Eigen::Matrix4d(T_global_base_latest_ * cam.T_base_depth);
+            ? Eigen::Matrix4d(T_global_base * T_base_lidar_ * T_lidar_frame)
+            : Eigen::Matrix4d(T_global_base * cam.T_base_depth);
         return true;
     }
 
@@ -1264,7 +1306,7 @@ private:
             return;
         }
         Eigen::Matrix4d T_global_depth;
-        if (!computeGlobalDepthTransform(cam, frame_id, is_native_depth_frame, T_global_depth)) {
+        if (!computeGlobalDepthTransform(cam, frame_id, is_native_depth_frame, T_global_depth, stampSec(stamp))) {
             return;
         }
         pcl::PointCloud<pcl::PointXYZ> global_cloud;
@@ -1545,7 +1587,7 @@ private:
                                const builtin_interfaces::msg::Time& stamp, const std::string& frame_id) {
         if (!cam.pub_semantic_leaves) return;
         Eigen::Matrix4d T_global_depth;
-        if (!computeGlobalDepthTransform(cam, frame_id, /*is_native_depth_frame=*/true, T_global_depth)) return;
+        if (!computeGlobalDepthTransform(cam, frame_id, /*is_native_depth_frame=*/true, T_global_depth, stampSec(stamp))) return;
 
         // yolo_leaf_lidar_beyond_depth_: the depth points plus the latest scan's points beyond the depth range,
         // both in the depth frame (see the parameter's own comment)
@@ -1577,7 +1619,8 @@ private:
                             std::abs(rclcpp::Time(det->header.stamp).seconds() - rclcpp::Time(stamp).seconds()))
                 det = d;
         const bool ready = det && !det->detections.empty() && cam.has_depth_color_matrix && cam.has_aligned_depth_camera_info &&
-                           std::abs(rclcpp::Time(det->header.stamp).seconds() - rclcpp::Time(stamp).seconds()) < yolo_leaf_max_age_;
+                           std::abs(rclcpp::Time(det->header.stamp).seconds() - rclcpp::Time(stamp).seconds()) <
+                               (yolo_leaf_sync_ ? yolo_leaf_sync_tol_ : yolo_leaf_max_age_);
 
         // "mask" method (see yolo_leaf_method_'s own comment): pixel-EXACT object membership from a YOLO
         // instance-segmentation node's own per-pixel label image — no 2D box/inflate heuristics needed to
@@ -1590,9 +1633,11 @@ private:
         // own pre-valley-fix leaves.
         if (yolo_leaf_method_ == "mask") {
             sensor_msgs::msg::Image::ConstSharedPtr mask_img;
+            // the mask of the chosen detection (same image), not just the one nearest the depth frame
+            const auto mstamp = (yolo_leaf_sync_ && det) ? det->header.stamp : stamp;
             for (const auto& m : cam.yolo_mask_ring)
-                if (!mask_img || std::abs(rclcpp::Time(m->header.stamp).seconds() - rclcpp::Time(stamp).seconds()) <
-                                    std::abs(rclcpp::Time(mask_img->header.stamp).seconds() - rclcpp::Time(stamp).seconds()))
+                if (!mask_img || std::abs(rclcpp::Time(m->header.stamp).seconds() - rclcpp::Time(mstamp).seconds()) <
+                                    std::abs(rclcpp::Time(mask_img->header.stamp).seconds() - rclcpp::Time(mstamp).seconds()))
                     mask_img = m;
             const bool mask_ready = ready && mask_img && mask_img->encoding == "32SC1" &&
                                     std::abs(rclcpp::Time(mask_img->header.stamp).seconds() - rclcpp::Time(stamp).seconds()) < yolo_leaf_max_age_;
@@ -1760,6 +1805,39 @@ private:
         cam.pub_semantic_leaves->publish(out);
     }
 
+    // yolo_leaf_sync: build the leaves of the oldest waiting depth frame once no detection can come closer to it in
+    // stamp (one stamped at/after the frame has arrived, and its mask too with the mask method). YOLO silent for more
+    // than 1 s, or more than 4 frames waiting: build them with what there is (no detection within the tolerance =
+    // empty leaves, so the consumers still see the camera alive).
+    void resolvePendingLeaves(CameraStream& cam) {
+        while (!cam.pending_leaf_frames.empty()) {
+            auto& f = cam.pending_leaf_frames.front();
+            const double t = stampSec(f.stamp);
+            double newest_det = -1e18, newest_mask = -1e18;
+            for (const auto& d : cam.yolo_ring) newest_det = std::max(newest_det, stampSec(d->header.stamp));
+            for (const auto& m : cam.yolo_mask_ring) newest_mask = std::max(newest_mask, stampSec(m->header.stamp));
+            const bool det_ok = newest_det >= t - 1e-4;
+            const bool mask_ok = yolo_leaf_method_ != "mask" || newest_mask >= t - 1e-4;
+            const bool yolo_dead = newest_det < t - 1.0 && stampSec(cam.pending_leaf_frames.back().stamp) - t >= 0.0;
+            if (!(det_ok && mask_ok) && !yolo_dead && cam.pending_leaf_frames.size() <= 4) break;
+            double best = 1e18;
+            for (const auto& d : cam.yolo_ring) best = std::min(best, std::abs(stampSec(d->header.stamp) - t));
+            if (best < 1.0) {
+                cam.leaf_dt_ms.push_back(best * 1000.0);
+                if (cam.leaf_dt_ms.size() >= 100) {
+                    std::vector<double> v = cam.leaf_dt_ms;
+                    std::sort(v.begin(), v.end());
+                    RCLCPP_INFO(this->get_logger(), "[%s] leaf sync: depth-detection stamp gap median %.1f ms, p90 %.1f ms, within tol %.0f%% (100 frames)",
+                                cam.name.c_str(), v[50], v[90],
+                                100.0 * std::count_if(v.begin(), v.end(), [this](double x) { return x <= yolo_leaf_sync_tol_ * 1000.0; }) / v.size());
+                    cam.leaf_dt_ms.clear();
+                }
+            }
+            publishSemanticLeaves(cam, f.cloud, f.stamp, f.frame_id);
+            cam.pending_leaf_frames.pop_front();
+        }
+    }
+
     void onNativeDepthCloud(CameraStream& cam, const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) {
         // timing diagnostic: how old the frame is when its processing starts, and how long the processing takes
         const double t_in = (this->now() - rclcpp::Time(msg->header.stamp)).seconds() * 1000.0;
@@ -1823,7 +1901,12 @@ private:
         }
 
         const std::string frame_id = !msg->header.frame_id.empty() ? msg->header.frame_id : cam.depth_optical_frame;
-        publishSemanticLeaves(cam, cloud, msg->header.stamp, frame_id);
+        if (yolo_leaf_sync_ && cam.pub_semantic_leaves) {
+            cam.pending_leaf_frames.push_back({cloud, msg->header.stamp, frame_id});
+            resolvePendingLeaves(cam);
+        } else {
+            publishSemanticLeaves(cam, cloud, msg->header.stamp, frame_id);
+        }
         finishDepthCloud(cam, cloud, msg->header.stamp, frame_id, /*is_native_depth_frame=*/true);
         publishGroundPoints(cam, floor_cloud, msg->header.stamp, frame_id, /*is_native_depth_frame=*/true);
     }
@@ -1965,7 +2048,7 @@ private:
         // preferred, cam.T_base_depth as the fallback) — factored out from
         // here so publishGroundPoints() can reuse the exact same logic.
         Eigen::Matrix4d T_global_depth;
-        const bool have_global_tf = computeGlobalDepthTransform(cam, frame_id, is_native_depth_frame, T_global_depth);
+        const bool have_global_tf = computeGlobalDepthTransform(cam, frame_id, is_native_depth_frame, T_global_depth, stampSec(stamp));
         if (ground_grid_ && have_global_tf) {     // the camera's near field for the ground height map
             std::vector<Eigen::Vector3d> gpts;
             gpts.reserve(depth_downsampled->points.size());
@@ -2200,6 +2283,12 @@ private:
         // period stale for it, which is fine for a floor/wall crop.
         T_global_base_latest_ = T_global_base;
         has_odom_ = true;
+        {
+            const double ts = stampSec(odom_msg->header.stamp);
+            if (!pose_hist_.empty() && ts < pose_hist_.back().first - 1.0) pose_hist_.clear();   // clock jumped back (bag loop)
+            if (pose_hist_.empty() || ts > pose_hist_.back().first) pose_hist_.emplace_back(ts, T_global_base);
+            while (pose_hist_.size() > 30) pose_hist_.pop_front();
+        }
 
         // ground_model "grid": this scan (all of it, before any crop: the floor band is what it needs) + the latest
         // camera depth points grow the height map the crops below use.
