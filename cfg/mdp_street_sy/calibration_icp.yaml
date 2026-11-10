@@ -1,5 +1,6 @@
 calibration_icp_node:
   ros__parameters:
+    depth_transport_from_preprocessing: true  # mdp_street_sy (not in base)
     depth_topic: /front_camera/camera/depth/image_rect_raw
     depth_transport: compressedDepth       # override to 'zstd' against bags/*_validation_lab, 'raw' against jo_sim
     # depth_cloud_topic / depth_to_color_extrinsics_topic: unset here on

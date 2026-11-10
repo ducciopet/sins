@@ -726,6 +726,8 @@ private:
     double yolo_leaf_min_box_coverage_ = 0.5;
     bool yolo_leaf_mask_box_fallback_ = false;
     double lidar_leaf_stamp_{-1e9};
+    // yolo_leaf_sync: the last scans, so a leaf built late (when YOLO answers) takes the scan nearest its OWN frame
+    std::deque<std::pair<double, std::shared_ptr<const pcl::PointCloud<pcl::PointXYZ>>>> lidar_leaf_ring_;
     double yolo_leaf_valley_fraction_{0.15};
     int yolo_leaf_min_points_{10};
     double depth_trigger_max_wait_sec_{0.15};
@@ -1612,11 +1614,16 @@ private:
         // yolo_leaf_lidar_beyond_depth_: the depth points plus the latest scan's points beyond the depth range,
         // both in the depth frame (see the parameter's own comment)
         pcl::PointCloud<pcl::PointXYZ> augmented;
-        if (yolo_leaf_lidar_beyond_depth_ && !lidar_leaf_cloud_.empty() &&
-            std::abs(lidar_leaf_stamp_ - rclcpp::Time(stamp).seconds()) < yolo_leaf_max_age_) {
+        const pcl::PointCloud<pcl::PointXYZ>* lidar_leaf = &lidar_leaf_cloud_;
+        double lidar_leaf_t = lidar_leaf_stamp_;
+        if (yolo_leaf_sync_)
+            for (const auto& e : lidar_leaf_ring_)
+                if (std::abs(e.first - stampSec(stamp)) < std::abs(lidar_leaf_t - stampSec(stamp))) { lidar_leaf = e.second.get(); lidar_leaf_t = e.first; }
+        if (yolo_leaf_lidar_beyond_depth_ && !lidar_leaf->empty() &&
+            std::abs(lidar_leaf_t - stampSec(stamp)) < (yolo_leaf_sync_ ? 0.06 : yolo_leaf_max_age_)) {
             const Eigen::Matrix4d T_depth_global = T_global_depth.inverse();
             augmented = depth_cloud;
-            for (const auto& pt : lidar_leaf_cloud_.points) {
+            for (const auto& pt : lidar_leaf->points) {
                 const Eigen::Vector4d pd = T_depth_global * Eigen::Vector4d(pt.x, pt.y, pt.z, 1.0);
                 if (pd.z() > cam.depth_max)
                     augmented.points.emplace_back(static_cast<float>(pd.x()), static_cast<float>(pd.y()), static_cast<float>(pd.z()));
@@ -2389,6 +2396,9 @@ private:
             lidar_leaf_cloud_.width = static_cast<uint32_t>(lidar_leaf_cloud_.points.size());
             lidar_leaf_cloud_.height = 1;
             lidar_leaf_stamp_ = rclcpp::Time(lidar_msg->header.stamp).seconds();
+            if (!lidar_leaf_ring_.empty() && lidar_leaf_stamp_ < lidar_leaf_ring_.back().first - 1.0) lidar_leaf_ring_.clear();
+            lidar_leaf_ring_.emplace_back(lidar_leaf_stamp_, std::make_shared<const pcl::PointCloud<pcl::PointXYZ>>(lidar_leaf_cloud_));
+            while (lidar_leaf_ring_.size() > 5) lidar_leaf_ring_.pop_front();
         }
 
         // Pass 4: voxel downsample the general-purpose cloud — adaptive leaf

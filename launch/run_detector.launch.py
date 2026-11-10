@@ -169,6 +169,7 @@ def _launch_setup(context, *args, **kwargs):
     # SAME native-cloud-or-deprojection choice preprocessing_node makes for
     # that camera, without a second setting to keep in sync by hand.
     calibration_nodes = []
+    from_pre_transport = bool(calibration_params.pop('depth_transport_from_preprocessing', False))
     for name in (camera_names if enable_calibration else []):
         # A camera_names entry with no matching camera_depth_intrinsics map
         # key is expected, not an error: adding a camera is meant to be a
@@ -209,6 +210,15 @@ def _launch_setup(context, *args, **kwargs):
         # cfg/outdoor/preprocessing.yaml currently does) falls through to
         # calibration_icp_node.cpp's own default: deprojection, unchanged.
         depth_cloud_topic = str((preprocessing_params.get(name, {}) or {}).get('aligned_depth_cloud_topic', ''))
+        # depth_transport_from_preprocessing (calibration_icp.yaml, launch-only key): the depth image transport of this
+        # camera is the one preprocessing_node uses for it (<name>.aligned_depth_transport), not the global launch arg —
+        # on the robot's street bag the depth is compressedDepth while the arg says zstd, so the ICP never received a
+        # frame and published its initial guess after the timeout
+        cam_depth_transport = depth_transport
+        if from_pre_transport:
+            t = (preprocessing_params.get(name, {}) or {}).get('aligned_depth_transport', '')
+            if t:
+                cam_depth_transport = str(t)
         calibration_nodes.append(Node(
             package='sins',
             executable='calibration_icp_node',
@@ -235,7 +245,7 @@ def _launch_setup(context, *args, **kwargs):
                 {
                     'use_sim_time': use_sim_time,
                     'depth_topic': f'/{name}/camera/aligned_depth_to_color/image_raw',
-                    'depth_transport': depth_transport,
+                    'depth_transport': cam_depth_transport,
                     **camera_intrinsics_params,
                     # depth_intrinsics (when present above) is only
                     # calibration_icp_node's bootstrap value —

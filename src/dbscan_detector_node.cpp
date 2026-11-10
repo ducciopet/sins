@@ -729,6 +729,7 @@ private:
     bool fusion_adaptive_wait_{false};
     double fusion_late_leaves_max_age_{0.0};
     std::vector<double> late_leaf_age_ms_;
+    size_t late_class_only_ = 0;   // late leaves that gave their class without a geometric cut (diagnostic)
     std::map<std::string, double> leaf_used_stamp_;   // newest leaf stamp already fused, per "<camera>_yolo" source
     static bool isLeafSource(const std::string& name) { return name.size() > 5 && name.compare(name.size() - 5, 5, "_yolo") == 0; }
     // a leaf joins the pending scan: in stamp tolerance, or (late leaves on) older than the scan within the max age
@@ -846,8 +847,8 @@ private:
             }
         if (late_leaf_age_ms_.size() >= 100) {
             std::sort(late_leaf_age_ms_.begin(), late_leaf_age_ms_.end());
-            RCLCPP_INFO(get_logger(), "fused leaves: scan - leaf stamp median %.1f ms, p90 %.1f ms (100 leaf sets)",
-                        late_leaf_age_ms_[50], late_leaf_age_ms_[90]);
+            RCLCPP_INFO(get_logger(), "fused leaves: scan - leaf stamp median %.1f ms, p90 %.1f ms (100 leaf sets); late leaves class-only so far: %zu",
+                        late_leaf_age_ms_[50], late_leaf_age_ms_[90], late_class_only_);
             late_leaf_age_ms_.clear();
         }
         struct Item { unsigned src; const SourceResult* res; size_t idx; };
@@ -1240,6 +1241,21 @@ private:
                         lb.center.x(), lb.center.y(), lb.center.z(), lb.size.x(), lb.size.y(), lb.size.z(),
                         o.box.center.x(), o.box.center.y(), o.box.center.z(), o.box.size.x(), o.box.size.y(), o.box.size.z(),
                         maskName(o.mask).c_str(), best_iou, center_dist);
+                    // A LATE leaf (fusion_late_leaves_max_age: built from an image older than this scan beyond the stamp
+                    // tolerance) only gives its class to the object it overlaps: its points are where the object WAS
+                    // (a car at 10 m/s moves 2.5 m in 250 ms), so cutting this scan's object to them would carve it at
+                    // the old position. The geometric cut needs leaf and object from the same instant.
+                    {
+                        const auto ls = pending_.cam_stamp.find(camera_names_[k] + "_yolo");
+                        if (ls != pending_.cam_stamp.end() && std::abs(ls->second - pending_.stamp) > fusion_stamp_tolerance_) {
+                            o.yolo_refined = true;
+                            o.yolo_class = leaves.box_class[li];
+                            o.yolo_track_id = leaves.box_track_id[li];
+                            ++refined;
+                            ++late_class_only_;
+                            continue;
+                        }
+                    }
                     const Eigen::Matrix3d Rl = lb.rotation.toRotationMatrix().transpose();
                     std::vector<Eigen::Vector3f> inside, rest;
                     if (by_points) {
