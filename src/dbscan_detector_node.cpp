@@ -257,6 +257,20 @@ public:
         // of being dropped, and the fusion no longer waits for leaves (only for the camera clouds). The leaf is a
         // region prior (class + extent), not geometry: a person moves ~15 cm in 100 ms, the overlap still holds.
         fusion_late_leaves_max_age_ = declare_parameter<double>("fusion_late_leaves_max_age", 0.0);
+        // true: a LATE leaf (older than this scan beyond fusion_stamp_tolerance) is moved to the scan instant with the
+        // velocity of the tracker's track it belongs to (the track predicted back to the image stamp, nearest within
+        // fusion_late_leaves_track_radius of the leaf), then refines geometry like an on-time leaf. The robot's own
+        // motion is already out (leaf and scan are in the global frame, each with the pose at its own stamp): only the
+        // object's motion separates them. A leaf with no track nearby keeps the class-only rule. With a camera that is
+        // on time the leaf is never late and nothing changes.
+        fusion_late_leaves_motion_comp_ = declare_parameter<bool>("fusion_late_leaves_motion_comp", false);
+        fusion_late_leaves_track_radius_ = declare_parameter<double>("fusion_late_leaves_track_radius", 1.5);
+        tracks_topic_ = declare_parameter<std::string>("tracks_topic", "/sins/tracker/tracks");
+        // true: a refining leaf (iou association) also absorbs the OTHER unclaimed fused objects that lie inside it
+        // (>= camera_min_points and >= yolo_refine_merge_min_inside of their points within the leaf box + margin)
+        // before the cut — a car the LiDAR sees in pieces (glass, dark paint, ring gaps) that one YOLO mask covers.
+        yolo_refine_merge_fragments_ = declare_parameter<bool>("yolo_refine_merge_fragments", false);
+        yolo_refine_merge_min_inside_ = declare_parameter<double>("yolo_refine_merge_min_inside", 0.5);
         fusion_voxel_near_ = declare_parameter<double>("fusion_voxel_near", 0.05);
         fusion_voxel_far_ = declare_parameter<double>("fusion_voxel_far", 0.03);
         fusion_voxel_split_ = declare_parameter<double>("fusion_voxel_split_range", 6.0);
@@ -300,6 +314,18 @@ public:
         wall_markers_sub_ = create_subscription<visualization_msgs::msg::MarkerArray>(
             "/sins/static_structures/wall_markers", rclcpp::QoS(10),
             [this](const visualization_msgs::msg::MarkerArray::ConstSharedPtr msg) { onWallMarkers(msg); });
+        if (fusion_late_leaves_motion_comp_)
+            tracks_sub_ = create_subscription<vision_msgs::msg::Detection3DArray>(
+                tracks_topic_, rclcpp::QoS(10), [this](const vision_msgs::msg::Detection3DArray::ConstSharedPtr msg) {
+                    tracks_.clear();
+                    tracks_stamp_ = msg->header.stamp.sec + 1e-9 * msg->header.stamp.nanosec;
+                    for (const auto& d : msg->detections) {
+                        if (d.results.empty()) continue;
+                        const auto& v = d.results[0].pose.pose.position;   // tracker_node: results[0] = status, pose = velocity
+                        tracks_.push_back({Eigen::Vector3d(d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.center.position.z),
+                                           Eigen::Vector3d(v.x, v.y, v.z)});
+                    }
+                });
         lidar_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
             lidar_topic_, rclcpp::SensorDataQoS(),
             [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) { onLidar(msg); });
@@ -730,6 +756,16 @@ private:
     double fusion_late_leaves_max_age_{0.0};
     std::vector<double> late_leaf_age_ms_;
     size_t late_class_only_ = 0;   // late leaves that gave their class without a geometric cut (diagnostic)
+    bool fusion_late_leaves_motion_comp_{false};
+    double fusion_late_leaves_track_radius_{1.5};
+    std::string tracks_topic_;
+    bool yolo_refine_merge_fragments_{false};
+    double yolo_refine_merge_min_inside_{0.5};
+    size_t late_compensated_ = 0, fragments_merged_ = 0;   // diagnostics
+    struct TrackState { Eigen::Vector3d pos, vel; };
+    std::vector<TrackState> tracks_;
+    double tracks_stamp_ = 0.0;
+    rclcpp::Subscription<vision_msgs::msg::Detection3DArray>::SharedPtr tracks_sub_;
     std::map<std::string, double> leaf_used_stamp_;   // newest leaf stamp already fused, per "<camera>_yolo" source
     static bool isLeafSource(const std::string& name) { return name.size() > 5 && name.compare(name.size() - 5, 5, "_yolo") == 0; }
     // a leaf joins the pending scan: in stamp tolerance, or (late leaves on) older than the scan within the max age
@@ -823,6 +859,7 @@ private:
         std::string yolo_class;
         int yolo_track_id = -1;    // the refining leaf's own YOLO 2D (ByteTrack) track id, -1 = never refined —
                                     // see onLeaves()'s own comment on why this now survives past this file
+        bool absorbed = false;     // merged into another object by yolo_refine_merge_fragments: dropped before publishing
     };
 
     std::string maskName(unsigned mask) const {
@@ -847,8 +884,9 @@ private:
             }
         if (late_leaf_age_ms_.size() >= 100) {
             std::sort(late_leaf_age_ms_.begin(), late_leaf_age_ms_.end());
-            RCLCPP_INFO(get_logger(), "fused leaves: scan - leaf stamp median %.1f ms, p90 %.1f ms (100 leaf sets); late leaves class-only so far: %zu",
-                        late_leaf_age_ms_[50], late_leaf_age_ms_[90], late_class_only_);
+            RCLCPP_INFO(get_logger(), "fused leaves: scan - leaf stamp median %.1f ms, p90 %.1f ms (100 leaf sets); late leaves class-only so far: %zu, "
+                        "motion-compensated: %zu; fragments merged into a leaf: %zu",
+                        late_leaf_age_ms_[50], late_leaf_age_ms_[90], late_class_only_, late_compensated_, fragments_merged_);
             late_leaf_age_ms_.clear();
         }
         struct Item { unsigned src; const SourceResult* res; size_t idx; };
@@ -1081,6 +1119,40 @@ private:
             // on an object always gets it, independent of which camera or array position it happened to be in.
 #define REFINE_WARN(...) do { if (yolo_refine_log_all_) RCLCPP_WARN(this->get_logger(), __VA_ARGS__); \
     else RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, __VA_ARGS__); } while (0)
+            // Late leaves moved to the scan instant with their track's velocity (fusion_late_leaves_motion_comp):
+            // per "<camera>_yolo" source, 1 = this leaf is geometrically valid for this scan (on time, or compensated).
+            std::map<std::string, std::vector<char>> leaf_geom_ok;
+            for (size_t k = 0; k < camera_names_.size(); ++k) {
+                const std::string src = camera_names_[k] + "_yolo";
+                const auto ly = pending_.cams.find(src);
+                if (ly == pending_.cams.end() || !ly->second) continue;
+                const auto ls = pending_.cam_stamp.find(src);
+                const double age = ls == pending_.cam_stamp.end() ? 0.0 : pending_.stamp - ls->second;
+                auto& ok = leaf_geom_ok[src];
+                const bool late = std::abs(age) > fusion_stamp_tolerance_;
+                ok.assign(ly->second->boxes.size(), late ? 0 : 1);
+                if (!late || !fusion_late_leaves_motion_comp_ || tracks_.empty()) continue;
+                auto comp = std::make_shared<SourceResult>(*ly->second);   // pending_ owns a shared copy: never mutate the original
+                for (size_t li = 0; li < comp->boxes.size(); ++li) {
+                    const Eigen::Vector3d lc = comp->boxes[li].center;
+                    // tracks are at tracks_stamp_; predict each back to the leaf's image stamp before matching
+                    const double t_img = ls->second;
+                    double best_d = fusion_late_leaves_track_radius_;
+                    const TrackState* bt = nullptr;
+                    for (const auto& t : tracks_) {
+                        const Eigen::Vector3d p = t.pos - t.vel * (tracks_stamp_ - t_img);
+                        const double d = (p - lc).head<2>().norm();
+                        if (d < best_d) { best_d = d; bt = &t; }
+                    }
+                    if (!bt) continue;   // unknown motion: class only
+                    const Eigen::Vector3d sh(bt->vel.x() * age, bt->vel.y() * age, 0.0);   // horizontal motion only
+                    comp->boxes[li].center += sh;
+                    for (int pi : comp->box_points[li]) comp->pts[static_cast<size_t>(pi)] += sh.cast<float>();
+                    ok[li] = 1;
+                    ++late_compensated_;
+                }
+                ly->second = comp;
+            }
             struct LeafRef { size_t k, li; double rank_iou; };
             std::vector<LeafRef> leaf_refs;
             for (size_t k = 0; k < camera_names_.size(); ++k) {
@@ -1246,8 +1318,8 @@ private:
                     // (a car at 10 m/s moves 2.5 m in 250 ms), so cutting this scan's object to them would carve it at
                     // the old position. The geometric cut needs leaf and object from the same instant.
                     {
-                        const auto ls = pending_.cam_stamp.find(camera_names_[k] + "_yolo");
-                        if (ls != pending_.cam_stamp.end() && std::abs(ls->second - pending_.stamp) > fusion_stamp_tolerance_) {
+                        const auto& gok = leaf_geom_ok[camera_names_[k] + "_yolo"];
+                        if (li < gok.size() && !gok[li]) {
                             o.yolo_refined = true;
                             o.yolo_class = leaves.box_class[li];
                             o.yolo_track_id = leaves.box_track_id[li];
@@ -1257,26 +1329,46 @@ private:
                         }
                     }
                     const Eigen::Matrix3d Rl = lb.rotation.toRotationMatrix().transpose();
+                    auto inLeaf = [&](const Eigen::Vector3f& q) {
+                        const Eigen::Vector3d d = Rl * (q.cast<double>() - lb.center);
+                        return std::abs(d.x()) <= lb.size.x() * 0.5 + yolo_refine_margin_ && std::abs(d.y()) <= lb.size.y() * 0.5 + yolo_refine_margin_ &&
+                               std::abs(d.z()) <= lb.size.z() * 0.5 + yolo_refine_margin_;
+                    };
+                    // Fragments of the same object inside this leaf join it before the cut (see yolo_refine_merge_fragments).
+                    // Merged into a candidate copy first: if the cut below rejects it, the fragments stay as they were.
+                    std::vector<size_t> absorb;
+                    std::vector<Eigen::Vector3f> merged_pts;
+                    if (yolo_refine_merge_fragments_ && !by_points) {
+                        for (size_t fj = 0; fj < fused.size(); ++fj) {
+                            if (fj == static_cast<size_t>(best) || fused[fj].yolo_refined || fused[fj].absorbed || fused[fj].pts.empty()) continue;
+                            if ((lb.center - fused[fj].box.center).norm() > 0.5 * (lb.size.norm() + fused[fj].box.size.norm()) + yolo_refine_margin_) continue;
+                            size_t n = 0;
+                            for (const auto& q : fused[fj].pts) if (inLeaf(q)) ++n;
+                            if (static_cast<int>(n) >= camera_min_points_ && n >= yolo_refine_merge_min_inside_ * fused[fj].pts.size())
+                                absorb.push_back(fj);
+                        }
+                        if (!absorb.empty()) {
+                            merged_pts = o.pts;
+                            for (size_t fj : absorb) merged_pts.insert(merged_pts.end(), fused[fj].pts.begin(), fused[fj].pts.end());
+                        }
+                    }
+                    const std::vector<Eigen::Vector3f>& opts = absorb.empty() ? o.pts : merged_pts;
                     std::vector<Eigen::Vector3f> inside, rest;
                     if (by_points) {
                         for (size_t q = 0; q < o.pts.size(); ++q) (leaf_member[q] ? inside : rest).push_back(o.pts[q]);
-                    } else for (const auto& q : o.pts) {
-                        const Eigen::Vector3d d = Rl * (q.cast<double>() - lb.center);
-                        (std::abs(d.x()) <= lb.size.x() * 0.5 + yolo_refine_margin_ && std::abs(d.y()) <= lb.size.y() * 0.5 + yolo_refine_margin_ &&
-                         std::abs(d.z()) <= lb.size.z() * 0.5 + yolo_refine_margin_ ? inside : rest).push_back(q);
-                    }
+                    } else for (const auto& q : opts) (inLeaf(q) ? inside : rest).push_back(q);
                     // Absolute floor (camera_min_points_) AND relative retention floor (see
                     // yolo_refine_min_retention_'s own comment) — a cut that keeps few points outright, or
                     // keeps plenty in absolute terms but only a thin sliver of what the fused object actually
                     // was pre-cut, is rejected the same way: skip this tick, never publish a marginal match.
-                    const double retention = o.pts.empty() ? 0.0 :
-                        static_cast<double>(inside.size()) / static_cast<double>(o.pts.size());
+                    const double retention = opts.empty() ? 0.0 :
+                        static_cast<double>(inside.size()) / static_cast<double>(opts.size());
                     // (a nested cut keeps by construction a small part of the larger object: only the absolute floor)
                     if (static_cast<int>(inside.size()) < camera_min_points_ || (!nested && retention < yolo_refine_min_retention_)) {
                         REFINE_WARN(
                             "yolo_refine: skipped low-retention cut (%s leaf %zu class=%s, leaf_pos=[%.2f,%.2f,%.2f] inside=%zu rest=%zu "
                             "of %zu pre-cut, retention=%.0f%% < %.0f%%)", camera_names_[k].c_str(), li,
-                            leaves.box_class[li].c_str(), lb.center.x(), lb.center.y(), lb.center.z(), inside.size(), rest.size(), o.pts.size(),
+                            leaves.box_class[li].c_str(), lb.center.x(), lb.center.y(), lb.center.z(), inside.size(), rest.size(), opts.size(),
                             retention * 100.0, yolo_refine_min_retention_ * 100.0);
                         continue;
                     }
@@ -1291,7 +1383,8 @@ private:
                     if (const auto mh = yolo_class_min_height_.find(leaves.box_class[li]); mh != yolo_class_min_height_.end() &&
                         pbox.size.z() < mh->second)
                         continue;
-                    const unsigned omask = o.mask;
+                    unsigned omask = o.mask;
+                    for (size_t fj : absorb) omask |= fused[fj].mask;
                     // Re-clustered with the LiDAR's own radii/min-points — correct for any object that went
                     // through mergeGroups (Phase 1 mutual-match, split-residual, or Phase 2 nested-absorb, all
                     // three call the SAME lambda): its points are already range-banded voxel-centroided to
@@ -1325,6 +1418,13 @@ private:
                             if (boxOk(cb, cp)) remainder.push_back({cb, std::move(cp), omask, false, ""});
                         }
                     }
+                    for (size_t fj : absorb) {   // the cut was accepted: the fragments are now part of this object
+                        o.mask |= fused[fj].mask;
+                        fused[fj].absorbed = true;
+                        fused[fj].yolo_refined = true;
+                        fused[fj].pts.clear();
+                        ++fragments_merged_;
+                    }
                     o.box = pbox;
                     o.pts = std::move(inside);
                     o.yolo_refined = true;
@@ -1335,6 +1435,8 @@ private:
                 }
             }
         }
+
+        fused.erase(std::remove_if(fused.begin(), fused.end(), [](const Fused& f) { return f.absorbed; }), fused.end());
 
         // ---- publish ----
         vision_msgs::msg::Detection3DArray arr;
