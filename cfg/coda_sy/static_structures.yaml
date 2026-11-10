@@ -1,5 +1,6 @@
 static_structures_node:
   ros__parameters:
+    pose_at_stamp: true  # coda_sy (not in base)
     # -----------------------------------------------------------------------
     # Topics / frames — camera_names/camera_frame_names MUST match
     # cfg/outdoor/preprocessing.yaml's own camera_names (run_detector.launch.py

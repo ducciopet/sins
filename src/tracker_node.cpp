@@ -1275,11 +1275,21 @@ private:
     // border_frac > 0: the centre must also stay that fraction of the image width/height away from every border
     // — see decaySemanticEvidence(): near the border YOLO only sees part of the object and cannot be expected to
     // keep re-confirming it.
-    bool insideAnyCameraFov(const Eigen::Vector3d& pos_global, double border_frac = 0.0, bool fresh_only = false) const {
+    // image_vel (yolo2d_time_compensation): the question is "was it inside the latest YOLO IMAGE" (semantic decay,
+    // fallback eligibility), so the object is moved back to the image stamp with this velocity and seen from the
+    // camera pose at that stamp; nullptr = "is it inside the camera's view now" (current pose and position)
+    bool insideAnyCameraFov(const Eigen::Vector3d& pos_global, double border_frac = 0.0, bool fresh_only = false,
+                            const Eigen::Vector3d* image_vel = nullptr) const {
         for (const auto& cam : cams_) {
             if (!cam.has_info || !cam.tf_ok) continue;
             if (fresh_only && !cam.fresh_2d) continue;
-            const Eigen::Vector3d p = cam.T_cam_global * pos_global;  // p.z() = depth along the optical axis
+            const bool at_image = image_vel && yolo2d_time_compensation_ && cam.latest_2d;
+            Eigen::Vector3d q = pos_global;
+            if (at_image) {
+                const double age = last_stamp_ - stampSec(cam.latest_2d->header.stamp);
+                if (age > 0.0 && age < yolo2d_max_age_) { q.x() -= image_vel->x() * age; q.y() -= image_vel->y() * age; }
+            }
+            const Eigen::Vector3d p = (at_image ? cam.T_cam_global_2d : cam.T_cam_global) * q;  // p.z() = depth along the optical axis
             if (p.z() <= 1e-3) continue;  // behind the camera
             const double u = cam.fx * p.x() / p.z() + cam.cx;
             const double v = cam.fy * p.y() / p.z() + cam.cy;
@@ -1682,8 +1692,9 @@ private:
             tr.yolo_base_mismatch_streak = 0;
             tr.last_yolo_track_id = -1;
             // motion-earned PD: in the reliable FOV YOLO is trusted, so a "mover" it does not recognize loses it
+            const Eigen::Vector3d v_img = tr.kf.vel();
             if (tr.motion_pd && det_class_this_tick.empty() &&
-                insideAnyCameraFov(tr.kf.pos(), decay_fov_border_frac_)) {
+                insideAnyCameraFov(tr.kf.pos(), decay_fov_border_frac_, false, &v_img)) {
                 if (++tr.motion_pd_fov_streak >= max_non_yolo_in_fov_frames_) {
                     tr.motion_pd = false;
                     tr.motion_pd_fov_streak = 0;
@@ -1695,13 +1706,14 @@ private:
             }
             return;
         }
-        const bool inside_fov = insideAnyCameraFov(tr.kf.pos());
+        const Eigen::Vector3d v_img = tr.kf.vel();
+        const bool inside_fov = insideAnyCameraFov(tr.kf.pos(), 0.0, false, &v_img);
         // Absence-of-evidence only counts away from the image border: a person crossing it is only partly
         // visible and routinely not detected for a few ticks, and with a short max_non_yolo_in_fov_frames_ that
         // used to strip the class right as they left the FOV. (A border margin on the CENTRE, not the object's
         // full extent: requiring the whole box inside exempted wrongly-classified static objects that merely sit
         // near the image edge from ever decaying.)
-        const bool in_reliable_fov = insideAnyCameraFov(tr.kf.pos(), decay_fov_border_frac_);
+        const bool in_reliable_fov = insideAnyCameraFov(tr.kf.pos(), decay_fov_border_frac_, false, &v_img);
         const std::string cleared_class = tr.best_class;  // for logging, in case this tick clears it
 
         // (1) inside-FOV: sustained absence of fresh 2D confirmation clears the class outright.
@@ -1716,7 +1728,7 @@ private:
         // track_decay_fresh_frames_only: a tick counts only if a camera that sees the track produced a NEW YOLO
         // frame since the previous tick (a camera slower than the LiDAR, or YOLO with a frame stride, gives YOLO
         // no chance to confirm on the other ticks); otherwise the streak is left as it is
-        const bool yolo_looked = !decay_fresh_only_ || insideAnyCameraFov(tr.kf.pos(), 0.0, true);
+        const bool yolo_looked = !decay_fresh_only_ || insideAnyCameraFov(tr.kf.pos(), 0.0, true, &v_img);
         if (inside_fov && det_class_this_tick.empty() && !yolo_looked) {
             // no new YOLO frame this tick: neither counts nor resets
         } else if (inside_fov && det_class_this_tick.empty()) {
@@ -2380,8 +2392,9 @@ private:
                 // Same reliable image region the semantic decay uses (track_decay_fov_border_frac): at the border
                 // YOLO sees only part of things, so a monocular match there can neither confirm nor (see
                 // decaySemanticEvidence) be un-confirmed — a class given there would never decay.
-                if (!insideAnyCameraFov(Eigen::Vector3d(d.bbox.center.position.x, d.bbox.center.position.y,
-                                                        d.bbox.center.position.z), decay_fov_border_frac_))
+                const Eigen::Vector3d dpos(d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.center.position.z);
+                const Eigen::Vector3d dvel = nearestTrackVelocity(dpos);
+                if (!insideAnyCameraFov(dpos, decay_fov_border_frac_, false, &dvel))
                     continue;
                 for (const auto& c : pixelCandidates(d.bbox.center.position, d.bbox.center.orientation, d.bbox.size, stamp)) {
                     const auto key = std::make_pair(c.cam_idx, c.det2d_idx);

@@ -1,5 +1,7 @@
 preprocessing_node:
   ros__parameters:
+    depth_trigger_early: true  # coda_sy (not in base)
+    yolo_leaf_aligned_path: true  # coda_sy (not in base)
     yolo_leaf_sync_tol: 0.07  # coda_sy (not in base)
     yolo_leaf_sync: true  # coda_sy (not in base)
     camera_pose_at_stamp: true  # coda_sy (not in base)

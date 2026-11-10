@@ -160,6 +160,7 @@
 #include "sins/gseg3d/ground_detection.hpp"
 
 #include <algorithm>
+#include <deque>
 #include <cmath>
 #include <random>
 #include <string>
@@ -176,6 +177,10 @@ public:
         base_frame_ = this->declare_parameter("base_frame", std::string("base_link"));
         global_frame_ = this->declare_parameter("global_frame", std::string("odom"));
         odom_topic_ = this->declare_parameter("odom_topic", std::string("/odometry/filtered"));
+        // true: a LiDAR scan / camera cloud goes into global_frame with the odometry pose AT ITS OWN STAMP
+        // (interpolated in the recent odometry history) instead of the latest pose received; the clouds reach this node
+        // 20-200 ms after their stamp and the robot moves meanwhile (default false = previous behaviour)
+        pose_at_stamp_ = this->declare_parameter("pose_at_stamp", false);
         // false = skip lidar_frame_ -> <name>_refined entirely and place
         // every camera's cloud via the robot's own raw URDF/bag TF chain
         // instead (base_frame_ -> whatever frame it actually arrives in —
@@ -612,6 +617,30 @@ private:
     void onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
         T_global_base_latest_ = odomToGlobalBase(msg);
         has_odom_ = true;
+        const double ts = rclcpp::Time(msg->header.stamp).seconds();
+        if (!pose_hist_.empty() && ts < pose_hist_.back().first - 1.0) pose_hist_.clear();   // clock jumped back (bag loop)
+        if (pose_hist_.empty() || ts > pose_hist_.back().first) pose_hist_.emplace_back(ts, T_global_base_latest_);
+        while (pose_hist_.size() > 200) pose_hist_.pop_front();
+    }
+
+    // T_global_base at time t (pose_at_stamp): interpolation between the two bracketing odometry poses (translation
+    // linear, rotation along the relative axis), extrapolation by at most one pose interval
+    Eigen::Matrix4d poseAt(const builtin_interfaces::msg::Time& stamp) const {
+        const double t = rclcpp::Time(stamp).seconds();
+        if (!pose_at_stamp_ || pose_hist_.size() < 2) return T_global_base_latest_;
+        size_t i = 1;
+        while (i + 1 < pose_hist_.size() && pose_hist_[i].first < t) ++i;
+        const auto& a = pose_hist_[i - 1];
+        const auto& b = pose_hist_[i];
+        const double span = b.first - a.first;
+        if (span < 1e-6) return b.second;
+        const double s = std::clamp((t - a.first) / span, -1.0, 2.0);
+        const Eigen::Matrix3d Ra = a.second.topLeftCorner<3, 3>(), Rb = b.second.topLeftCorner<3, 3>();
+        const Eigen::AngleAxisd d(Ra.transpose() * Rb);
+        Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+        T.topLeftCorner<3, 3>() = Ra * Eigen::AngleAxisd(d.angle() * s, d.axis()).toRotationMatrix();
+        T.topRightCorner<3, 1>() = a.second.topRightCorner<3, 1>() + s * (b.second.topRightCorner<3, 1>() - a.second.topRightCorner<3, 1>());
+        return T;
     }
 
     // =====================================================================
@@ -1169,7 +1198,7 @@ private:
         }
         if (pts.size() < 3) return;
 
-        const Eigen::Isometry3d T_global_lidar = toIsometry(T_global_base_latest_ * T_base_lidar_);
+        const Eigen::Isometry3d T_global_lidar = toIsometry(poseAt(msg->header.stamp) * T_base_lidar_);
         // LiDAR: walls only — see the user's explicit split (cameras handle
         // ground/floor instead, onCameraVoxelized below). The LiDAR's own
         // 360°, consistent-height scan is the better source for vertical
@@ -1233,7 +1262,7 @@ private:
             if (cam.is_native_depth_frame) {
                 T_lidar_frame = Eigen::Matrix4d(T_lidar_frame * cam.T_color_depth);
             }
-            T_global_cam = toIsometry(T_global_base_latest_ * T_base_lidar_ * T_lidar_frame);
+            T_global_cam = toIsometry(poseAt(msg->header.stamp) * T_base_lidar_ * T_lidar_frame);
         } else {
             // Calibration disabled: trust the robot's own raw TF chain
             // directly (base_frame_ -> whichever frame this cloud is
@@ -1245,7 +1274,7 @@ private:
             // existed because T_lidar_camera was calibrated against ONE
             // specific convention (color-optical).
             if (!ensureBaseCameraTf(cam, msg->header.frame_id)) return;
-            T_global_cam = toIsometry(T_global_base_latest_ * cam.T_base_camera);
+            T_global_cam = toIsometry(poseAt(msg->header.stamp) * cam.T_base_camera);
         }
 
         pcl::PointCloud<pcl::PointXYZ> cloud;
@@ -1574,6 +1603,8 @@ private:
     Eigen::Matrix4d T_base_lidar_{Eigen::Matrix4d::Identity()};
     bool has_odom_{false};
     Eigen::Matrix4d T_global_base_latest_{Eigen::Matrix4d::Identity()};
+    bool pose_at_stamp_{false};
+    std::deque<std::pair<double, Eigen::Matrix4d>> pose_hist_;   // (stamp, T_global_base) of the recent odometry
 
     // Floor state lives per-camera now (CameraSource::floor_plane_global/
     // has_floor_estimate — see that struct's own comment), NOT here — LiDAR
