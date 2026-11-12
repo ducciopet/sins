@@ -1,0 +1,40 @@
+yolo_seg_track_detector:
+  ros__parameters:
+    # -----------------------------------------------------------------------
+    # Same node/script as detection.yaml (yolo_seg_track_detector.py is
+    # entirely weights_path/topic-driven, no model-specific code) — this is
+    # a second, independent instance trying Ultralytics YOLO26s-seg instead
+    # of detection.yaml's YOLO11n-seg, run_detector.launch.py's own
+    # enable_yolo11/enable_yolo26 toggles pick which one(s) actually launch
+    # (currently: yolo11 off, yolo26 on — see that file's own comment).
+    # Topic templates below are prefixed 'yolo26_seg_track/', NOT
+    # detection.yaml's 'yolo_seg_track/', so both could run side by side
+    # without colliding if ever both enabled at once.
+    #
+    # No values differ from cfg/indoor/detection_yolo26.yaml yet (matches
+    # detection.yaml's own indoor/outdoor split — see its comment).
+    #
+    # camera_names below is only the standalone-run fallback:
+    # run_detector.launch.py overrides it with preprocessing.yaml's own list,
+    # same forwarding as static_structures_node, so every node agrees on which
+    # cameras exist.
+    # -----------------------------------------------------------------------
+    camera_names: ["front_camera"]  # mdp_street (base: ["front_camera", "back_camera"])
+    image_topic_template: '/{camera}/camera/color/image_raw'
+    detected_image_topic_template: 'yolo26_seg_track/{camera}/detected_image'   # + '/compressed' for the JPEG counterpart
+    detected_masks_topic_template: 'yolo26_seg_track/{camera}/instance_masks'   # 32SC1 label image, pixel value = persistent track id (enable_tracking true below); raw only, see file header
+    detected_detections_topic_template: 'yolo26_seg_track/{camera}/detections'  # vision_msgs/Detection2DArray, id = persistent ByteTrack id (enable_tracking true below)
+    inference_time_topic_template: 'yolo26_seg_track/{camera}/inference_time'   # per-frame inference timing
+
+    # NOT verified to exist/download yet — see cfg/indoor/detection_yolo26.yaml's
+    # own comment on this.
+    weights_path: weights/yolo26s-seg.pt
+    class_names_path: cfg/coco.names
+    target_classes: [person]
+    score_threshold: 0.5     # min confidence required to keep a detection
+    # ByteTrack (model.track()) — see cfg/indoor/detection_yolo26.yaml's own comment on this.
+    enable_tracking: true
+    inference_size: 640      # [px] YOLO input resolution (lower = faster, less accurate at distance)
+    queue_size: 10
+    jpeg_quality: 80          # compressed annotated-image quality (0-100)
+    tracker: bytetrack.yaml  # Ultralytics' built-in ByteTrack config, used since enable_tracking is true

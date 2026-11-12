@@ -271,6 +271,27 @@ public:
         // before the cut — a car the LiDAR sees in pieces (glass, dark paint, ring gaps) that one YOLO mask covers.
         yolo_refine_merge_fragments_ = declare_parameter<bool>("yolo_refine_merge_fragments", false);
         yolo_refine_merge_min_inside_ = declare_parameter<double>("yolo_refine_merge_min_inside", 0.5);
+        // OBJECT-SCALE FRAGMENT MERGE (fragment_merge_gap_ratio, < 0 = off): a second grouping of the final objects, at
+        // the scale of the pieces themselves instead of DBSCAN's fixed eps. Two pieces join when ALL agree: (1) their
+        // horizontal point-to-point gap is at most this ratio x the shorter piece's length (and fragment_merge_max_gap),
+        // so a 2 m piece of a car bridges a window-sized hole while two 0.5 m pedestrians keep DBSCAN's own scale;
+        // (2) their height ranges overlap by at least fragment_merge_min_z_overlap of the lower one; (3) they are in
+        // line: the union is not wider than the wider piece + fragment_merge_width_margin; (4) the union passes the
+        // usual size filter (max_box_extent/volume); (5) YOLO does not disagree: a person piece never joins, two
+        // different classes never join. Greedy, smallest gap first; groups are re-checked as a whole.
+        fragment_merge_gap_ratio_ = declare_parameter<double>("fragment_merge_gap_ratio", -1.0);
+        fragment_merge_max_gap_ = declare_parameter<double>("fragment_merge_max_gap", 1.0);
+        fragment_merge_min_z_overlap_ = declare_parameter<double>("fragment_merge_min_z_overlap", 0.5);
+        fragment_merge_width_margin_ = declare_parameter<double>("fragment_merge_width_margin", 0.3);
+        // OCCLUSION EDGES (occlusion_edge_check, default off): for every published object, how many of its two visible
+        // side edges (as seen from the robot, in azimuth) are occlusion boundaries: another object's points lie just past
+        // that edge (within max(occlusion_edge_min_angle_deg, the LiDAR eps at that range)) and nearer than the edge by
+        // at least occlusion_edge_range_margin. With both edges occluded the object is seen through a gap: its true
+        // extent is unknown and its centre slides with the viewpoint (a wall patch moving by parallax). Sent to the
+        // tracker in results[0].pose.pose.position.x (0, 1, 2), the same stash convention the tracker uses for velocity.
+        occlusion_edge_check_ = declare_parameter<bool>("occlusion_edge_check", false);
+        occlusion_edge_min_angle_deg_ = declare_parameter<double>("occlusion_edge_min_angle_deg", 1.0);
+        occlusion_edge_range_margin_ = declare_parameter<double>("occlusion_edge_range_margin", 0.5);
         fusion_voxel_near_ = declare_parameter<double>("fusion_voxel_near", 0.05);
         fusion_voxel_far_ = declare_parameter<double>("fusion_voxel_far", 0.03);
         fusion_voxel_split_ = declare_parameter<double>("fusion_voxel_split_range", 6.0);
@@ -761,6 +782,13 @@ private:
     std::string tracks_topic_;
     bool yolo_refine_merge_fragments_{false};
     double yolo_refine_merge_min_inside_{0.5};
+    double fragment_merge_gap_ratio_{-1.0}, fragment_merge_max_gap_{1.0}, fragment_merge_min_z_overlap_{0.5}, fragment_merge_width_margin_{0.3};
+    size_t scale_merges_ = 0, scale_merge_ticks_ = 0;
+    bool occlusion_edge_check_{false};
+    double occlusion_edge_min_angle_deg_{1.0}, occlusion_edge_range_margin_{0.5};
+    size_t occ_ticks_ = 0, occ_objects_ = 0, occ_both_ = 0;
+    double occ_ms_ = 0.0;
+    double scale_merge_ms_ = 0.0;
     size_t late_compensated_ = 0, fragments_merged_ = 0;   // diagnostics
     struct TrackState { Eigen::Vector3d pos, vel; };
     std::vector<TrackState> tracks_;
@@ -872,6 +900,143 @@ private:
             else s += "Y" + std::string(1, static_cast<char>(std::toupper(camera_names_[k - camera_names_.size() - 1][0])));
         }
         return s;
+    }
+
+    // see fragment_merge_gap_ratio's own comment
+    void mergeAtObjectScale(std::vector<Fused>& fused) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t n = fused.size();
+        struct Info { double len, wid, z0, z1; Eigen::Vector2d c; std::vector<Eigen::Vector2f> xy; };
+        std::vector<Info> in(n);
+        for (size_t i = 0; i < n; ++i) {
+            const auto& f = fused[i];
+            in[i].len = std::max(f.box.size.x(), f.box.size.y());
+            in[i].wid = std::min(f.box.size.x(), f.box.size.y());
+            in[i].c = f.box.center.head<2>();
+            in[i].z0 = std::numeric_limits<double>::max(); in[i].z1 = std::numeric_limits<double>::lowest();
+            const size_t step = std::max<size_t>(1, f.pts.size() / 150);
+            for (size_t q = 0; q < f.pts.size(); ++q) {
+                in[i].z0 = std::min(in[i].z0, static_cast<double>(f.pts[q].z()));
+                in[i].z1 = std::max(in[i].z1, static_cast<double>(f.pts[q].z()));
+                if (q % step == 0) in[i].xy.push_back(f.pts[q].head<2>());
+            }
+        }
+        auto vetoed = [&](size_t i) { return fused[i].yolo_class == "person"; };
+        struct Pair { double gap; size_t i, j; };
+        std::vector<Pair> pairs;
+        for (size_t i = 0; i < n; ++i) {
+            if (vetoed(i) || fused[i].pts.empty()) continue;
+            for (size_t j = i + 1; j < n; ++j) {
+                if (vetoed(j) || fused[j].pts.empty()) continue;
+                if (!fused[i].yolo_class.empty() && !fused[j].yolo_class.empty() && fused[i].yolo_class != fused[j].yolo_class) continue;
+                const double allow = std::min(fragment_merge_max_gap_, fragment_merge_gap_ratio_ * std::min(in[i].len, in[j].len));
+                if ((in[i].c - in[j].c).norm() > 0.5 * (in[i].len + in[j].len) + allow) continue;
+                const double ov = std::min(in[i].z1, in[j].z1) - std::max(in[i].z0, in[j].z0);
+                if (ov < fragment_merge_min_z_overlap_ * std::min(in[i].z1 - in[i].z0, in[j].z1 - in[j].z0)) continue;
+                double g2 = std::numeric_limits<double>::max();
+                for (const auto& a : in[i].xy)
+                    for (const auto& b : in[j].xy) g2 = std::min(g2, static_cast<double>((a - b).squaredNorm()));
+                const double gap = std::sqrt(g2);
+                if (gap <= allow) pairs.push_back({gap, i, j});
+            }
+        }
+        std::sort(pairs.begin(), pairs.end(), [](const Pair& a, const Pair& b) { return a.gap < b.gap; });
+        std::vector<size_t> root(n);
+        std::iota(root.begin(), root.end(), 0);
+        std::function<size_t(size_t)> find = [&](size_t x) { return root[x] == x ? x : root[x] = find(root[x]); };
+        std::vector<double> gwid(n);
+        for (size_t i = 0; i < n; ++i) gwid[i] = in[i].wid;
+        size_t merged = 0;
+        for (const auto& pr : pairs) {
+            const size_t a = find(pr.i), b = find(pr.j);
+            if (a == b) continue;
+            auto& A = fused[a]; auto& B = fused[b];
+            if (!A.yolo_class.empty() && !B.yolo_class.empty() && A.yolo_class != B.yolo_class) continue;
+            std::vector<Eigen::Vector3f> up = A.pts;
+            up.insert(up.end(), B.pts.begin(), B.pts.end());
+            std::vector<int> idx(up.size());
+            std::iota(idx.begin(), idx.end(), 0);
+            Eigen::Vector3d uc = Eigen::Vector3d::Zero();
+            for (const auto& q : up) uc += q.cast<double>();
+            uc /= static_cast<double>(up.size());
+            const Obb ub = sins::computeObb(up, idx, yaw_only_, yaw_only_ ? localUp(floor_planes_, uc) : Eigen::Vector3d::UnitZ());
+            const double uw = std::min(ub.size.x(), ub.size.y());
+            if (uw > std::max(gwid[a], gwid[b]) + fragment_merge_width_margin_ || !boxOk(ub, up)) continue;
+            A.pts = std::move(up);
+            A.box = ub;
+            A.mask |= B.mask;
+            if (A.yolo_class.empty() && !B.yolo_class.empty()) { A.yolo_class = B.yolo_class; A.yolo_track_id = B.yolo_track_id; A.yolo_refined = true; }
+            B.absorbed = true;
+            B.pts.clear();
+            gwid[a] = std::max(gwid[a], gwid[b]);
+            root[b] = a;
+            ++merged;
+        }
+        if (merged) fused.erase(std::remove_if(fused.begin(), fused.end(), [](const Fused& f) { return f.absorbed; }), fused.end());
+        scale_merges_ += merged;
+        scale_merge_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (++scale_merge_ticks_ % 100 == 0)
+            RCLCPP_INFO(get_logger(), "object-scale fragment merge: %.2f merges/scan, %.3f ms/scan (last 100 scans)",
+                        scale_merges_ / 100.0, scale_merge_ms_ / 100.0);
+        if (scale_merge_ticks_ % 100 == 0) { scale_merges_ = 0; scale_merge_ms_ = 0.0; }
+    }
+
+    // see occlusion_edge_check's own comment; returns, per object, how many of its two side edges are occluded
+    std::vector<int> occludedEdges(const std::vector<Fused>& fused) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t n = fused.size();
+        struct Ang { double ac = 0.0, lo = 0.0, hi = 0.0, r_lo = 0.0, r_hi = 0.0, rmin = 0.0; bool ok = false; };
+        std::vector<Ang> A(n);
+        auto wrap = [](double a) { while (a > M_PI) a -= 2 * M_PI; while (a < -M_PI) a += 2 * M_PI; return a; };
+        for (size_t i = 0; i < n; ++i) {
+            const auto& f = fused[i];
+            if (f.pts.empty()) continue;
+            auto& a = A[i];
+            a.ac = std::atan2(f.box.center.y() - origin_.y(), f.box.center.x() - origin_.x());
+            a.lo = std::numeric_limits<double>::max(); a.hi = std::numeric_limits<double>::lowest();
+            a.rmin = std::numeric_limits<double>::max();
+            for (const auto& q : f.pts) {
+                const double rel = wrap(std::atan2(q.y() - origin_.y(), q.x() - origin_.x()) - a.ac);
+                const double rr = std::hypot(q.x() - origin_.x(), q.y() - origin_.y());
+                a.rmin = std::min(a.rmin, rr);
+                if (rel < a.lo) { a.lo = rel; a.r_lo = rr; }
+                if (rel > a.hi) { a.hi = rel; a.r_hi = rr; }
+            }
+            a.ok = true;
+        }
+        std::vector<int> out(n, 0);
+        for (size_t i = 0; i < n; ++i) {
+            if (!A[i].ok) continue;
+            const auto& a = A[i];
+            const double r = std::max(0.5, a.rmin);
+            const double delta = std::max(occlusion_edge_min_angle_deg_ * M_PI / 180.0, std::atan2(lidar_eps_.at(r), r));
+            bool occ_lo = false, occ_hi = false;
+            for (size_t j = 0; j < n && !(occ_lo && occ_hi); ++j) {
+                if (j == i || !A[j].ok) continue;
+                const auto& b = A[j];
+                // quick reject: j's angular span (relative to i's centre) must touch i's extended span, and j must be nearer
+                const double bc = wrap(b.ac - a.ac);
+                if (bc + b.hi < a.lo - delta || bc + b.lo > a.hi + delta) continue;
+                if (b.rmin > std::max(a.r_lo, a.r_hi) - occlusion_edge_range_margin_) continue;
+                for (const auto& q : fused[j].pts) {
+                    const double rel = wrap(std::atan2(q.y() - origin_.y(), q.x() - origin_.x()) - a.ac);
+                    const double rr = std::hypot(q.x() - origin_.x(), q.y() - origin_.y());
+                    if (!occ_lo && rel < a.lo + 0.5 * delta && rel >= a.lo - delta && rr < a.r_lo - occlusion_edge_range_margin_) occ_lo = true;
+                    if (!occ_hi && rel > a.hi - 0.5 * delta && rel <= a.hi + delta && rr < a.r_hi - occlusion_edge_range_margin_) occ_hi = true;
+                    if (occ_lo && occ_hi) break;
+                }
+            }
+            out[i] = (occ_lo ? 1 : 0) + (occ_hi ? 1 : 0);
+            occ_both_ += out[i] == 2;
+        }
+        occ_objects_ += n;
+        occ_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (++occ_ticks_ % 100 == 0) {
+            RCLCPP_INFO(get_logger(), "occlusion edges: %.1f%% of objects seen through a gap (both edges occluded), %.3f ms/scan (last 100 scans)",
+                        occ_objects_ ? 100.0 * occ_both_ / occ_objects_ : 0.0, occ_ms_ / 100.0);
+            occ_objects_ = occ_both_ = 0; occ_ms_ = 0.0;
+        }
+        return out;
     }
 
     void fuseAndPublish() {
@@ -1437,12 +1602,14 @@ private:
         }
 
         fused.erase(std::remove_if(fused.begin(), fused.end(), [](const Fused& f) { return f.absorbed; }), fused.end());
+        if (fragment_merge_gap_ratio_ > 0.0) mergeAtObjectScale(fused);
 
         // ---- publish ----
         vision_msgs::msg::Detection3DArray arr;
         arr.header = pending_.header;
         arr.header.frame_id = global_frame_;
         std::map<std::string, std::vector<Obb>> by_name;
+        const std::vector<int> occ_edges = occlusion_edge_check_ ? occludedEdges(fused) : std::vector<int>(fused.size(), 0);
         for (size_t i = 0; i < fused.size(); ++i) {
             const Obb& b = fused[i].box;
             vision_msgs::msg::Detection3D d;
@@ -1455,6 +1622,7 @@ private:
             vision_msgs::msg::ObjectHypothesisWithPose h;
             h.hypothesis.class_id = maskName(fused[i].mask);  // which sources contributed, e.g. "L+B"
             h.hypothesis.score = static_cast<double>(fused[i].pts.size());
+            h.pose.pose.position.x = static_cast<double>(occ_edges[i]);   // occluded side edges (occlusion_edge_check)
             d.results.push_back(h);
             if (fused[i].yolo_refined && !fused[i].yolo_class.empty()) {
                 vision_msgs::msg::ObjectHypothesisWithPose y;

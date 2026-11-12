@@ -493,6 +493,9 @@ struct Track {
     // (stamp, object xy, lidar xy) of the matched observations over track_size_gate_travel_window s, and the result
     std::deque<std::array<double, 5>> ego_hist;
     bool large_travel = false;
+    // (stamp, object xy, lidar xy) over track_travel_proof_window s and the result (motion proven by the path itself)
+    std::deque<std::array<double, 5>> proof_hist;
+    bool travel_proof = false;
     // birth position and whether the observed centre has ever left it (track_motion_min_net_footprints)
     double birth_x = 0.0, birth_y = 0.0;
     bool left_birth = false;
@@ -783,6 +786,34 @@ public:
         // straightness test), instead of track_size_gate_travel_min_dist after a full window. Scale-free: a car has
         // moved once it has covered its own length; the centre of a partly seen static object slides by a fraction of it.
         size_travel_body_lengths_ = declare_parameter<double>("track_size_gate_body_lengths", -1.0);
+        // MOTION PROVEN BY THE PATH (track_travel_proof_window [s], < 0 = off). Within the window the observed centre
+        // has travelled, in the world frame AND net of the sensor's own displacement, at least
+        // max(track_travel_proof_min_dist, track_travel_proof_body_lengths x the track's own remembered extent), along a
+        // nearly straight path (net >= track_travel_proof_straightness x path length). A static object cannot do this
+        // (its centre wanders within a fraction of its own size, or slides WITH the robot), so such a track is a mover
+        // whatever the rules for unclassified objects say: it is exempt from the disocclusion block, the motion
+        // consistency/birth-spot rules (C/N), the KF-confidence/point-vote corroboration, the size gate and the
+        // consecutive-tick debounce (it still needs its KF speed above the dynamic bar on the current tick and track_travel_proof_min_coverage of the
+        // window observed).
+        travel_proof_window_ = declare_parameter<double>("track_travel_proof_window", -1.0);
+        travel_proof_body_lengths_ = declare_parameter<double>("track_travel_proof_body_lengths", 1.0);
+        travel_proof_min_dist_ = declare_parameter<double>("track_travel_proof_min_dist", 1.0);
+        travel_proof_straightness_ = declare_parameter<double>("track_travel_proof_straightness", 0.8);
+        // regular advance: at least this fraction of the window's ticks move at a speed within
+        // [ratio, 1/ratio] x the median tick speed (a track hopping between static objects moves in jumps)
+        travel_proof_step_ratio_ = declare_parameter<double>("track_travel_proof_step_ratio", 0.33);
+        travel_proof_regular_frac_ = declare_parameter<double>("track_travel_proof_regular_frac", 0.7);
+        // the window must be observed for at least this fraction of its length, with at least min_obs detections
+        // (a vehicle passing the robot can stay in view for less than the window: lower these to let it prove motion)
+        travel_proof_min_coverage_ = declare_parameter<double>("track_travel_proof_min_coverage", 0.8);
+        travel_proof_min_obs_ = declare_parameter<int>("track_travel_proof_min_obs", 5);
+        // a detection the detector saw through a gap (both side edges occluded, dbscan_detector occlusion_edge_check)
+        // cannot prove motion by its path: its centre slides with the viewpoint
+        travel_proof_occlusion_veto_ = declare_parameter<bool>("track_travel_proof_occlusion_veto", false);
+        // the point-shift veto (track_point_shift_veto) also cancels the proof. Default off: the point test cannot see
+        // motion ALONG a surface (a car passing side-on lands its new points on its own old side: street vehicle
+        // recall 67 -> 51 with this on), the very case the path proof exists for
+        travel_proof_point_veto_ = declare_parameter<bool>("track_travel_proof_point_veto", false);
         // TWO-POINT INITIALISATION (track_two_point_init, default off). A new track has no velocity estimate (its KF
         // starts at v = 0), so the velocity-based checks on its SECOND observation (implied speed against the
         // prediction, velocity direction, natural-motion innovation) only test "is the object slower than the gate":
@@ -819,6 +850,16 @@ public:
         // a wall or a parked car never absorbs a passer-by) are merged into one box, their points pooled. A piece
         // carrying a dynamic class other than the track's own is never absorbed.
         fragment_merge_margin_ = declare_parameter<double>("track_fragment_merge_margin", -1.0);
+        // ORPHAN PIECES (track_absorb_pieces, default false). The association is one-to-one, so when an object reaches
+        // the tracker in two pieces (a car split by its windows or dark paint: 32% of the moving-car scans on the Marina
+        // di Pisa street) the track takes one and the other starts a NEW track (78% of the track births on moving cars).
+        // After the assignment, a detection left unmatched joins the piece a track did take when the two form one rigid
+        // body along the track's heading: union no longer than the track's remembered extent (track_jitter_extent_memory)
+        // plus the partial-view allowance (track_jitter_footprint_scale), and no wider than the wider piece plus
+        // track_absorb_pieces_lateral_margin. Two people side by side (too wide) or walking in file (too long for a
+        // person's extent) stay apart; a piece carrying a dynamic class other than the track's own is never absorbed.
+        absorb_pieces_ = declare_parameter<bool>("track_absorb_pieces", false);
+        absorb_lateral_margin_ = declare_parameter<double>("track_absorb_pieces_lateral_margin", 0.3);
         // DISPLACEMENT-CONFIRMED SPEED (track_motion_consistency_window [s], < 0 = off). The KF speed of a static
         // object seen in part from a moving robot settles at a few tenths of m/s (its centre wanders), enough to pass
         // track_dynamic_speed_thresh; a mover's observed centre actually covers its speed x time. A tick counts as
@@ -1997,6 +2038,82 @@ private:
         msg = out;
         points_by_det.swap(pts);
     }
+    // track_absorb_pieces: see the parameter's own comment. Grows the box of each matched detection by the unmatched
+    // pieces of the same rigid body (msg rewritten as a copy, same indices; points pooled); absorbed[di] = 1 for them.
+    size_t absorbPieces(vision_msgs::msg::Detection3DArray::ConstSharedPtr& msg,
+                        std::map<size_t, std::vector<Eigen::Vector3f>>& points_by_det,
+                        const std::vector<int>& track_ids, const std::vector<int>& track_to_det,
+                        const std::vector<int>& det_to_track, std::vector<char>& absorbed) const {
+        const size_t nd = msg->detections.size();
+        absorbed.assign(nd, 0);
+        // corners of a box projected on a unit axis: [min, max]
+        auto span = [](const vision_msgs::msg::BoundingBox3D& b, double ux, double uy) {
+            const double yaw = yawOf(b.center.orientation), c = std::cos(yaw), s = std::sin(yaw);
+            const double h = 0.5 * std::abs(b.size.x * (c * ux + s * uy)) + 0.5 * std::abs(b.size.y * (-s * ux + c * uy));
+            const double m = b.center.position.x * ux + b.center.position.y * uy;
+            return std::array<double, 2>{m - h, m + h};
+        };
+        std::shared_ptr<vision_msgs::msg::Detection3DArray> out;
+        size_t n_abs = 0;
+        for (size_t ti = 0; ti < track_ids.size(); ++ti) {
+            const int dj = track_to_det[ti];
+            if (dj < 0) continue;
+            const Track& tr = tracks_.at(track_ids[ti]);
+            if (!tr.confirmed) continue;
+            // heading: the KF velocity when the track moves, else its last box's long axis
+            const Eigen::Vector3d v = tr.kf.vel();
+            double hx, hy;
+            if (planarSpeed(v) >= dynamic_speed_thresh_) { const double n = std::hypot(v.x(), v.y()); hx = v.x() / n; hy = v.y() / n; }
+            else {
+                const double yaw = yawOf(tr.orientation) + (tr.size.y > tr.size.x ? M_PI_2 : 0.0);
+                hx = std::cos(yaw); hy = std::sin(yaw);
+            }
+            const double ext = trackExtent(tr);
+            const double max_len = ext + (jitter_fp_scale_ > 0.0 ? jitter_fp_scale_ * 0.5 * ext : 0.0);
+            const auto& base = (out ? out->detections : msg->detections)[static_cast<size_t>(dj)].bbox;
+            auto u = span(base, hx, hy), w = span(base, -hy, hx);
+            double piece_w = w[1] - w[0];
+            std::vector<size_t> take;
+            for (size_t di = 0; di < nd; ++di) {
+                if (det_to_track[di] >= 0 || absorbed[di]) continue;
+                const auto& d = msg->detections[di];
+                const std::string cls = detectionClass(d);
+                if (isDynamicClass(cls) && cls != tr.best_class) continue;
+                const auto du = span(d.bbox, hx, hy), dw = span(d.bbox, -hy, hx);
+                const double len = std::max(u[1], du[1]) - std::min(u[0], du[0]);
+                const double wid = std::max(w[1], dw[1]) - std::min(w[0], dw[0]);
+                if (len > max_len || wid > std::max(piece_w, dw[1] - dw[0]) + absorb_lateral_margin_) continue;
+                u = {std::min(u[0], du[0]), std::max(u[1], du[1])};
+                w = {std::min(w[0], dw[0]), std::max(w[1], dw[1])};
+                piece_w = w[1] - w[0];
+                take.push_back(di);
+            }
+            if (take.empty()) continue;
+            if (!out) out = std::make_shared<vision_msgs::msg::Detection3DArray>(*msg);
+            auto& m = out->detections[static_cast<size_t>(dj)];
+            double z0 = m.bbox.center.position.z - 0.5 * m.bbox.size.z, z1 = m.bbox.center.position.z + 0.5 * m.bbox.size.z;
+            for (size_t di : take) {
+                const auto& d = msg->detections[di].bbox;
+                z0 = std::min(z0, d.center.position.z - 0.5 * d.size.z); z1 = std::max(z1, d.center.position.z + 0.5 * d.size.z);
+                if (m.results.empty() && !msg->detections[di].results.empty()) m.results = msg->detections[di].results;
+                const auto pit = points_by_det.find(di);
+                if (pit != points_by_det.end()) { auto& pv = points_by_det[static_cast<size_t>(dj)]; pv.insert(pv.end(), pit->second.begin(), pit->second.end()); }
+                absorbed[di] = 1;
+                ++n_abs;
+            }
+            // union box in the heading frame
+            const double cu = 0.5 * (u[0] + u[1]), cw = 0.5 * (w[0] + w[1]);
+            m.bbox.center.position.x = cu * hx - cw * hy;
+            m.bbox.center.position.y = cu * hy + cw * hx;
+            m.bbox.center.position.z = 0.5 * (z0 + z1);
+            m.bbox.size.x = u[1] - u[0]; m.bbox.size.y = w[1] - w[0]; m.bbox.size.z = z1 - z0;
+            const double yaw = std::atan2(hy, hx);
+            m.bbox.center.orientation.x = 0.0; m.bbox.center.orientation.y = 0.0;
+            m.bbox.center.orientation.z = std::sin(0.5 * yaw); m.bbox.center.orientation.w = std::cos(0.5 * yaw);
+        }
+        if (out) msg = out;
+        return n_abs;
+    }
     // world-frame half extents of a (yawed) box
     static double boxHalfExtentX(const vision_msgs::msg::BoundingBox3D& b) {
         const double yaw = yawOf(b.center.orientation);
@@ -2342,6 +2459,13 @@ private:
                 ++token;
                 tryAugment(di, candidates_by_det, track_to_det, det_to_track, visited, token);
             }
+        }
+
+        std::vector<char> absorbed(nd, 0);
+        if (absorb_pieces_) {
+            const size_t n = absorbPieces(msg, points_by_det, track_ids, track_to_det, det_to_track, absorbed);
+            absorbed_total_ += n;
+            if (debug_lifecycle_ && n) RCLCPP_INFO(get_logger(), "[lifecycle] absorbed %zu orphan piece(s) t=%.3f (total %zu)", n, stamp, absorbed_total_);
         }
 
         // LiDAR-only semantic fallback — GLOBAL resolution (see pixelCandidates()'s own comment on why: a YOLO
@@ -2724,6 +2848,43 @@ private:
                     tr.large_travel = rel >= min_rel && path > 0.0 && net >= need * path;
                 }
             }
+            // motion proven by the path (track_travel_proof_window): see the parameter's own comment
+            if (travel_proof_window_ > 0.0) {
+                tr.proof_hist.push_back({stamp, d.bbox.center.position.x, d.bbox.center.position.y,
+                                         lidar_origin_.x(), lidar_origin_.y()});
+                while (tr.proof_hist.size() > 1 && tr.proof_hist.front()[0] < stamp - travel_proof_window_) tr.proof_hist.pop_front();
+                tr.travel_proof = false;
+                const size_t n = tr.proof_hist.size();
+                if (n >= static_cast<size_t>(std::max(3, travel_proof_min_obs_)) &&
+                    tr.proof_hist.back()[0] - tr.proof_hist.front()[0] >= travel_proof_min_coverage_ * travel_proof_window_) {
+                    const auto& a = tr.proof_hist.front(); const auto& b = tr.proof_hist.back();
+                    // per-tick speed of the observed centre: a real mover advances on (nearly) every tick, a track
+                    // hopping along a row of static objects or a sliding partial view advances in jumps
+                    std::vector<double> step;
+                    double path = 0.0;
+                    for (size_t k = 1; k < n; ++k) {
+                        const double dt_k = std::max(1e-3, tr.proof_hist[k][0] - tr.proof_hist[k - 1][0]);
+                        const double ds = std::hypot(tr.proof_hist[k][1] - tr.proof_hist[k - 1][1], tr.proof_hist[k][2] - tr.proof_hist[k - 1][2]);
+                        path += ds;
+                        step.push_back(ds / dt_k);
+                    }
+                    std::vector<double> sorted = step;
+                    std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+                    const double med = sorted[sorted.size() / 2];
+                    size_t regular = 0;
+                    for (double v : step) if (v >= travel_proof_step_ratio_ * med && v <= med / travel_proof_step_ratio_) ++regular;
+                    const double net = std::hypot(b[1] - a[1], b[2] - a[2]);
+                    const double rel = lidar_tf_ok_ ? std::hypot((b[1] - a[1]) - (b[3] - a[3]), (b[2] - a[2]) - (b[4] - a[4])) : net;
+                    const double ext = std::max({trackExtent(tr), d.bbox.size.x, d.bbox.size.y});
+                    const double need = std::max(travel_proof_min_dist_, travel_proof_body_lengths_ * ext);
+                    tr.travel_proof = net >= need && rel >= need && path > 0.0 && net >= travel_proof_straightness_ * path &&
+                                      regular >= travel_proof_regular_frac_ * static_cast<double>(step.size());
+                }
+            }
+            // track_travel_proof_point_veto: see the parameter's own comment
+            if (travel_proof_point_veto_ && point_shift_vetoed) tr.travel_proof = false;
+            if (travel_proof_occlusion_veto_ && !d.results.empty() && d.results[0].pose.pose.position.x >= 1.5) tr.travel_proof = false;
+            const bool proven = tr.travel_proof && speed_ok;
             // walker-shaped at walking speed (track_disocclusion_person_exempt): see the parameter's own comment
             const double fp = std::max(d.bbox.size.x, d.bbox.size.y);
             const bool person_like = disocclusion_person_exempt_ &&
@@ -2731,7 +2892,7 @@ private:
                 d.bbox.size.z >= disocclusion_person_height_.first && d.bbox.size.z <= disocclusion_person_height_.second &&
                 fp >= disocclusion_person_footprint_.first && fp <= disocclusion_person_footprint_.second;
             const bool blocked_by_disocclusion = disocclusion && !classified_now && !had_dynamic_history && !seen_before && !travelled && !person_like &&
-                                                 !(point_shift_lifts_disocc_ && point_shift_evidence);
+                                                 !(point_shift_lifts_disocc_ && point_shift_evidence) && !proven;
             if (log_motion_block_ && disocclusion && !classified_now && !had_dynamic_history && !seen_before && travelled)
                 RCLCPP_WARN(get_logger(), "disocc_travel: track #%d pos=[%.2f,%.2f] size=[%.2f,%.2f,%.2f] hits=%d speed=%.2f",
                     tr.id, d.bbox.center.position.x, d.bbox.center.position.y, d.bbox.size.x, d.bbox.size.y, d.bbox.size.z,
@@ -2757,7 +2918,7 @@ private:
                 RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
                     "track #%d: suppressed as a probable disocclusion artifact (background revealed behind another track)",
                     tr.id);
-            tr.dynamic_ticks = (motion_evidence && !blocked_by_disocclusion) ? tr.dynamic_ticks + 1 : 0;
+            tr.dynamic_ticks = ((motion_evidence || proven) && !blocked_by_disocclusion) ? tr.dynamic_ticks + 1 : 0;
             tr.dbg_speed_ok = speed_ok; tr.dbg_kf_conf = kf_vel_confident; tr.dbg_vote = point_vote_evidence;
             tr.dbg_disocc = blocked_by_disocclusion; tr.dbg_vote_ratio = voteRatio; tr.dbg_motion_ev = motion_evidence;
 
@@ -2773,7 +2934,7 @@ private:
 
         tickMark(4);
         for (size_t di = 0; di < nd; ++di) {
-            if (det_used[di]) continue;
+            if (det_used[di] || absorbed[di]) continue;
             const auto& d = msg->detections[di];
             // Duplicate-track suppression (v1: isCloseToExistingTrack — see the constructor's own comment):
             // this "unmatched" detection may really be a second, fragmented candidate for an object that
@@ -2965,7 +3126,8 @@ private:
             for (bool b : tr.dynamic_hist) if (b) ++sticky_count;
             const bool sticky_dynamic = static_cast<int>(tr.dynamic_hist.size()) >= dynamic_sticky_window_ &&
                                         sticky_count >= dynamic_sticky_frames_ && speed >= dynamic_speed_thresh_;
-            bool dynamic = debounced_dynamic || sticky_dynamic;
+            const bool proven = tr.travel_proof && speed >= dynamic_speed_thresh_;   // track_travel_proof_window
+            bool dynamic = debounced_dynamic || sticky_dynamic || proven;
             bool dbg_size_ok = true;
             // Size-sanity gate (v1: constrainSize_ — see the constructor's own comment on why this is scoped to
             // UNCLASSIFIED tracks only): an implausibly-sized moving blob never gets the DYNAMIC label, though
@@ -2974,7 +3136,7 @@ private:
                 const bool sizeOk = std::abs(tr.size.x - dynamic_target_size_.x()) < dynamic_size_tolerance_.x() &&
                                     std::abs(tr.size.y - dynamic_target_size_.y()) < dynamic_size_tolerance_.y() &&
                                     std::abs(tr.size.z - dynamic_target_size_.z()) < dynamic_size_tolerance_.z();
-                if (!sizeOk && !tr.large_travel) dynamic = false;
+                if (!sizeOk && !tr.large_travel && !proven) dynamic = false;
                 dbg_size_ok = sizeOk || tr.large_travel;
             }
             if (coasting) {
@@ -3250,6 +3412,10 @@ private:
     double disocclusion_seen_max_innov_{-1.0};
     int publish_coasting_ticks_{0};
     double size_travel_window_{-1.0}, size_travel_min_dist_{2.0};
+    double travel_proof_window_{-1.0}, travel_proof_body_lengths_{1.0}, travel_proof_min_dist_{1.0}, travel_proof_straightness_{0.8}, travel_proof_step_ratio_{0.33}, travel_proof_regular_frac_{0.7};
+    bool travel_proof_occlusion_veto_{false}, travel_proof_point_veto_{false};
+    double travel_proof_min_coverage_{0.8};
+    int travel_proof_min_obs_{5};
     std::array<double, 3> size_travel_straight_{0.7, 0.05, 0.95};
     double size_travel_body_lengths_{-1.0};
     bool two_point_init_{false};
@@ -3272,6 +3438,9 @@ private:
             tr.extent_hist.pop_front();
     }
     double fragment_merge_margin_{-1.0};
+    bool absorb_pieces_{false};
+    double absorb_lateral_margin_{0.3};
+    size_t absorbed_total_ = 0;
     double motion_cons_window_{-1.0}, motion_cons_ratio_{0.5};
     double inherit_motion_dist_{-1.0}, inherit_motion_age_{1.0};
     std::deque<Grave> graves_;
