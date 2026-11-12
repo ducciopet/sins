@@ -280,6 +280,7 @@
 #include <deque>
 #include <limits>
 #include <map>
+#include <functional>
 #include <memory>
 #include <numeric>
 #include <set>
@@ -496,6 +497,13 @@ struct Track {
     // (stamp, object xy, lidar xy) over track_travel_proof_window s and the result (motion proven by the path itself)
     std::deque<std::array<double, 5>> proof_hist;
     bool travel_proof = false;
+    double proof_ext = 0.0;
+    // motion-coherent group of this tick (track_motion_group_ticks): representative id (-1 = none), whether a member
+    // proved motion by its path, and the representative's union box (centre/size in its own yaw frame)
+    int group_rep = -1;
+    bool group_proven = false;
+    Eigen::Vector3d group_center = Eigen::Vector3d::Zero();
+    geometry_msgs::msg::Vector3 group_size;   // extent of the object whose path history this track inherited (track_travel_proof_inherit_min_dist)
     // birth position and whether the observed centre has ever left it (track_motion_min_net_footprints)
     double birth_x = 0.0, birth_y = 0.0;
     bool left_birth = false;
@@ -506,6 +514,14 @@ struct Track {
 };
 
 // A dynamic track that just died, kept for track_inherit_motion_age s (see the parameter's own comment).
+// the path history of a track that just died, kept for a successor on the same object (track_travel_proof_inherit_min_dist)
+struct ProofGrave {
+    double stamp;
+    std::deque<std::array<double, 5>> hist;
+    Eigen::Vector3d pos, vel;
+    double ext;
+};
+
 struct Grave {
     double stamp;
     Track tr;
@@ -807,6 +823,35 @@ public:
         // (a vehicle passing the robot can stay in view for less than the window: lower these to let it prove motion)
         travel_proof_min_coverage_ = declare_parameter<double>("track_travel_proof_min_coverage", 0.8);
         travel_proof_min_obs_ = declare_parameter<int>("track_travel_proof_min_obs", 5);
+        // PATH HISTORY OF THE OBJECT, NOT OF THE TRACK (-1 = off). A fragmenting object (a car splitting into pieces,
+        // its centroid jumping) loses its track and gets a new one several times per passage (street: passages last 4 s
+        // in median but the track on a vehicle is 1.6 s old in median), and each new track restarted the proof from zero,
+        // so it never filled the window. A newborn track now takes over the path history of the track it replaces: the
+        // nearest track (alive, or died within track_travel_proof_inherit_age s, coasted with its velocity) whose
+        // predicted centre is within max(this, half the donor's extent) of the new detection and that was observed within
+        // the age limit. The proof itself is unchanged (same window, coverage, straightness, distance): it is
+        // measured on the object instead of on one of its fragments.
+        travel_proof_inherit_min_dist_ = declare_parameter<double>("track_travel_proof_inherit_min_dist", -1.0);
+        travel_proof_inherit_age_ = declare_parameter<double>("track_travel_proof_inherit_age", 1.0);
+        // the newborn track also starts from the donor's velocity instead of zero (same object): otherwise its KF speed
+        // needs several ticks to pass the dynamic bar, which the proof also requires
+        travel_proof_inherit_velocity_ = declare_parameter<bool>("track_travel_proof_inherit_velocity", false);
+        // MOTION-COHERENT GROUPS (-1 = off). One object seen in pieces (a car: a 2.7 m body plus a ~1 m end piece, LiDAR
+        // only, no YOLO) gets one track per piece; no single-scan geometric rule tells those pieces from two different
+        // objects that touch (merging them at the detector or by footprint lost pedestrians walking next to walls and
+        // each other). Pieces of one rigid object MOVE TOGETHER: two matched, confirmed tracks both above the dynamic
+        // speed bar, within half their summed extents + track_motion_group_gap of each other, with the same velocity
+        // (difference <= max(track_motion_group_vel_tol, 30% of the speed)) and a constant distance (within
+        // track_motion_group_rigid_tol of the distance when the pair started) for this many consecutive ticks form
+        // a group. A group publishes ONE box (the union of its members, on the largest member's track id), and a path
+        // proof (track_travel_proof_window) of any member counts for the group. A wall never qualifies (below the
+        // speed bar); two pedestrians walking side by side can, then they publish one box only while they stay rigid.
+        motion_group_ticks_ = declare_parameter<int>("track_motion_group_ticks", -1);
+        motion_group_gap_ = declare_parameter<double>("track_motion_group_gap", 0.5);
+        motion_group_vel_tol_ = declare_parameter<double>("track_motion_group_vel_tol", 0.4);
+        motion_group_rigid_tol_ = declare_parameter<double>("track_motion_group_rigid_tol", 0.3);
+        // CODa seq 0 (campus, people walking in pairs): grouping two classified persons cost 9 points of moving recall
+        motion_group_person_veto_ = declare_parameter<bool>("track_motion_group_person_veto", true);
         // a detection the detector saw through a gap (both side edges occluded, dbscan_detector occlusion_edge_check)
         // cannot prove motion by its path: its centre slides with the viewpoint
         travel_proof_occlusion_veto_ = declare_parameter<bool>("track_travel_proof_occlusion_veto", false);
@@ -2149,6 +2194,20 @@ private:
         RCLCPP_INFO(get_logger(), "tick timing (median/max of 50, ms): prep %.1f/%.1f assoc %.1f/%.1f fallback %.1f/%.1f "
                     "matched %.1f/%.1f spawn %.1f/%.1f publish %.1f/%.1f | tracks %.0f",
                     med(0), mx(0), med(1), mx(1), med(2), mx(2), med(3), mx(3), med(4), mx(4), med(5), mx(5), med(6));
+        if (travel_proof_inherit_min_dist_ > 0.0)
+        {
+            RCLCPP_INFO(get_logger(), "path history inherited by %d new tracks in the last 50 ticks", proof_inherits_);
+            const auto& q = proof_diag_;
+            RCLCPP_INFO(get_logger(), "path proof, tracks that inherited a >= 3 m object: evaluated %d | short window %d | distance %d | straightness %d | "
+                        "regularity %d | occlusion veto %d | speed below bar %d | proven %d", q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
+            proof_diag_.fill(0);
+        }
+        if (motion_group_ticks_ > 0) {
+            RCLCPP_INFO(get_logger(), "motion-coherent groups: %.2f/tick, %.1f members each, %.3f ms/tick (last 50 ticks)",
+                        group_count_ / 50.0, group_count_ ? static_cast<double>(group_members_) / group_count_ : 0.0, group_ms_ / 50.0);
+            group_count_ = 0; group_members_ = 0; group_ms_ = 0.0;
+        }
+        proof_inherits_ = 0;
         tick_ms_.clear();
     }
     void onFused(const vision_msgs::msg::Detection3DArray::ConstSharedPtr& in_msg) {
@@ -2855,6 +2914,12 @@ private:
                 while (tr.proof_hist.size() > 1 && tr.proof_hist.front()[0] < stamp - travel_proof_window_) tr.proof_hist.pop_front();
                 tr.travel_proof = false;
                 const size_t n = tr.proof_hist.size();
+                // diagnostics (track_travel_proof_inherit_min_dist on): which test stops the proof of large objects
+                const bool diag = travel_proof_inherit_min_dist_ > 0.0 && tr.proof_ext >= 3.0;
+                if (diag) ++proof_diag_[0];
+                if (diag && !(n >= static_cast<size_t>(std::max(3, travel_proof_min_obs_)) &&
+                              tr.proof_hist.back()[0] - tr.proof_hist.front()[0] >= travel_proof_min_coverage_ * travel_proof_window_))
+                    ++proof_diag_[1];
                 if (n >= static_cast<size_t>(std::max(3, travel_proof_min_obs_)) &&
                     tr.proof_hist.back()[0] - tr.proof_hist.front()[0] >= travel_proof_min_coverage_ * travel_proof_window_) {
                     const auto& a = tr.proof_hist.front(); const auto& b = tr.proof_hist.back();
@@ -2875,16 +2940,26 @@ private:
                     for (double v : step) if (v >= travel_proof_step_ratio_ * med && v <= med / travel_proof_step_ratio_) ++regular;
                     const double net = std::hypot(b[1] - a[1], b[2] - a[2]);
                     const double rel = lidar_tf_ok_ ? std::hypot((b[1] - a[1]) - (b[3] - a[3]), (b[2] - a[2]) - (b[4] - a[4])) : net;
-                    const double ext = std::max({trackExtent(tr), d.bbox.size.x, d.bbox.size.y});
+                    const double ext = std::max({trackExtent(tr), tr.proof_ext, d.bbox.size.x, d.bbox.size.y});
                     const double need = std::max(travel_proof_min_dist_, travel_proof_body_lengths_ * ext);
                     tr.travel_proof = net >= need && rel >= need && path > 0.0 && net >= travel_proof_straightness_ * path &&
                                       regular >= travel_proof_regular_frac_ * static_cast<double>(step.size());
+                    if (diag) {
+                        if (net < need || rel < need) ++proof_diag_[2];
+                        else if (!(path > 0.0 && net >= travel_proof_straightness_ * path)) ++proof_diag_[3];
+                        else if (regular < travel_proof_regular_frac_ * static_cast<double>(step.size())) ++proof_diag_[4];
+                    }
                 }
             }
             // track_travel_proof_point_veto: see the parameter's own comment
             if (travel_proof_point_veto_ && point_shift_vetoed) tr.travel_proof = false;
             if (travel_proof_occlusion_veto_ && !d.results.empty() && d.results[0].pose.pose.position.x >= 1.5) tr.travel_proof = false;
             const bool proven = tr.travel_proof && speed_ok;
+            if (travel_proof_inherit_min_dist_ > 0.0 && tr.proof_ext >= 3.0) {
+                if (travel_proof_occlusion_veto_ && !d.results.empty() && d.results[0].pose.pose.position.x >= 1.5) ++proof_diag_[5];
+                if (tr.travel_proof && !speed_ok) ++proof_diag_[6];
+                if (proven) ++proof_diag_[7];
+            }
             // walker-shaped at walking speed (track_disocclusion_person_exempt): see the parameter's own comment
             const double fp = std::max(d.bbox.size.x, d.bbox.size.y);
             const bool person_like = disocclusion_person_exempt_ &&
@@ -3031,6 +3106,40 @@ private:
                     if (donor) { donor->retired = true; donor->missed_in_a_row = 1 << 20; }
                 }
             }
+            if (travel_proof_window_ > 0.0 && travel_proof_inherit_min_dist_ > 0.0) {   // see the parameter's own comment
+                const auto& c = d.bbox.center.position;
+                double best = std::numeric_limits<double>::max();
+                const std::deque<std::array<double, 5>>* hist = nullptr;
+                double hext = 0.0; int src_id = -1;
+                Eigen::Vector3d hvel = Eigen::Vector3d::Zero();
+                for (size_t ti = 0; ti < nt; ++ti) {
+                    const Track& o = tracks_.at(track_ids[ti]);
+                    if (o.proof_hist.size() < 2 || stamp - o.proof_hist.back()[0] > travel_proof_inherit_age_) continue;
+                    const double oext = std::max(trackExtent(o), o.proof_ext);
+                    const double dist = std::hypot(predicted_pos[ti].x() - c.x, predicted_pos[ti].y() - c.y);
+                    if (dist <= std::max(travel_proof_inherit_min_dist_, 0.5 * oext) && dist < best) {
+                        best = dist; hist = &o.proof_hist; hext = oext; src_id = o.id; hvel = o.kf.vel();
+                    }
+                }
+                for (const auto& g : proof_graves_) {
+                    const double age = stamp - g.stamp;
+                    if (age < 0.0 || age > travel_proof_inherit_age_) continue;
+                    const Eigen::Vector3d pp = g.pos + g.vel * age;
+                    const double dist = std::hypot(pp.x() - c.x, pp.y() - c.y);
+                    if (dist <= std::max(travel_proof_inherit_min_dist_, 0.5 * g.ext) && dist < best) {
+                        best = dist; hist = &g.hist; hext = g.ext; src_id = -2; hvel = g.vel;
+                    }
+                }
+                if (hist) {
+                    tr.proof_hist = *hist;
+                    tr.proof_ext = hext;
+                    if (travel_proof_inherit_velocity_) { tr.kf.x_.segment<3>(3) = hvel; tr.kf.x_.segment<3>(6).setZero(); }
+                    if (debug_lifecycle_)
+                        RCLCPP_INFO(get_logger(), "[lifecycle] #%d inherits the path history of %s (%.2f m, %zu entries)", tr.id,
+                                    src_id >= 0 ? ("#" + std::to_string(src_id)).c_str() : "a dead track", best, hist->size());
+                    ++proof_inherits_;
+                }
+            }
             tracks_.emplace(tr.id, std::move(tr));
         }
 
@@ -3040,6 +3149,9 @@ private:
             const int effective_max_missed = isDynamicClass(it->second.best_class) ? max_missed_classified_ : max_missed_;
             const bool dead = it->second.missed_in_a_row > effective_max_missed ||
                               it->second.stationary_ticks > track_stationary_max_ticks_;
+            if (dead && travel_proof_window_ > 0.0 && travel_proof_inherit_min_dist_ > 0.0 && it->second.proof_hist.size() >= 2)
+                proof_graves_.push_back(ProofGrave{it->second.proof_hist.back()[0], it->second.proof_hist, it->second.kf.pos(),
+                                                   it->second.kf.vel(), std::max(trackExtent(it->second), it->second.proof_ext)});
             if (dead && inherit_motion_dist_ >= 0.0 && it->second.pub_dynamic && !it->second.retired)
                 graves_.push_back(Grave{stamp, it->second});
             if (dead && debug_lifecycle_)
@@ -3057,7 +3169,10 @@ private:
         }
         while (!graves_.empty() && (stamp - graves_.front().stamp > inherit_motion_age_ || stamp < graves_.front().stamp))
             graves_.pop_front();
+        while (!proof_graves_.empty() && (stamp - proof_graves_.front().stamp > travel_proof_inherit_age_ || stamp < proof_graves_.front().stamp))
+            proof_graves_.pop_front();
 
+        if (motion_group_ticks_ > 0) updateMotionGroups(matched_ids);
         tickMark(5);
         publish(msg->header, matched_ids);
         tickMark(6);
@@ -3086,6 +3201,79 @@ private:
             center.z() = 0.5 * (floor_z_ + top);
             size.z = top - floor_z_;
         }
+    }
+
+    // see track_motion_group_ticks' own comment
+    void updateMotionGroups(const std::set<int>& matched_ids) {
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<int> ids;
+        for (auto& [id, tr] : tracks_) {
+            tr.group_rep = -1; tr.group_proven = false;
+            if (tr.confirmed && matched_ids.count(id) && planarSpeed(tr.kf.vel()) >= dynamic_speed_thresh_) ids.push_back(id);
+        }
+        std::map<std::pair<int, int>, PairState> next;
+        std::map<int, int> root;
+        for (int id : ids) root[id] = id;
+        std::function<int(int)> find = [&](int x) { return root[x] == x ? x : root[x] = find(root[x]); };
+        for (size_t a = 0; a < ids.size(); ++a) {
+            const Track& A = tracks_.at(ids[a]);
+            const double ea = trackExtent(A);
+            for (size_t b = a + 1; b < ids.size(); ++b) {
+                const Track& B = tracks_.at(ids[b]);
+                // two tracks YOLO calls persons are two people walking together, never pieces of one object
+                if (motion_group_person_veto_ && A.best_class == "person" && B.best_class == "person") continue;
+                const Eigen::Vector3d pa = A.kf.pos(), pb = B.kf.pos();
+                const double dist = std::hypot(pa.x() - pb.x(), pa.y() - pb.y());
+                if (dist > 0.5 * (ea + trackExtent(B)) + motion_group_gap_) continue;
+                const Eigen::Vector3d va = A.kf.vel(), vb = B.kf.vel();
+                const double dv = std::hypot(va.x() - vb.x(), va.y() - vb.y());
+                if (dv > std::max(motion_group_vel_tol_, 0.3 * std::max(planarSpeed(va), planarSpeed(vb)))) continue;
+                const auto key = std::make_pair(ids[a], ids[b]);
+                const auto it = group_pairs_.find(key);
+                PairState st = it == group_pairs_.end() ? PairState{0, dist} : it->second;
+                if (std::abs(dist - st.d_ref) > motion_group_rigid_tol_) st = PairState{0, dist};
+                ++st.ticks;
+                next[key] = st;
+                if (st.ticks >= motion_group_ticks_) root[find(ids[a])] = find(ids[b]);
+            }
+        }
+        group_pairs_.swap(next);
+        std::map<int, std::vector<int>> groups;
+        for (int id : ids) groups[find(id)].push_back(id);
+        for (auto& [r, mem] : groups) {
+            if (mem.size() < 2) continue;
+            int rep = mem[0];
+            bool proven = false;
+            for (int id : mem) {
+                const Track& t = tracks_.at(id);
+                if (trackExtent(t) > trackExtent(tracks_.at(rep))) rep = id;
+                proven = proven || t.travel_proof;
+            }
+            // union of the members' boxes in the representative's yaw frame
+            Track& R = tracks_.at(rep);
+            const double yaw = yawOf(R.orientation), c = std::cos(yaw), s = std::sin(yaw);
+            const Eigen::Vector3d o = R.kf.pos();
+            double lo[3] = {1e9, 1e9, 1e9}, hi[3] = {-1e9, -1e9, -1e9};
+            for (int id : mem) {
+                const Track& t = tracks_.at(id);
+                const double ty = yawOf(t.orientation), tc = std::cos(ty), ts = std::sin(ty);
+                const Eigen::Vector3d p = t.kf.pos();
+                for (int sx : {-1, 1}) for (int sy : {-1, 1}) {
+                    const double wx = p.x() + tc * sx * 0.5 * t.size.x - ts * sy * 0.5 * t.size.y - o.x();
+                    const double wy = p.y() + ts * sx * 0.5 * t.size.x + tc * sy * 0.5 * t.size.y - o.y();
+                    const double lx = c * wx + s * wy, ly = -s * wx + c * wy;
+                    lo[0] = std::min(lo[0], lx); hi[0] = std::max(hi[0], lx);
+                    lo[1] = std::min(lo[1], ly); hi[1] = std::max(hi[1], ly);
+                }
+                lo[2] = std::min(lo[2], p.z() - 0.5 * t.size.z); hi[2] = std::max(hi[2], p.z() + 0.5 * t.size.z);
+            }
+            const double mx = 0.5 * (lo[0] + hi[0]), my = 0.5 * (lo[1] + hi[1]);
+            R.group_center = Eigen::Vector3d(o.x() + c * mx - s * my, o.y() + s * mx + c * my, 0.5 * (lo[2] + hi[2]));
+            R.group_size.x = hi[0] - lo[0]; R.group_size.y = hi[1] - lo[1]; R.group_size.z = hi[2] - lo[2];
+            for (int id : mem) { Track& t = tracks_.at(id); t.group_rep = rep; t.group_proven = proven; }
+            ++group_count_; group_members_ += static_cast<int>(mem.size());
+        }
+        group_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     }
 
     void publish(const std_msgs::msg::Header& header, const std::set<int>& matched_ids) {
@@ -3126,7 +3314,11 @@ private:
             for (bool b : tr.dynamic_hist) if (b) ++sticky_count;
             const bool sticky_dynamic = static_cast<int>(tr.dynamic_hist.size()) >= dynamic_sticky_window_ &&
                                         sticky_count >= dynamic_sticky_frames_ && speed >= dynamic_speed_thresh_;
-            const bool proven = tr.travel_proof && speed >= dynamic_speed_thresh_;   // track_travel_proof_window
+            if (tr.group_rep >= 0 && tr.group_rep != id) {   // track_motion_group_ticks: published by its group's representative
+                dbgCsv(header, id, tr, true, -1, -1, true, "grouped");
+                continue;
+            }
+            const bool proven = (tr.travel_proof || tr.group_proven) && speed >= dynamic_speed_thresh_;   // track_travel_proof_window
             bool dynamic = debounced_dynamic || sticky_dynamic || proven;
             bool dbg_size_ok = true;
             // Size-sanity gate (v1: constrainSize_ — see the constructor's own comment on why this is scoped to
@@ -3192,7 +3384,8 @@ private:
             d.id = "track_" + std::to_string(id);
             Eigen::Vector3d box_center = tr.kf.pos();
             auto box_size = tr.size;
-            completePersonBox(tr, box_center, box_size);
+            if (tr.group_rep == id) { box_center = tr.group_center; box_size = tr.group_size; }
+            else completePersonBox(tr, box_center, box_size);
             d.bbox.center.position.x = box_center.x();
             d.bbox.center.position.y = box_center.y();
             d.bbox.center.position.z = box_center.z();
@@ -3415,6 +3608,18 @@ private:
     double travel_proof_window_{-1.0}, travel_proof_body_lengths_{1.0}, travel_proof_min_dist_{1.0}, travel_proof_straightness_{0.8}, travel_proof_step_ratio_{0.33}, travel_proof_regular_frac_{0.7};
     bool travel_proof_occlusion_veto_{false}, travel_proof_point_veto_{false};
     double travel_proof_min_coverage_{0.8};
+    double travel_proof_inherit_min_dist_{-1.0}, travel_proof_inherit_age_{1.0};
+    bool travel_proof_inherit_velocity_{false};
+    int motion_group_ticks_{-1};
+    bool motion_group_person_veto_{true};
+    double motion_group_gap_{0.5}, motion_group_vel_tol_{0.4}, motion_group_rigid_tol_{0.3};
+    struct PairState { int ticks; double d_ref; };
+    std::map<std::pair<int, int>, PairState> group_pairs_;
+    int group_count_{0}, group_members_{0};
+    double group_ms_{0.0};
+    std::deque<ProofGrave> proof_graves_;
+    int proof_inherits_{0};
+    std::array<int, 8> proof_diag_{};
     int travel_proof_min_obs_{5};
     std::array<double, 3> size_travel_straight_{0.7, 0.05, 0.95};
     double size_travel_body_lengths_{-1.0};

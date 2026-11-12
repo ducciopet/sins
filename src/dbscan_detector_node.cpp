@@ -283,6 +283,12 @@ public:
         fragment_merge_max_gap_ = declare_parameter<double>("fragment_merge_max_gap", 1.0);
         fragment_merge_min_z_overlap_ = declare_parameter<double>("fragment_merge_min_z_overlap", 0.5);
         fragment_merge_width_margin_ = declare_parameter<double>("fragment_merge_width_margin", 0.3);
+        // ANCHORED MODE (-1 = off): a merge needs an ELONGATED anchor, a piece at least this long and at least twice as
+        // long as wide (a car's body seen side-on: street two-piece vehicles have a 2.7 m main piece and a ~1 m, 0.4 m
+        // tall end piece 1.5 m along its axis, all LiDAR-only, so no YOLO class can join them). The allowed gap scales
+        // with the ANCHOR's length (fragment_merge_gap_ratio x anchor, capped at fragment_merge_max_gap), not with the
+        // smaller piece: two small objects side by side (pedestrians walking together) have no anchor and never merge.
+        fragment_merge_anchor_min_length_ = declare_parameter<double>("fragment_merge_anchor_min_length", -1.0);
         // OCCLUSION EDGES (occlusion_edge_check, default off): for every published object, how many of its two visible
         // side edges (as seen from the robot, in azimuth) are occlusion boundaries: another object's points lie just past
         // that edge (within max(occlusion_edge_min_angle_deg, the LiDAR eps at that range)) and nearer than the edge by
@@ -783,6 +789,7 @@ private:
     bool yolo_refine_merge_fragments_{false};
     double yolo_refine_merge_min_inside_{0.5};
     double fragment_merge_gap_ratio_{-1.0}, fragment_merge_max_gap_{1.0}, fragment_merge_min_z_overlap_{0.5}, fragment_merge_width_margin_{0.3};
+    double fragment_merge_anchor_min_length_{-1.0};
     size_t scale_merges_ = 0, scale_merge_ticks_ = 0;
     bool occlusion_edge_check_{false};
     double occlusion_edge_min_angle_deg_{1.0}, occlusion_edge_range_margin_{0.5};
@@ -929,7 +936,12 @@ private:
             for (size_t j = i + 1; j < n; ++j) {
                 if (vetoed(j) || fused[j].pts.empty()) continue;
                 if (!fused[i].yolo_class.empty() && !fused[j].yolo_class.empty() && fused[i].yolo_class != fused[j].yolo_class) continue;
-                const double allow = std::min(fragment_merge_max_gap_, fragment_merge_gap_ratio_ * std::min(in[i].len, in[j].len));
+                double allow = std::min(fragment_merge_max_gap_, fragment_merge_gap_ratio_ * std::min(in[i].len, in[j].len));
+                if (fragment_merge_anchor_min_length_ > 0.0) {   // see the parameter's own comment
+                    const Info& an = in[i].len >= in[j].len ? in[i] : in[j];
+                    if (an.len < fragment_merge_anchor_min_length_ || an.len < 2.0 * an.wid) continue;
+                    allow = std::min(fragment_merge_max_gap_, fragment_merge_gap_ratio_ * an.len);
+                }
                 if ((in[i].c - in[j].c).norm() > 0.5 * (in[i].len + in[j].len) + allow) continue;
                 const double ov = std::min(in[i].z1, in[j].z1) - std::max(in[i].z0, in[j].z0);
                 if (ov < fragment_merge_min_z_overlap_ * std::min(in[i].z1 - in[i].z0, in[j].z1 - in[j].z0)) continue;
