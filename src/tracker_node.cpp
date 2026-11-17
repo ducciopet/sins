@@ -744,7 +744,13 @@ public:
         // ...or as a VETO (track_point_shift_veto): an unclassified track whose points are, for the most part, still on
         // the surface they described >= 0.5 s ago gets no motion evidence this tick, whatever its KF speed says
         // (ticks without the measure, e.g. a track younger than 0.3 s, are not vetoed)
-        point_shift_veto_ = declare_parameter<bool>("track_point_shift_veto", false);  // [s] ignore a stale clusters cloud (same convention as yolo2d_max_age)
+        point_shift_veto_ = declare_parameter<bool>("track_point_shift_veto", false);
+        // true: the point-to-surface veto applies only to tracks WITHOUT a dynamic class (as it was meant: a blob whose
+        // points mostly sit where its surface was is not moving). An articulated body YOLO recognises as mobile always
+        // has still parts while it advances (the stance leg of a walking person, the lower body of a cyclist): its
+        // fraction of displaced surface is no evidence of standing still. Classified tracks under
+        // track_classified_corroboration_all keep the KF-confidence OR point-vote corroboration. Default false = as before.
+        point_shift_veto_unclassified_only_ = declare_parameter<bool>("track_point_shift_veto_unclassified_only", false);  // [s] ignore a stale clusters cloud (same convention as yolo2d_max_age)
 
         // Disocclusion-artifact detection — NOT from v1 (the user's own design, from a separate discussion, see
         // isDisocclusionArtifact()'s own comment): when a track moves away from a spot, whatever was BEHIND it
@@ -2892,7 +2898,7 @@ private:
             tr.dbg_cons_ok = left_ok || !tr.dbg_left_ok;
             const bool motion_evidence = left_ok &&
                 ((classified_now && !large) ? speed_ok
-                 : (speed_ok && !point_shift_vetoed &&
+                 : (speed_ok && !(point_shift_vetoed && !(point_shift_veto_unclassified_only_ && classified_now)) &&
                     (kf_vel_confident || (point_shift_min_frac_ > 0.0 && !point_shift_veto_ ? point_shift_evidence : point_vote_evidence))));
             // Disocclusion only gates the UNCLASSIFIED (PATH3) case — see this check's own first attempt at
             // scoping (only an actively-moving OTHER track counts at all) and the comment above on why PATH1/
@@ -3755,6 +3761,7 @@ private:
     bool classified_corroboration_all_{false};
     bool lidar_fallback_{true};
     double class_anchor_ttl_{0.0}, class_anchor_radius_{0.6};
+    bool point_shift_veto_unclassified_only_{false};
     bool class_anchor_carrier_{false};
     size_t anchor_carrier_left_{0}, anchor_carrier_blocked_{0};
     int class_anchor_min_votes_{2};
