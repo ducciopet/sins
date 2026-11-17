@@ -1037,6 +1037,13 @@ public:
         class_anchor_ttl_ = declare_parameter<double>("track_class_anchor_ttl", 0.0);
         class_anchor_min_votes_ = declare_parameter<int>("track_class_anchor_min_votes", 2);
         class_anchor_radius_ = declare_parameter<double>("track_class_anchor_radius", 0.6);
+        // Anchor as a stand-in for a LOST class carrier, never a second one (default false = as before). true: the
+        // anchor remembers the track that voted last (its carrier); while the carrier is alive and within
+        // track_class_anchor_radius of the anchor, the anchor gives its class to no other track (one object, one
+        // classified track: pieces next to a standing person or a parked car stay unclassified); when the carrier
+        // leaves the radius the object has gone from that spot and the anchor is erased; only when the carrier dies
+        // on the spot (occlusion, lost fragment) the anchor stays valid for track_class_anchor_ttl, as before.
+        class_anchor_carrier_ = declare_parameter<bool>("track_class_anchor_carrier", false);
         // Height term of the association (see the candidate loop): penalty per metre of difference between the
         // candidate's box top and the track's smoothed top, hard reject beyond track_max_top_diff, active once the
         // track has track_height_min_samples matched ticks; the smoothing is an EMA with this alpha.
@@ -2210,6 +2217,9 @@ private:
                     med(0), mx(0), med(1), mx(1), med(2), mx(2), med(3), mx(3), med(4), mx(4), med(5), mx(5), med(6));
         if (inherit_motion_dist_ >= 0.0)
             RCLCPP_INFO(get_logger(), "inherited motion: %zu heirs, %zu revoked on probation (total)", inherit_count_, inherit_revoked_);
+        if (class_anchor_carrier_)
+            RCLCPP_INFO(get_logger(), "class anchors: %zu, erased as the carrier left %zu, transfers blocked by a live carrier %zu (total)",
+                        class_anchors_.size(), anchor_carrier_left_, anchor_carrier_blocked_);
         if (travel_proof_inherit_min_dist_ > 0.0)
         {
             RCLCPP_INFO(get_logger(), "path history inherited by %d new tracks in the last 50 ticks", proof_inherits_);
@@ -2235,7 +2245,16 @@ private:
         if (dt <= 0.0 || dt > 1.0) dt = 0.1;  // clock jump (bag loop) or first message: fall back to the nominal LiDAR period
         last_stamp_ = stamp;
         class_anchors_.erase(std::remove_if(class_anchors_.begin(), class_anchors_.end(),
-            [&](const ClassAnchor& an) { return stamp - an.last > class_anchor_ttl_; }), class_anchors_.end());
+            [&](const ClassAnchor& an) {
+                if (stamp - an.last > class_anchor_ttl_) return true;
+                if (!class_anchor_carrier_ || an.carrier < 0) return false;
+                // track_class_anchor_carrier: the carrier left the spot -> the object is gone, the memory is void
+                const auto it = tracks_.find(an.carrier);
+                if (it == tracks_.end()) return false;                     // carrier died on the spot: anchor holds
+                const bool left = std::hypot(it->second.last_obs.x - an.x, it->second.last_obs.y - an.y) > class_anchor_radius_;
+                if (left) ++anchor_carrier_left_;
+                return left;
+            }), class_anchors_.end());
         refreshCameraTf();  // once per tick, not per track — see its own comment
         refreshLidarTf();
         std::map<size_t, std::vector<Eigen::Vector3f>> points_by_det = parsePointsByDetection(stamp);
@@ -3729,13 +3748,15 @@ private:
     std::set<int> last_published_ids_;
     int next_id_{1};
     double last_stamp_{-1.0};
-    struct ClassAnchor { double x, y; std::string cls; int votes; double last; };
+    struct ClassAnchor { double x, y; std::string cls; int votes; double last; int carrier = -1; };
     std::vector<ClassAnchor> class_anchors_;
     std::map<std::string, double> class_min_height_;
     double classified_corroboration_min_size_{0.0};
     bool classified_corroboration_all_{false};
     bool lidar_fallback_{true};
     double class_anchor_ttl_{0.0}, class_anchor_radius_{0.6};
+    bool class_anchor_carrier_{false};
+    size_t anchor_carrier_left_{0}, anchor_carrier_blocked_{0};
     int class_anchor_min_votes_{2};
 
     // See track_class_anchor_ttl. Returns the class an active anchor at this spot supports ("" if none).
@@ -3755,10 +3776,17 @@ private:
                 best->last = now;
                 best->x = 0.8 * best->x + 0.2 * tr.last_obs.x;
                 best->y = 0.8 * best->y + 0.2 * tr.last_obs.y;
+                best->carrier = tr.id;
             } else {
-                class_anchors_.push_back({tr.last_obs.x, tr.last_obs.y, cls, 1, now});
+                class_anchors_.push_back({tr.last_obs.x, tr.last_obs.y, cls, 1, now, tr.id});
                 return std::string();
             }
+        }
+        // track_class_anchor_carrier: no second carrier while the first is alive (it is within the radius, or the
+        // anchor would have been erased this tick)
+        if (best && class_anchor_carrier_ && best->carrier >= 0 && best->carrier != tr.id && tracks_.count(best->carrier)) {
+            ++anchor_carrier_blocked_;
+            return std::string();
         }
         if (!best || best->votes < class_anchor_min_votes_ || now - best->last > class_anchor_ttl_) return std::string();
         // the remembered class obeys the same physical minimum height as the camera and LiDAR-only paths

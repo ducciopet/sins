@@ -136,6 +136,9 @@
     other global_frame_ display in rviz without needing a TF lookup.
 */
 #include <array>
+#include <chrono>
+#include <stdexcept>
+#include <unordered_map>
 #include <numeric>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -249,6 +252,19 @@ public:
         // planes became the "floor" and cropped the people. A downward RealSense sees the floor first anyway.
         floor_lowest_below_sensor_ = this->declare_parameter("floor_lowest_below_sensor", false);
         ground_height_ = this->declare_parameter("ground_height", -0.3);
+        // Floor source: "camera" (default, as before: one RANSAC floor plane per camera from its depth cloud) or "lidar":
+        // ONE floor plane from the raw LiDAR scan (floor_lidar_topic, not the wall input, whose floor band is cropped),
+        // only points within floor_lidar_max_range [m] (planar) and below the sensor, so a far slope or a table top
+        // cannot drag the plane; voxel floor_lidar_voxel [m], at most floor_lidar_hz scans/s. Cameras then fit no floor.
+        // Same RANSAC / floor_max_tilt_deg / floor_lowest_below_sensor / EMA as the camera planes; published as the
+        // ns="floor" marker preprocessing_node already reads (ground_model planes). Time per scan logged every 50.
+        floor_source_ = this->declare_parameter("floor_source", std::string("camera"));
+        floor_lidar_topic_ = this->declare_parameter("floor_lidar_topic", std::string("/velodyne_points"));
+        floor_lidar_max_range_ = this->declare_parameter("floor_lidar_max_range", 15.0);
+        floor_lidar_voxel_ = this->declare_parameter("floor_lidar_voxel", 0.2);
+        floor_lidar_hz_ = this->declare_parameter("floor_lidar_hz", 5.0);
+        if (floor_source_ != "camera" && floor_source_ != "lidar")
+            throw std::runtime_error("floor_source must be camera or lidar, got " + floor_source_);
 
         // GSeg3D ground estimate — see the file header's own section and
         // runGseg3d(). Independent of the RANSAC floor above: no EMA, no
@@ -323,6 +339,19 @@ public:
             "camera_names", std::vector<std::string>{"front_camera"});
         for (const auto& name : camera_names_) {
             setupCamera(name);
+        }
+        if (floor_source_ == "lidar") {
+            lidar_floor_ = std::make_shared<CameraSource>();
+            lidar_floor_->name = "lidar";
+            lidar_floor_->floor_plane_global.normal = Eigen::Vector3d::UnitZ();
+            lidar_floor_->floor_plane_global.d = -ground_height_;
+            lidar_floor_->pub_floor_points = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+                "/sins/lidar/floor_points", rclcpp::SensorDataQoS());
+            sub_floor_lidar_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
+                floor_lidar_topic_, rclcpp::SensorDataQoS(),
+                [this](const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) { onFloorLidar(msg); });
+            RCLCPP_INFO(this->get_logger(), "  floor_source lidar: %s, range %.1f m, below the sensor, voxel %.2f m, %.1f Hz",
+                        floor_lidar_topic_.c_str(), floor_lidar_max_range_, floor_lidar_voxel_, floor_lidar_hz_);
         }
 
         RCLCPP_INFO(this->get_logger(), "static_structures_node ready");
@@ -1322,9 +1351,56 @@ private:
         // doesn't consume/move them.
         runGseg3d(pts, T_global_cam, msg->header.stamp, cam.pub_gseg3d_ground, cam.pub_gseg3d_non_ground);
 
-        DetectionResult det = detectFromSensorPoints(std::move(pts), T_global_cam, /*detect_walls=*/false, /*detect_floor=*/true);
+        DetectionResult det = detectFromSensorPoints(std::move(pts), T_global_cam, /*detect_walls=*/false,
+                                                     /*detect_floor=*/floor_source_ == "camera");
         publishGlobalPoints(cam.pub_floor_points, det.floor_points_global, msg->header.stamp);
         mergeDetection(det, /*floor_source=*/&cam);
+    }
+
+    // floor_source "lidar": one floor plane from the raw scan (see the floor_source parameter).
+    void onFloorLidar(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) {
+        if (!has_odom_ || !ensureStaticTf()) return;
+        const double t = rclcpp::Time(msg->header.stamp).seconds();
+        if (floor_lidar_hz_ > 0.0 && t >= lidar_floor_->last_processed_stamp &&
+            t - lidar_floor_->last_processed_stamp < 0.9 / floor_lidar_hz_) return;
+        lidar_floor_->last_processed_stamp = t;
+        const auto t0 = std::chrono::steady_clock::now();
+        pcl::PointCloud<pcl::PointXYZ> cloud;
+        pcl::fromROSMsg(*msg, cloud);
+        const double r2 = floor_lidar_max_range_ * floor_lidar_max_range_, inv = 1.0 / floor_lidar_voxel_;
+        std::unordered_map<int64_t, std::pair<Eigen::Vector3d, int>> vox;
+        for (const auto& pt : cloud.points) {
+            if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+            if (pt.z >= 0.0f || double(pt.x) * pt.x + double(pt.y) * pt.y > r2) continue;   // below the sensor, in range
+            const int64_t key = ((static_cast<int64_t>(std::floor(pt.x * inv)) & 0x1FFFFF) << 42) |
+                                ((static_cast<int64_t>(std::floor(pt.y * inv)) & 0x1FFFFF) << 21) |
+                                (static_cast<int64_t>(std::floor(pt.z * inv)) & 0x1FFFFF);
+            auto& v = vox[key];
+            v.first += Eigen::Vector3d(pt.x, pt.y, pt.z); ++v.second;
+        }
+        std::vector<Eigen::Vector3d> pts;
+        pts.reserve(vox.size());
+        for (const auto& kv : vox) pts.push_back(kv.second.first / kv.second.second);
+        const size_t n_pts = pts.size();
+        if (n_pts >= 3) {
+            const Eigen::Isometry3d T_global_lidar = toIsometry(poseAt(msg->header.stamp) * T_base_lidar_);
+            DetectionResult det = detectFromSensorPoints(std::move(pts), T_global_lidar, /*detect_walls=*/false,
+                                                         /*detect_floor=*/true);
+            publishGlobalPoints(lidar_floor_->pub_floor_points, det.floor_points_global, msg->header.stamp);
+            if (det.floor_found) ++floor_lidar_found_;
+            mergeDetection(det, lidar_floor_.get());
+        }
+        floor_lidar_ms_.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        floor_lidar_pts_ += n_pts;
+        if (floor_lidar_ms_.size() >= 50) {
+            std::vector<double> v = floor_lidar_ms_;
+            std::sort(v.begin(), v.end());
+            RCLCPP_INFO(this->get_logger(), "[floor lidar] %zu scans: %.1f ms median, %.1f ms p90, %.1f ms max, %zu pts/scan, "
+                        "plane found %zu/%zu, height under the robot %.2f m", v.size(), v[v.size() / 2],
+                        v[v.size() * 9 / 10], v.back(), floor_lidar_pts_ / v.size(), floor_lidar_found_, v.size(),
+                        -lidar_floor_->floor_plane_global.d);
+            floor_lidar_ms_.clear(); floor_lidar_pts_ = 0; floor_lidar_found_ = 0;
+        }
     }
 
     // GSeg3D ground estimate — see file header's own section. Independent
@@ -1509,8 +1585,11 @@ private:
             {0.75f, 0.30f, 0.85f},  // purple
         };
         const Eigen::Vector3d robot_xy = T_global_base_latest_.block<3, 1>(0, 3);
-        for (size_t i = 0; i < cameras_.size(); ++i) {
-            const auto& cam = *cameras_[i];
+        std::vector<const CameraSource*> floor_srcs;
+        for (const auto& c : cameras_) floor_srcs.push_back(c.get());
+        if (lidar_floor_) floor_srcs.push_back(lidar_floor_.get());   // floor_source lidar: the one LiDAR plane
+        for (size_t i = 0; i < floor_srcs.size(); ++i) {
+            const auto& cam = *floor_srcs[i];
             if (!cam.has_floor_estimate) continue;  // nothing to show yet for this camera
 
             visualization_msgs::msg::Marker floor;
@@ -1587,6 +1666,13 @@ private:
 
     std::vector<std::string> camera_names_;
     std::vector<std::shared_ptr<CameraSource>> cameras_;
+    // floor_source "lidar" (see the parameter): its floor state, subscription and per-scan timing
+    std::string floor_source_{"camera"}, floor_lidar_topic_;
+    double floor_lidar_max_range_{15.0}, floor_lidar_voxel_{0.2}, floor_lidar_hz_{5.0};
+    std::shared_ptr<CameraSource> lidar_floor_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_floor_lidar_;
+    std::vector<double> floor_lidar_ms_;
+    size_t floor_lidar_pts_{0}, floor_lidar_found_{0};
 
     // ---- ROS I/O ----
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
