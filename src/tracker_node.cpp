@@ -279,6 +279,7 @@
 #include <cstdio>
 #include <deque>
 #include <limits>
+#include <chrono>
 #include <map>
 #include <functional>
 #include <memory>
@@ -472,6 +473,7 @@ struct Track {
     int motion_pd_fov_streak = 0;
     double yolo_x_width = 0.0, yolo_y_width = 0.0;  // high-water mark: largest size seen WITH fresh YOLO evidence
     int yolo_base_mismatch_streak = 0;
+    std::map<int, int> yolo_id_by_cam;   // track_yolo_id_per_camera: last YOLO 2D (ByteTrack) id per camera index
     int last_yolo_track_id = -1;  // the YOLO 2D track id active when yolo_x_width/yolo_y_width were last updated — see decaySemanticEvidence()'s own comment
 
     // Historical continuity ("sticky dynamic") + KF-velocity confidence — v1's PATH 2
@@ -1050,6 +1052,29 @@ public:
         // leaves the radius the object has gone from that spot and the anchor is erased; only when the carrier dies
         // on the spot (occlusion, lost fragment) the anchor stays valid for track_class_anchor_ttl, as before.
         class_anchor_carrier_ = declare_parameter<bool>("track_class_anchor_carrier", false);
+        // YOLO 2D identity per camera (default false = as before: one id compared across cameras). Each camera runs its
+        // own YOLO + ByteTrack, so the same physical object has unrelated ids in two cameras and two objects can share a
+        // number. true: the id arrives with its camera (dbscan_detector_node) and each track keeps the last id PER
+        // camera; "same 2D instance" (the shrink gate's id_known_same) holds if the camera that sees it now gives the id
+        // it gave before; an id from a camera that had not seen the track yet is no evidence of another object.
+        yolo_id_per_camera_ = declare_parameter<bool>("track_yolo_id_per_camera", false);
+        // Class kept while its 2D instance lives (default false). A YOLO instance that ByteTrack keeps following in a
+        // camera IS the object: while that (camera, id) is still in the camera's latest YOLO message with the track's
+        // class and its box contains the track centre's projection, a tick without a fused class is not absence of
+        // evidence (the 3D association failed, the camera did not). Uses track_yolo_id_per_camera's ids.
+        class_keep_while_2d_alive_ = declare_parameter<bool>("track_class_keep_while_2d_alive", false);
+        // Class decay only on real evidence of absence (default false). A camera cannot see what a nearer object hides:
+        // a tick counts toward track_max_non_yolo_in_fov_frames only if, in at least one camera that has the track
+        // centre in its image, no nearer track's projected box covers half of this track's projected box (simple
+        // z-buffer on projected boxes, nearer by more than 0.5 m). Hidden ticks neither count nor reset.
+        class_decay_visible_only_ = declare_parameter<bool>("track_class_decay_visible_only", false);
+        // Vehicle extent prior (default false). The LiDAR sees a vehicle's near faces only, so its box is cut along the
+        // viewing ray and its centre sits too close. For car/truck/bus/motorbike/bicycle tracks the published box is
+        // extended away from the sensor along the ray to the class's typical size (nuScenes means: car 4.6x1.9, truck
+        // 6.9x2.5, bus 11.0x2.9, motorcycle 2.1x0.8, bicycle 1.7x0.6 m): the box axis closer to the ray gets the length
+        // if the other (cross) axis is under the mean of length and width (seen end-on), else the width (seen
+        // side-on); only extends, never shrinks; publication only (association and points untouched).
+        vehicle_extent_prior_ = declare_parameter<bool>("track_vehicle_extent_prior", false);
         // Height term of the association (see the candidate loop): penalty per metre of difference between the
         // candidate's box top and the track's smoothed top, hard reject beyond track_max_top_diff, active once the
         // track has track_height_min_samples matched ticks; the smoothing is an EMA with this alpha.
@@ -1305,6 +1330,10 @@ private:
     // parse as a number upstream in preprocessing_node — see that file's own box/mask branches).
     static int detectionYoloTrackId(const vision_msgs::msg::Detection3D& d) {
         return d.results.size() < 2 ? -1 : static_cast<int>(d.results[1].hypothesis.score);
+    }
+    // the camera (index in camera_names) the id above belongs to: results[1].pose.position.x (dbscan_detector_node)
+    static int detectionYoloCamera(const vision_msgs::msg::Detection3D& d) {
+        return d.results.size() < 2 ? -1 : static_cast<int>(std::lround(d.results[1].pose.pose.position.x));
     }
 
     // results[0] is ALWAYS the provenance mask (e.g. "L", "L+F", "L+B" — which sources contributed points, see
@@ -1803,10 +1832,71 @@ private:
     // A track that may move even when still: semantic evidence of a dynamic class, or motion-earned PD.
     bool potentiallyDynamic(const Track& tr) const { return isDynamicClass(tr.best_class) || tr.motion_pd; }
 
+    // Projected axis-aligned pixel box (u0, v0, u1, v1) and depth of a global-frame box in camera ci; false if any
+    // corner is behind the camera. Orientation ignored: the footprint's larger side is used on both horizontal axes.
+    bool projectBox(size_t ci, const Eigen::Vector3d& c, double sx, double sy, double sz, double b[4], double& depth) const {
+        const auto& cam = cams_[ci];
+        if (!cam.has_info || !cam.tf_ok) return false;
+        const double h = 0.5 * std::max(sx, sy);
+        b[0] = b[1] = 1e9; b[2] = b[3] = -1e9;
+        for (int ix : {-1, 1}) for (int iy : {-1, 1}) for (int iz : {-1, 1}) {
+            const Eigen::Vector3d p = cam.T_cam_global * (c + Eigen::Vector3d(ix * h, iy * h, iz * 0.5 * sz));
+            if (p.z() <= 0.3) return false;
+            const double u = cam.fx * p.x() / p.z() + cam.cx, v = cam.fy * p.y() / p.z() + cam.cy;
+            b[0] = std::min(b[0], u); b[1] = std::min(b[1], v); b[2] = std::max(b[2], u); b[3] = std::max(b[3], v);
+        }
+        depth = (cam.T_cam_global * c).z();
+        return true;
+    }
+
+    // track_class_keep_while_2d_alive: a (camera, id) this track was associated with is still in that camera's latest
+    // YOLO message with the track's class, and its box contains the track centre's projection
+    bool yolo2dInstanceAlive(const Track& tr) const {
+        for (const auto& [ci, yid] : tr.yolo_id_by_cam) {
+            if (ci < 0 || static_cast<size_t>(ci) >= cams_.size()) continue;
+            const auto& cam = cams_[static_cast<size_t>(ci)];
+            if (!cam.has_info || !cam.tf_ok || !cam.latest_2d) continue;
+            if (std::abs(last_stamp_ - stampSec(cam.latest_2d->header.stamp)) > yolo2d_max_age_) continue;
+            const Eigen::Vector3d p = cam.T_cam_global * tr.kf.pos();
+            if (p.z() <= 0.3) continue;
+            const double u = cam.fx * p.x() / p.z() + cam.cx, v = cam.fy * p.y() / p.z() + cam.cy;
+            for (const auto& d2 : cam.latest_2d->detections) {
+                if (d2.id != std::to_string(yid) || d2.results.empty() || d2.results[0].hypothesis.class_id != tr.best_class) continue;
+                if (std::abs(u - d2.bbox.center.position.x) <= 0.5 * d2.bbox.size_x &&
+                    std::abs(v - d2.bbox.center.position.y) <= 0.5 * d2.bbox.size_y) return true;
+            }
+        }
+        return false;
+    }
+
+    // track_class_decay_visible_only: some camera has the track centre in its image and no nearer track hides it
+    bool visibleUnoccluded(int id, const Track& tr) const {
+        for (size_t ci = 0; ci < cams_.size(); ++ci) {
+            double b[4], z;
+            if (!projectBox(ci, tr.kf.pos(), tr.size.x, tr.size.y, tr.size.z, b, z)) continue;
+            const auto& cam = cams_[ci];
+            const double cu = 0.5 * (b[0] + b[2]), cv = 0.5 * (b[1] + b[3]);
+            if (cu < 0 || cu >= cam.width || cv < 0 || cv >= cam.height) continue;
+            const double area = std::max(1e-6, (b[2] - b[0]) * (b[3] - b[1]));
+            bool hidden = false;
+            for (const auto& [oid, o] : tracks_) {
+                if (oid == id || o.missed_in_a_row > 0) continue;
+                double ob[4], oz;
+                if (!projectBox(ci, o.kf.pos(), o.size.x, o.size.y, o.size.z, ob, oz) || oz > z - 0.5) continue;
+                const double ix = std::max(0.0, std::min(b[2], ob[2]) - std::max(b[0], ob[0]));
+                const double iy = std::max(0.0, std::min(b[3], ob[3]) - std::max(b[1], ob[1]));
+                if (ix * iy >= 0.5 * area) { hidden = true; break; }
+            }
+            if (!hidden) return true;
+        }
+        return false;
+    }
+
     void decaySemanticEvidence(int id, Track& tr, const std::string& det_class_this_tick,
                                const vision_msgs::msg::BoundingBox3D::_size_type& det_size, int det_track_id,
-                               bool camera_covered) {
+                               bool camera_covered, int det_cam = -1) {
         if (tr.best_class.empty()) {
+            tr.yolo_id_by_cam.clear();
             tr.non_yolo_in_fov_streak = 0;
             tr.yolo_base_mismatch_streak = 0;
             tr.last_yolo_track_id = -1;
@@ -1848,10 +1938,23 @@ private:
         // frame since the previous tick (a camera slower than the LiDAR, or YOLO with a frame stride, gives YOLO
         // no chance to confirm on the other ticks); otherwise the streak is left as it is
         const bool yolo_looked = !decay_fresh_only_ || insideAnyCameraFov(tr.kf.pos(), 0.0, true, &v_img);
+        bool keep_2d = false, hidden = false;
+        if (inside_fov && det_class_this_tick.empty() && (class_keep_while_2d_alive_ || class_decay_visible_only_)) {
+            const auto t0 = std::chrono::steady_clock::now();
+            keep_2d = class_keep_while_2d_alive_ && yolo2dInstanceAlive(tr);
+            hidden = !keep_2d && class_decay_visible_only_ && !visibleUnoccluded(id, tr);
+            yolo_assoc_ms_.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
         if (inside_fov && det_class_this_tick.empty() && !yolo_looked) {
             // no new YOLO frame this tick: neither counts nor resets
+        } else if (keep_2d) {
+            tr.non_yolo_in_fov_streak = 0;   // track_class_keep_while_2d_alive: the camera still follows the object
+            ++kept_2d_alive_;
+        } else if (hidden) {
+            ++decay_hidden_;                 // track_class_decay_visible_only: hidden, no evidence either way
         } else if (inside_fov && det_class_this_tick.empty()) {
             if (++tr.non_yolo_in_fov_streak >= decay_limit) {
+                tr.yolo_id_by_cam.clear();
                 tr.best_class.clear();
                 tr.class_votes.clear();
                 tr.pending_class.clear();
@@ -1881,6 +1984,16 @@ private:
             tr.yolo_y_width = std::max(tr.yolo_y_width, det_size.y);
             tr.last_yolo_track_id = det_track_id;
         }
+        // track_yolo_id_per_camera: the id compared with the one THIS camera gave before (none yet = no evidence)
+        bool cam_same = false;
+        if (yolo_id_per_camera_ && det_track_id >= 0 && det_cam >= 0) {
+            const auto it = tr.yolo_id_by_cam.find(det_cam);
+            if (it == tr.yolo_id_by_cam.end()) { cam_same = true; ++yolo_cam_new_; }
+            else if (it->second == det_track_id) { cam_same = true; ++yolo_cam_same_; }
+            else ++yolo_cam_changed_;
+        }
+        if ((yolo_id_per_camera_ || class_keep_while_2d_alive_) && !det_class_this_tick.empty() && det_track_id >= 0 && det_cam >= 0)
+            tr.yolo_id_by_cam[det_cam] = det_track_id;
 
         // (2) GROWTH (v1 parity: dynamicDetector.cpp's own "YOLO decay (base size mismatch)" flags growth, never
         // shrinkage — v1's own comment there: "Shrinkage is ignored — it is a physical artifact, not an ID
@@ -1914,7 +2027,8 @@ private:
             const double growth_x = (det_size.x - tr.yolo_x_width) / std::max(tr.yolo_x_width, 0.01);
             const double growth_y = (det_size.y - tr.yolo_y_width) / std::max(tr.yolo_y_width, 0.01);
             const bool grew = growth_x > yolo_base_mismatch_thresh_ || growth_y > yolo_base_mismatch_thresh_;
-            const bool id_known_same = det_track_id >= 0 && prev_track_id >= 0 && det_track_id == prev_track_id;
+            const bool id_known_same = yolo_id_per_camera_ ? cam_same
+                                                           : (det_track_id >= 0 && prev_track_id >= 0 && det_track_id == prev_track_id);
             // Shrink only counts inside the FOV, where YOLO can tell a different object from the same one seen
             // smaller. Outside it nothing can adjudicate, and a close person's LiDAR box shrinks routinely
             // (shadow cone, seen from behind) — that cleared "person" off people standing behind the robot.
@@ -1934,6 +2048,7 @@ private:
                     tr.yolo_base_mismatch_streak = 0;
                     tr.yolo_x_width = tr.yolo_y_width = 0.0;
                     tr.last_yolo_track_id = -1;
+                    tr.yolo_id_by_cam.clear();
                     RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
                         "track #%d: cleared class '%s' — box %s %.0f%%/%.0f%% past its YOLO baseline for %d "
                         "ticks (%s FOV, yolo_id %d->%d)",
@@ -2223,6 +2338,16 @@ private:
                     med(0), mx(0), med(1), mx(1), med(2), mx(2), med(3), mx(3), med(4), mx(4), med(5), mx(5), med(6));
         if (inherit_motion_dist_ >= 0.0)
             RCLCPP_INFO(get_logger(), "inherited motion: %zu heirs, %zu revoked on probation (total)", inherit_count_, inherit_revoked_);
+        if (yolo_id_per_camera_ || class_keep_while_2d_alive_ || class_decay_visible_only_ || vehicle_extent_prior_) {
+            std::vector<double> v = yolo_assoc_ms_;
+            std::sort(v.begin(), v.end());
+            RCLCPP_INFO(get_logger(), "yolo assoc (total): per-camera id new-camera %zu same %zu changed %zu | class kept by a live 2D "
+                        "instance %zu ticks | decay skipped as hidden %zu ticks | vehicle boxes extended %zu | check cost "
+                        "median %.3f ms max %.3f ms over %zu checks (last 50 ticks)", yolo_cam_new_, yolo_cam_same_,
+                        yolo_cam_changed_, kept_2d_alive_, decay_hidden_, veh_extended_, v.empty() ? 0.0 : v[v.size() / 2],
+                        v.empty() ? 0.0 : v.back(), v.size());
+            yolo_assoc_ms_.clear();
+        }
         if (class_anchor_carrier_)
             RCLCPP_INFO(get_logger(), "class anchors: %zu, erased as the carrier left %zu, transfers blocked by a live carrier %zu (total)",
                         class_anchors_.size(), anchor_carrier_left_, anchor_carrier_blocked_);
@@ -2817,7 +2942,7 @@ private:
                 // an active still-object anchor counts as this tick's class evidence (see track_class_anchor_ttl)
                 const std::string anchored = classAnchor(tr, eff_class, had_depth_class, stamp);
                 decaySemanticEvidence(track_ids[ti], tr, eff_class.empty() ? anchored : eff_class, d.bbox.size,
-                                      det_track_id, detectionMask(d) != "L");
+                                      det_track_id, detectionMask(d) != "L", had_depth_class ? detectionYoloCamera(d) : -1);
             }
             matched_ids.insert(track_ids[ti]);
 
@@ -3249,6 +3374,32 @@ private:
     // the sensor ray (measured against motion capture on the lab bags). For a "person" track the published box is
     // therefore stood on the floor (floor_frame's height, the robot's own footprint), given at least
     // track_person_min_height, and its centre pushed track_person_ray_offset further along the LiDAR ray.
+    // track_vehicle_extent_prior (see its parameter): extend a vehicle's published box away from the sensor along the ray
+    void completeVehicleBox(const Track& tr, Eigen::Vector3d& center, vision_msgs::msg::BoundingBox3D::_size_type& size) {
+        if (!vehicle_extent_prior_ || !lidar_tf_ok_) return;
+        static const std::map<std::string, std::pair<double, double>> prior = {
+            {"car", {4.6, 1.9}}, {"truck", {6.9, 2.5}}, {"bus", {11.0, 2.9}}, {"motorbike", {2.1, 0.8}}, {"bicycle", {1.7, 0.6}}};
+        const auto pr = prior.find(tr.best_class);
+        if (pr == prior.end()) return;
+        Eigen::Vector2d ray(center.x() - lidar_origin_.x(), center.y() - lidar_origin_.y());
+        if (ray.norm() < 1e-3) return;
+        ray.normalize();
+        const auto& q = tr.orientation;
+        const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+        const Eigen::Vector2d ax(std::cos(yaw), std::sin(yaw));
+        const bool x_on_ray = std::abs(ax.dot(ray)) >= std::sqrt(0.5);
+        double& s_ray = x_on_ray ? size.x : size.y;
+        const double s_cross = x_on_ray ? size.y : size.x;
+        const double L = pr->second.first, W = pr->second.second;
+        const double target = s_cross < 0.5 * (L + W) ? L : W;   // end-on: depth is the length; side-on: the width
+        if (s_ray >= target) return;
+        const double ext = target - s_ray;
+        center.x() += 0.5 * ext * ray.x();
+        center.y() += 0.5 * ext * ray.y();
+        s_ray = target;
+        ++veh_extended_;
+    }
+
     void completePersonBox(const Track& tr, Eigen::Vector3d& center, vision_msgs::msg::BoundingBox3D::_size_type& size) const {
         if (!person_box_completion_ || tr.best_class != "person") return;
         if (lidar_tf_ok_ && person_ray_offset_ > 0.0) {
@@ -3448,7 +3599,7 @@ private:
             Eigen::Vector3d box_center = tr.kf.pos();
             auto box_size = tr.size;
             if (tr.group_rep == id) { box_center = tr.group_center; box_size = tr.group_size; }
-            else completePersonBox(tr, box_center, box_size);
+            else { completePersonBox(tr, box_center, box_size); completeVehicleBox(tr, box_center, box_size); }
             d.bbox.center.position.x = box_center.x();
             d.bbox.center.position.y = box_center.y();
             d.bbox.center.position.z = box_center.z();
@@ -3763,6 +3914,9 @@ private:
     double class_anchor_ttl_{0.0}, class_anchor_radius_{0.6};
     bool point_shift_veto_unclassified_only_{false};
     bool class_anchor_carrier_{false};
+    bool yolo_id_per_camera_{false}, class_keep_while_2d_alive_{false}, class_decay_visible_only_{false}, vehicle_extent_prior_{false};
+    size_t yolo_cam_new_{0}, yolo_cam_same_{0}, yolo_cam_changed_{0}, kept_2d_alive_{0}, decay_hidden_{0}, veh_extended_{0};
+    std::vector<double> yolo_assoc_ms_;
     size_t anchor_carrier_left_{0}, anchor_carrier_blocked_{0};
     int class_anchor_min_votes_{2};
 

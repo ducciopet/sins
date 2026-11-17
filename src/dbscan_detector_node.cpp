@@ -892,6 +892,8 @@ private:
                                     // empty — "unknown class name", e.g. not in class_names_ — that is different
                                     // from "never refined at all", which is what gates re-use below)
         std::string yolo_class;
+        int yolo_cam = -1;         // index (camera_names order) of the camera whose YOLO gave yolo_track_id: each camera
+                                    // runs its own YOLO + ByteTrack, so an id only means something with its camera
         int yolo_track_id = -1;    // the refining leaf's own YOLO 2D (ByteTrack) track id, -1 = never refined —
                                     // see onLeaves()'s own comment on why this now survives past this file
         bool absorbed = false;     // merged into another object by yolo_refine_merge_fragments: dropped before publishing
@@ -977,7 +979,7 @@ private:
             A.pts = std::move(up);
             A.box = ub;
             A.mask |= B.mask;
-            if (A.yolo_class.empty() && !B.yolo_class.empty()) { A.yolo_class = B.yolo_class; A.yolo_track_id = B.yolo_track_id; A.yolo_refined = true; }
+            if (A.yolo_class.empty() && !B.yolo_class.empty()) { A.yolo_class = B.yolo_class; A.yolo_track_id = B.yolo_track_id; A.yolo_cam = B.yolo_cam; A.yolo_refined = true; }
             B.absorbed = true;
             B.pts.clear();
             gwid[a] = std::max(gwid[a], gwid[b]);
@@ -1499,7 +1501,7 @@ private:
                         if (li < gok.size() && !gok[li]) {
                             o.yolo_refined = true;
                             o.yolo_class = leaves.box_class[li];
-                            o.yolo_track_id = leaves.box_track_id[li];
+                            o.yolo_track_id = leaves.box_track_id[li]; o.yolo_cam = static_cast<int>(k);
                             ++refined;
                             ++late_class_only_;
                             continue;
@@ -1606,7 +1608,7 @@ private:
                     o.pts = std::move(inside);
                     o.yolo_refined = true;
                     o.yolo_class = leaves.box_class[li];
-                    o.yolo_track_id = leaves.box_track_id[li];
+                    o.yolo_track_id = leaves.box_track_id[li]; o.yolo_cam = static_cast<int>(k);
                     for (auto& rr : remainder) fused.push_back(std::move(rr));
                     ++refined;
                 }
@@ -1642,6 +1644,9 @@ private:
                 // Repurposed from a constant 1.0 (unread anywhere) to the refining leaf's own YOLO 2D track id —
                 // see tracker_node.cpp's detectionYoloTrackId()/decaySemanticEvidence() for the consumer.
                 y.hypothesis.score = static_cast<double>(fused[i].yolo_track_id);
+                // ...and the camera that id belongs to (index in camera_names, same order as tracker_node's cameras):
+                // each camera has its own ByteTrack, so tracker_node keys the id by camera (track_yolo_id_per_camera)
+                y.pose.pose.position.x = static_cast<double>(fused[i].yolo_cam);
                 d.results.push_back(y);
             }
             arr.detections.push_back(d);
