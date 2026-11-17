@@ -511,6 +511,8 @@ struct Track {
     int unmatched_streak = 0;
     bool pub_dynamic = false;
     bool retired = false;
+    // inherited motion state on probation (track_inherit_motion_probation): stamp and inherited speed, < 0 = none
+    double inherit_stamp = -1.0, inherit_speed = 0.0;
 };
 
 // A dynamic track that just died, kept for track_inherit_motion_age s (see the parameter's own comment).
@@ -918,6 +920,18 @@ public:
         // donor is retired so the same object is not reported twice.
         inherit_motion_dist_ = declare_parameter<double>("track_inherit_motion_dist", -1.0);
         inherit_motion_age_ = declare_parameter<double>("track_inherit_motion_age", 1.0);
+        // INHERITANCE GUARDS (default off). An heir is published dynamic from its first tick, so a static piece born
+        // near a moving object (a pole, a parked bike or car the person walks past) inherits a motion it does not
+        // have: on the Marina di Pisa street (robot still) inheritance 0.6 m / 0.5 s added +11% person FP with the
+        // same TP (lab 17/11). track_inherit_motion_size_check: the donor must pass the association size gate
+        // against the heir's detection (track_max_size_diff), i.e. be the same body. track_inherit_motion_probation
+        // [s] (< 0 = off): after this time the heir's observed centre must have moved at least
+        // track_inherit_motion_probation_ratio x inherited speed x elapsed time from its birth point, otherwise the
+        // inherited state (dynamic streak/history, speed history, consistency history, velocity) is dropped and the
+        // track has to earn its motion like any new one.
+        inherit_size_check_ = declare_parameter<bool>("track_inherit_motion_size_check", false);
+        inherit_probation_ = declare_parameter<double>("track_inherit_motion_probation", -1.0);
+        inherit_probation_ratio_ = declare_parameter<double>("track_inherit_motion_probation_ratio", 0.5);
         disocclusion_travel_window_ = declare_parameter<double>("track_disocclusion_travel_window", -1.0);
         disocclusion_travel_min_dist_ = declare_parameter<double>("track_disocclusion_travel_min_dist", 1.5);
         disocclusion_travel_min_straightness_ = declare_parameter<double>("track_disocclusion_travel_min_straightness", 0.8);
@@ -2194,6 +2208,8 @@ private:
         RCLCPP_INFO(get_logger(), "tick timing (median/max of 50, ms): prep %.1f/%.1f assoc %.1f/%.1f fallback %.1f/%.1f "
                     "matched %.1f/%.1f spawn %.1f/%.1f publish %.1f/%.1f | tracks %.0f",
                     med(0), mx(0), med(1), mx(1), med(2), mx(2), med(3), mx(3), med(4), mx(4), med(5), mx(5), med(6));
+        if (inherit_motion_dist_ >= 0.0)
+            RCLCPP_INFO(get_logger(), "inherited motion: %zu heirs, %zu revoked on probation (total)", inherit_count_, inherit_revoked_);
         if (travel_proof_inherit_min_dist_ > 0.0)
         {
             RCLCPP_INFO(get_logger(), "path history inherited by %d new tracks in the last 50 ticks", proof_inherits_);
@@ -2697,6 +2713,24 @@ private:
             const bool was_unclassified = tr.best_class.empty();
             tr.last_obs = d.bbox.center.position;
             tr.last_obs_stamp = stamp;
+            if (tr.inherit_stamp > 0.0 && stamp - tr.inherit_stamp >= inherit_probation_) {   // track_inherit_motion_probation
+                const double el = stamp - tr.inherit_stamp;
+                const double moved = std::hypot(tr.last_obs.x - tr.birth_x, tr.last_obs.y - tr.birth_y);
+                if (moved < inherit_probation_ratio_ * tr.inherit_speed * el) {
+                    tr.dynamic_ticks = 0;
+                    tr.dynamic_hist.clear();
+                    tr.speed_hist.clear();
+                    tr.cons_hist.clear();
+                    tr.left_birth = false;
+                    tr.kf.x_.segment<3>(3).setZero();
+                    tr.pub_dynamic = false;
+                    ++inherit_revoked_;
+                    if (debug_lifecycle_)
+                        RCLCPP_INFO(get_logger(), "[lifecycle] #%d inherited motion revoked: moved %.2f m in %.2f s (inherited %.2f m/s)",
+                                    tr.id, moved, el, tr.inherit_speed);
+                }
+                tr.inherit_stamp = -1.0;
+            }
             // LiDAR-only semantic fallback — already resolved GLOBALLY above (one YOLO box -> one detection, not
             // one per track), just look this detection's own result up.
             const bool had_depth_class = !detectionClass(d).empty();
@@ -3078,12 +3112,14 @@ private:
                 for (size_t ti = 0; ti < nt; ++ti) {
                     Track& o = tracks_.at(track_ids[ti]);
                     if (track_to_det[ti] >= 0 || !o.confirmed || !o.pub_dynamic || o.retired) continue;
+                    if (inherit_size_check_ && relSizeDiff(o.size, d.bbox.size, min_size_diff_floor_) >= max_size_diff_) continue;
                     const double dist = std::hypot(predicted_pos[ti].x() - c.x, predicted_pos[ti].y() - c.y);
                     if (dist < best) { best = dist; donor = &o; }
                 }
                 for (const auto& g : graves_) {
                     const double age = stamp - g.stamp;
                     if (age > inherit_motion_age_ || age < 0.0) continue;
+                    if (inherit_size_check_ && relSizeDiff(g.tr.size, d.bbox.size, min_size_diff_floor_) >= max_size_diff_) continue;
                     const Eigen::Vector3d pp = g.tr.kf.pos() + g.tr.kf.vel() * age;
                     const double dist = std::hypot(pp.x() - c.x, pp.y() - c.y);
                     if (dist < best) { best = dist; donor = nullptr; gdonor = &g.tr; }
@@ -3100,6 +3136,8 @@ private:
                     tr.kf.x_.segment<3>(6).setZero();
                     tr.hits = std::max(tr.hits, src->hits);
                     tr.pub_dynamic = true;
+                    if (inherit_probation_ > 0.0) { tr.inherit_stamp = stamp; tr.inherit_speed = planarSpeed(src->kf.vel()); }
+                    ++inherit_count_;
                     if (debug_lifecycle_)
                         RCLCPP_INFO(get_logger(), "[lifecycle] #%d inherits the motion state of %s #%d (%.2f m)", tr.id,
                                     donor ? "unmatched" : "dead", src->id, best);
@@ -3648,6 +3686,9 @@ private:
     size_t absorbed_total_ = 0;
     double motion_cons_window_{-1.0}, motion_cons_ratio_{0.5};
     double inherit_motion_dist_{-1.0}, inherit_motion_age_{1.0};
+    bool inherit_size_check_{false};
+    double inherit_probation_{-1.0}, inherit_probation_ratio_{0.5};
+    size_t inherit_count_{0}, inherit_revoked_{0};
     std::deque<Grave> graves_;
     bool disocclusion_person_exempt_{false};
     std::pair<double, double> disocclusion_person_speed_{0.8, 2.2}, disocclusion_person_height_{1.0, 1.9},
