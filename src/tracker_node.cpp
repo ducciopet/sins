@@ -488,6 +488,17 @@ struct Track {
     // isDisocclusionArtifact()'s own comment) — see pointCloudVoteRatio()'s own comment for prev_points, and
     // the constructor's own comment for pos_hist (a short window of this track's own recent raw observations).
     std::vector<Eigen::Vector3f> prev_points;
+    // track_vehicle_lshape / track_shape_memory (see their parameters): this tick's L-shape fit and the remembered
+    // footprint in the track's own frame (origin carried by the KF velocity, x along the heading)
+    double shape_stamp = -1.0;                 // tick of the latest fit (published only on that tick)
+    int lshape_sides = 0;                      // 2 = corner seen (heading known), 1 = one side, 0 = no fit
+    double lshape_yaw = 0.0;                   // heading of the fitted rectangle's first axis (odom)
+    Eigen::Vector2d lshape_c{0.0, 0.0};        // fitted rectangle centre (odom)
+    double lshape_a = 0.0, lshape_b = 0.0;     // fitted rectangle sides along yaw / across
+    bool mem_ok = false;
+    double mem_yaw = 0.0, mem_stamp = -1.0;
+    Eigen::Vector2d mem_origin{0.0, 0.0};
+    double mem_x0 = 0.0, mem_x1 = 0.0, mem_y0 = 0.0, mem_y1 = 0.0;   // remembered extents in the track frame
     std::deque<Eigen::Vector3d> pos_hist;
     // (stamp, raw xy) of this track's matched observations over the last track_disocclusion_travel_window s
     std::deque<std::pair<double, Eigen::Vector2d>> travel_hist;
@@ -1088,6 +1099,26 @@ public:
         vehicle_extent_heading_cos_ = std::cos(declare_parameter<double>("track_vehicle_extent_heading_max_deg", 30.0) * M_PI / 180.0);
         vehicle_extent_heading_speed_ = declare_parameter<double>("track_vehicle_extent_heading_min_speed", 1.0);
         vehicle_extent_heading_aspect_ = declare_parameter<double>("track_vehicle_extent_heading_min_aspect", 1.5);
+        // L-shape completion (default false). Seen from one point, a vehicle's LiDAR points lie on at most two of its
+        // sides, which meet at the corner nearest the sensor; a rectangle fitted to them in plan view (classic search
+        // of the angle that minimises the variance of the points' distances to the two nearest sides, 1 deg steps)
+        // gives the heading and that corner. For car/truck/bus tracks with >= track_vehicle_lshape_min_points points:
+        // if both sides are seen (each with >= 20% of the points and >= track_vehicle_lshape_min_side long) the
+        // published box takes the fitted heading and grows to the class size (the same nuScenes means as the extent
+        // prior) AWAY from the sensor on each axis, keeping the seen sides fixed; with one side only it acts as the
+        // heading-gated prior (track_vehicle_extent_prior_heading). Never shrinks what was observed; publication only.
+        vehicle_lshape_ = declare_parameter<bool>("track_vehicle_lshape", false);
+        lshape_min_points_ = declare_parameter<int>("track_vehicle_lshape_min_points", 10);
+        lshape_min_side_ = declare_parameter<double>("track_vehicle_lshape_min_side", 0.5);
+        // Shape memory (default false). A vehicle is rigid: what the LiDAR saw of it a moment ago is still there even
+        // if now hidden or cut by the field of view. For car/truck/bus tracks the observed footprint is accumulated in
+        // the track's own frame (origin moved by the KF velocity each tick, x along the heading from the L-shape fit,
+        // else the velocity when >= track_vehicle_extent_heading_min_speed): per side the farthest extent seen, relaxed
+        // toward the current observation by track_shape_memory_forget per tick (slow forgetting of drift); capped at
+        // 1.25 x the class size; reset when the heading turns > 30 deg or the observation leaves the remembered box.
+        // The published box and centre come from the memory (and, with the L-shape on, are completed from it).
+        shape_memory_ = declare_parameter<bool>("track_shape_memory", false);
+        shape_memory_forget_ = declare_parameter<double>("track_shape_memory_forget", 0.02);
         // Height term of the association (see the candidate loop): penalty per metre of difference between the
         // candidate's box top and the track's smoothed top, hard reject beyond track_max_top_diff, active once the
         // track has track_height_min_samples matched ticks; the smoothing is an EMA with this alpha.
@@ -2351,6 +2382,15 @@ private:
                     med(0), mx(0), med(1), mx(1), med(2), mx(2), med(3), mx(3), med(4), mx(4), med(5), mx(5), med(6));
         if (inherit_motion_dist_ >= 0.0)
             RCLCPP_INFO(get_logger(), "inherited motion: %zu heirs, %zu revoked on probation (total)", inherit_count_, inherit_revoked_);
+        if (vehicle_lshape_ || shape_memory_) {
+            std::vector<double> v = shape_ms_;
+            std::sort(v.begin(), v.end());
+            RCLCPP_INFO(get_logger(), "vehicle shape (total): L-shape two sides %zu, one side %zu, no fit %zu, boxes completed %zu | "
+                        "memory used %zu, reset %zu | cost median %.3f ms max %.3f ms over %zu fits (last 50 ticks)",
+                        lshape_two_, lshape_one_, lshape_none_, lshape_completed_, mem_used_, mem_reset_,
+                        v.empty() ? 0.0 : v[v.size() / 2], v.empty() ? 0.0 : v.back(), v.size());
+            shape_ms_.clear();
+        }
         if (yolo_id_per_camera_ || class_keep_while_2d_alive_ || class_decay_visible_only_ || vehicle_extent_prior_ || vehicle_extent_heading_) {
             std::vector<double> v = yolo_assoc_ms_;
             std::sort(v.begin(), v.end());
@@ -2992,6 +3032,7 @@ private:
                 ? pointCloudVoteRatio(pit->second, tr.prev_points, tr.kf.vel(), dt) : -1.0;
             const bool point_vote_evidence = voteRatio >= point_vote_thresh_;  // a negative (abstain) ratio never clears this
             tr.prev_points = pit != points_by_det.end() ? pit->second : std::vector<Eigen::Vector3f>{};
+            if (vehicle_lshape_ || shape_memory_) updateVehicleShape(tr, stamp, dt);
             if (dbg_csv_ || point_shift_min_frac_ > 0.0) pointSurfaceShift(tr, pit != points_by_det.end() ? &pit->second : nullptr, stamp);
             const bool point_shift_evidence = point_shift_min_frac_ > 0.0 && tr.dbg_pm_frac >= point_shift_min_frac_;
             const bool point_shift_vetoed = point_shift_veto_ && point_shift_min_frac_ > 0.0 && tr.dbg_pm_frac >= 0.0 &&
@@ -3389,10 +3430,172 @@ private:
     // therefore stood on the floor (floor_frame's height, the robot's own footprint), given at least
     // track_person_min_height, and its centre pushed track_person_ray_offset further along the LiDAR ray.
     // track_vehicle_extent_prior (see its parameter): extend a vehicle's published box away from the sensor along the ray
-    void completeVehicleBox(const Track& tr, Eigen::Vector3d& center, vision_msgs::msg::BoundingBox3D::_size_type& size) {
-        if ((!vehicle_extent_prior_ && !vehicle_extent_heading_) || !lidar_tf_ok_) return;
+    static const std::map<std::string, std::pair<double, double>>& vehiclePrior() {
         static const std::map<std::string, std::pair<double, double>> prior = {
             {"car", {4.6, 1.9}}, {"truck", {6.9, 2.5}}, {"bus", {11.0, 2.9}}, {"motorbike", {2.1, 0.8}}, {"bicycle", {1.7, 0.6}}};
+        return prior;
+    }
+    static bool isLshapeClass(const std::string& c) { return c == "car" || c == "truck" || c == "bus"; }
+
+    // L-shape fit (track_vehicle_lshape) + footprint memory (track_shape_memory), at the match, on this tick's points
+    void updateVehicleShape(Track& tr, double stamp, double dt) {
+        tr.lshape_sides = 0;
+        if (!isLshapeClass(tr.best_class)) { tr.mem_ok = false; return; }
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<Eigen::Vector2d> P;
+        const size_t step = std::max<size_t>(1, tr.prev_points.size() / 300);
+        for (size_t k = 0; k < tr.prev_points.size(); k += step) P.emplace_back(tr.prev_points[k].x(), tr.prev_points[k].y());
+        if (static_cast<int>(P.size()) >= lshape_min_points_) {
+            // variance criterion: for each angle, each point goes to the nearer of its two nearest rectangle sides
+            double best = std::numeric_limits<double>::max(), best_th = 0.0;
+            std::vector<double> c1(P.size()), c2(P.size());
+            for (int deg = 0; deg < 90; ++deg) {
+                const double th = deg * M_PI / 180.0, ct = std::cos(th), st = std::sin(th);
+                double mn1 = 1e18, mx1 = -1e18, mn2 = 1e18, mx2 = -1e18;
+                for (size_t k = 0; k < P.size(); ++k) {
+                    c1[k] = P[k].x() * ct + P[k].y() * st; c2[k] = -P[k].x() * st + P[k].y() * ct;
+                    mn1 = std::min(mn1, c1[k]); mx1 = std::max(mx1, c1[k]); mn2 = std::min(mn2, c2[k]); mx2 = std::max(mx2, c2[k]);
+                }
+                double s1 = 0, q1 = 0, s2 = 0, q2 = 0; int n1 = 0, n2 = 0;
+                for (size_t k = 0; k < P.size(); ++k) {
+                    const double d1 = std::min(mx1 - c1[k], c1[k] - mn1), d2 = std::min(mx2 - c2[k], c2[k] - mn2);
+                    if (d1 < d2) { s1 += d1; q1 += d1 * d1; ++n1; } else { s2 += d2; q2 += d2 * d2; ++n2; }
+                }
+                const double v = (n1 ? q1 / n1 - (s1 / n1) * (s1 / n1) : 0.0) + (n2 ? q2 / n2 - (s2 / n2) * (s2 / n2) : 0.0);
+                if (v < best) { best = v; best_th = th; }
+            }
+            const double ct = std::cos(best_th), st = std::sin(best_th);
+            double mn1 = 1e18, mx1 = -1e18, mn2 = 1e18, mx2 = -1e18;
+            for (const auto& p : P) {
+                const double a = p.x() * ct + p.y() * st, b = -p.x() * st + p.y() * ct;
+                mn1 = std::min(mn1, a); mx1 = std::max(mx1, a); mn2 = std::min(mn2, b); mx2 = std::max(mx2, b);
+            }
+            // side membership: points within 0.2 m of a side; a side counts if it holds >= 20% of the points and spans
+            // >= lshape_min_side along itself
+            const Eigen::Vector2d o(lidar_origin_.x(), lidar_origin_.y());
+            const double oa = o.x() * ct + o.y() * st, ob = -o.x() * st + o.y() * ct;
+            const double sa = oa < 0.5 * (mn1 + mx1) ? mn1 : mx1;   // side facing the sensor, axis 1 (constant a)
+            const double sb = ob < 0.5 * (mn2 + mx2) ? mn2 : mx2;   // axis 2 (constant b)
+            int na = 0, nb = 0; double a_lo = 1e18, a_hi = -1e18, b_lo = 1e18, b_hi = -1e18;
+            for (const auto& p : P) {
+                const double a = p.x() * ct + p.y() * st, b = -p.x() * st + p.y() * ct;
+                if (std::abs(a - sa) < 0.2) { ++na; b_lo = std::min(b_lo, b); b_hi = std::max(b_hi, b); }
+                if (std::abs(b - sb) < 0.2) { ++nb; a_lo = std::min(a_lo, a); a_hi = std::max(a_hi, a); }
+            }
+            const bool side_a = na >= 0.2 * P.size() && b_hi - b_lo >= lshape_min_side_;   // the side along axis 2
+            const bool side_b = nb >= 0.2 * P.size() && a_hi - a_lo >= lshape_min_side_;   // the side along axis 1
+            tr.lshape_sides = (side_a && side_b) ? 2 : ((side_a || side_b) ? 1 : 0);
+            tr.lshape_yaw = best_th;
+            tr.lshape_a = mx1 - mn1; tr.lshape_b = mx2 - mn2;
+            const double ca = 0.5 * (mn1 + mx1), cb = 0.5 * (mn2 + mx2);
+            tr.lshape_c = Eigen::Vector2d(ca * ct - cb * st, ca * st + cb * ct);
+        }
+        if (tr.lshape_sides == 2) ++lshape_two_; else if (tr.lshape_sides == 1) ++lshape_one_; else ++lshape_none_;
+        tr.shape_stamp = stamp;
+        if (shape_memory_) updateShapeMemory(tr, P, stamp, dt);
+        shape_ms_.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+
+    void updateShapeMemory(Track& tr, const std::vector<Eigen::Vector2d>& P, double stamp, double dt) {
+        if (P.empty()) return;
+        // heading: the L-shape corner (axis 1 or 2, whichever is closer to the remembered/velocity heading), else velocity
+        const Eigen::Vector3d v = tr.kf.vel();
+        double ref = tr.mem_ok ? tr.mem_yaw : (planarSpeed(v) >= vehicle_extent_heading_speed_ ? std::atan2(v.y(), v.x()) : tr.lshape_yaw);
+        double yaw;
+        if (tr.lshape_sides == 2) {
+            // the fitted axes are defined modulo 90 deg: take the one closest to the reference heading
+            yaw = tr.lshape_yaw;
+            for (int k = 1; k < 4; ++k) {
+                const double c = tr.lshape_yaw + k * M_PI / 2;
+                if (std::abs(std::remainder(c - ref, 2 * M_PI)) < std::abs(std::remainder(yaw - ref, 2 * M_PI))) yaw = c;
+            }
+        } else if (planarSpeed(v) >= vehicle_extent_heading_speed_) yaw = std::atan2(v.y(), v.x());
+        else if (tr.mem_ok) yaw = tr.mem_yaw;
+        else return;
+        const auto prior = vehiclePrior().at(tr.best_class);
+        const double capx = 1.25 * prior.first, capy = 1.25 * prior.second;
+        // carry the origin with the object
+        if (tr.mem_ok) tr.mem_origin += Eigen::Vector2d(v.x(), v.y()) * std::max(0.0, stamp - tr.mem_stamp);
+        const auto obs = [&](const Eigen::Vector2d& org, double y, double& x0, double& x1, double& y0, double& y1) {
+            const double c = std::cos(y), s = std::sin(y); x0 = y0 = 1e18; x1 = y1 = -1e18;
+            for (const auto& p : P) {
+                const Eigen::Vector2d d = p - org; const double a = d.x() * c + d.y() * s, b = -d.x() * s + d.y() * c;
+                x0 = std::min(x0, a); x1 = std::max(x1, a); y0 = std::min(y0, b); y1 = std::max(y1, b);
+            }
+        };
+        bool reset = !tr.mem_ok || std::abs(std::remainder(yaw - tr.mem_yaw, 2 * M_PI)) > M_PI / 6;
+        double x0, x1, y0, y1;
+        if (!reset) {
+            obs(tr.mem_origin, tr.mem_yaw, x0, x1, y0, y1);
+            // observation outside the remembered box (no overlap): the memory drifted off the object
+            if (x0 > tr.mem_x1 || x1 < tr.mem_x0 || y0 > tr.mem_y1 || y1 < tr.mem_y0) reset = true;
+        }
+        if (reset) {
+            if (tr.mem_ok) ++mem_reset_;
+            Eigen::Vector2d c(0, 0); for (const auto& p : P) c += p; c /= static_cast<double>(P.size());
+            tr.mem_origin = c; tr.mem_yaw = yaw; tr.mem_ok = true;
+            obs(c, yaw, tr.mem_x0, tr.mem_x1, tr.mem_y0, tr.mem_y1);
+        } else {
+            tr.mem_yaw = yaw;   // small turn: re-express nothing (within 30 deg), keep the extents
+            const double f = shape_memory_forget_;
+            // farthest extent seen per side, relaxed slowly toward the observation; never inside the observation
+            tr.mem_x0 = std::min(x0, tr.mem_x0 + f * (x0 - tr.mem_x0)); tr.mem_x1 = std::max(x1, tr.mem_x1 + f * (x1 - tr.mem_x1));
+            tr.mem_y0 = std::min(y0, tr.mem_y0 + f * (y0 - tr.mem_y0)); tr.mem_y1 = std::max(y1, tr.mem_y1 + f * (y1 - tr.mem_y1));
+            // cap at 1.25 x the class size, trimming the side farther from the current observation
+            if (tr.mem_x1 - tr.mem_x0 > capx) { if (tr.mem_x1 - x1 > x0 - tr.mem_x0) tr.mem_x1 = tr.mem_x0 + capx; else tr.mem_x0 = tr.mem_x1 - capx; }
+            if (tr.mem_y1 - tr.mem_y0 > capy) { if (tr.mem_y1 - y1 > y0 - tr.mem_y0) tr.mem_y1 = tr.mem_y0 + capy; else tr.mem_y0 = tr.mem_y1 - capy; }
+        }
+        tr.mem_stamp = stamp;
+        (void)dt;
+    }
+
+    // Box completion of a vehicle from its fitted / remembered rectangle (yaw, centre, sides a along yaw, b across):
+    // grows each axis to the class size away from the sensor (the side facing the sensor stays fixed); never shrinks
+    void completeRect(const std::string& cls, double yaw, Eigen::Vector2d c, double a, double b, bool grow,
+                      Eigen::Vector3d& center, vision_msgs::msg::BoundingBox3D::_size_type& size,
+                      geometry_msgs::msg::Quaternion& orient) {
+        const auto prior = vehiclePrior().at(cls);
+        const double ct = std::cos(yaw), st = std::sin(yaw);
+        if (grow) {
+            // the longer side is the length
+            const bool a_len = a >= b;
+            const double ta = std::max(a, a_len ? prior.first : prior.second), tb = std::max(b, a_len ? prior.second : prior.first);
+            const Eigen::Vector2d o(lidar_origin_.x() - c.x(), lidar_origin_.y() - c.y());
+            const double oa = o.x() * ct + o.y() * st, ob = -o.x() * st + o.y() * ct;
+            // centre moves away from the sensor by half the growth on each axis (sensor beside the span: symmetric)
+            double da = 0.0, db = 0.0;
+            if (std::abs(oa) > 0.5 * a) da = (oa > 0 ? -1.0 : 1.0) * 0.5 * (ta - a);
+            if (std::abs(ob) > 0.5 * b) db = (ob > 0 ? -1.0 : 1.0) * 0.5 * (tb - b);
+            if (ta > a || tb > b) ++lshape_completed_;
+            c += Eigen::Vector2d(da * ct - db * st, da * st + db * ct);
+            a = ta; b = tb;
+        }
+        center.x() = c.x(); center.y() = c.y();
+        size.x = a; size.y = b;
+        orient.x = 0.0; orient.y = 0.0; orient.z = std::sin(0.5 * yaw); orient.w = std::cos(0.5 * yaw);
+    }
+
+    void completeVehicleBox(const Track& tr, Eigen::Vector3d& center, vision_msgs::msg::BoundingBox3D::_size_type& size,
+                            geometry_msgs::msg::Quaternion& orient) {
+        if ((vehicle_lshape_ || shape_memory_) && lidar_tf_ok_ && isLshapeClass(tr.best_class) && tr.shape_stamp == last_stamp_) {
+            if (shape_memory_ && tr.mem_ok && tr.mem_stamp == last_stamp_) {
+                ++mem_used_;
+                const double ct = std::cos(tr.mem_yaw), st = std::sin(tr.mem_yaw);
+                const double ca = 0.5 * (tr.mem_x0 + tr.mem_x1), cb = 0.5 * (tr.mem_y0 + tr.mem_y1);
+                const Eigen::Vector2d c = tr.mem_origin + Eigen::Vector2d(ca * ct - cb * st, ca * st + cb * ct);
+                // never smaller than this tick's observed box
+                completeRect(tr.best_class, tr.mem_yaw, c, std::max(tr.mem_x1 - tr.mem_x0, 0.0), std::max(tr.mem_y1 - tr.mem_y0, 0.0),
+                             vehicle_lshape_ && tr.lshape_sides == 2, center, size, orient);
+                return;
+            }
+            if (vehicle_lshape_ && tr.lshape_sides == 2) {
+                completeRect(tr.best_class, tr.lshape_yaw, tr.lshape_c, tr.lshape_a, tr.lshape_b, true, center, size, orient);
+                return;
+            }
+        }
+        const bool heading_mode = vehicle_extent_heading_ || (vehicle_lshape_ && isLshapeClass(tr.best_class));
+        if ((!vehicle_extent_prior_ && !heading_mode) || !lidar_tf_ok_) return;
+        const auto& prior = vehiclePrior();
         const auto pr = prior.find(tr.best_class);
         if (pr == prior.end()) return;
         Eigen::Vector2d ray(center.x() - lidar_origin_.x(), center.y() - lidar_origin_.y());
@@ -3401,7 +3604,7 @@ private:
         const auto& q = tr.orientation;
         const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
         const Eigen::Vector2d ax(std::cos(yaw), std::sin(yaw));
-        if (vehicle_extent_heading_) {
+        if (heading_mode) {
             Eigen::Vector2d heading;
             const Eigen::Vector3d v = tr.kf.vel();
             if (planarSpeed(v) >= vehicle_extent_heading_speed_) heading = Eigen::Vector2d(v.x(), v.y()).normalized();
@@ -3631,12 +3834,13 @@ private:
             d.id = "track_" + std::to_string(id);
             Eigen::Vector3d box_center = tr.kf.pos();
             auto box_size = tr.size;
+            geometry_msgs::msg::Quaternion box_orient = tr.orientation;
             if (tr.group_rep == id) { box_center = tr.group_center; box_size = tr.group_size; }
-            else { completePersonBox(tr, box_center, box_size); completeVehicleBox(tr, box_center, box_size); }
+            else { completePersonBox(tr, box_center, box_size); completeVehicleBox(tr, box_center, box_size, box_orient); }
             d.bbox.center.position.x = box_center.x();
             d.bbox.center.position.y = box_center.y();
             d.bbox.center.position.z = box_center.z();
-            d.bbox.center.orientation = tr.orientation;
+            d.bbox.center.orientation = box_orient;
             d.bbox.size = box_size;
             vision_msgs::msg::ObjectHypothesisWithPose h;
             h.hypothesis.class_id = status;
@@ -3664,7 +3868,7 @@ private:
                 obs.track_age = static_cast<uint32_t>(tr.hits);
                 obs.status = dynamic ? jo_msgs::msg::Obstacle::STATUS_DYNAMIC : jo_msgs::msg::Obstacle::STATUS_POTENTIALLY_DYNAMIC;
                 obs.pose.position = d.bbox.center.position;
-                obs.pose.orientation = tr.orientation;
+                obs.pose.orientation = box_orient;
                 obs.size.x = box_size.x; obs.size.y = box_size.y; obs.size.z = box_size.z;
                 obs.twist.linear.x = v.x(); obs.twist.linear.y = v.y(); obs.twist.linear.z = v.z();
                 const Eigen::Vector3d a = tr.kf.acc();
@@ -3952,6 +4156,11 @@ private:
     bool vehicle_extent_heading_{false};
     double vehicle_extent_heading_cos_{0.866}, vehicle_extent_heading_speed_{1.0}, vehicle_extent_heading_aspect_{1.5};
     size_t veh_heading_unknown_{0}, veh_heading_side_{0};
+    bool vehicle_lshape_{false}, shape_memory_{false};
+    int lshape_min_points_{10};
+    double lshape_min_side_{0.5}, shape_memory_forget_{0.02};
+    size_t lshape_two_{0}, lshape_one_{0}, lshape_none_{0}, lshape_completed_{0}, mem_used_{0}, mem_reset_{0};
+    std::vector<double> shape_ms_;
     std::vector<double> yolo_assoc_ms_;
     size_t anchor_carrier_left_{0}, anchor_carrier_blocked_{0};
     int class_anchor_min_votes_{2};
