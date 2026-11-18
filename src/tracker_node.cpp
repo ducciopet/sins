@@ -1075,6 +1075,19 @@ public:
         // if the other (cross) axis is under the mean of length and width (seen end-on), else the width (seen
         // side-on); only extends, never shrinks; publication only (association and points untouched).
         vehicle_extent_prior_ = declare_parameter<bool>("track_vehicle_extent_prior", false);
+        // Heading-gated vehicle extent prior (default false; acts with or without track_vehicle_extent_prior). Only a
+        // vehicle seen END-ON hides most of its depth: seen side-on, the visible side already spans the length and the
+        // depth hidden along the ray is just the width, which the LiDAR's two visible faces mostly cover (street, 18/11:
+        // side-on centres already within 0.2 m of the GT, extending them pushed 90% -> 58% past the 1 m gate). So the box
+        // is extended to the class length along the ray ONLY if the vehicle's heading is known and within
+        // track_vehicle_extent_heading_max_deg of the ray: heading from the track velocity when moving at >=
+        // track_vehicle_extent_heading_min_speed, else from the observed box's long axis when it is at least
+        // track_vehicle_extent_heading_min_aspect times longer than wide (an L-shape/side seen clearly); otherwise no
+        // extension. Publication only (association and points untouched).
+        vehicle_extent_heading_ = declare_parameter<bool>("track_vehicle_extent_prior_heading", false);
+        vehicle_extent_heading_cos_ = std::cos(declare_parameter<double>("track_vehicle_extent_heading_max_deg", 30.0) * M_PI / 180.0);
+        vehicle_extent_heading_speed_ = declare_parameter<double>("track_vehicle_extent_heading_min_speed", 1.0);
+        vehicle_extent_heading_aspect_ = declare_parameter<double>("track_vehicle_extent_heading_min_aspect", 1.5);
         // Height term of the association (see the candidate loop): penalty per metre of difference between the
         // candidate's box top and the track's smoothed top, hard reject beyond track_max_top_diff, active once the
         // track has track_height_min_samples matched ticks; the smoothing is an EMA with this alpha.
@@ -2338,13 +2351,14 @@ private:
                     med(0), mx(0), med(1), mx(1), med(2), mx(2), med(3), mx(3), med(4), mx(4), med(5), mx(5), med(6));
         if (inherit_motion_dist_ >= 0.0)
             RCLCPP_INFO(get_logger(), "inherited motion: %zu heirs, %zu revoked on probation (total)", inherit_count_, inherit_revoked_);
-        if (yolo_id_per_camera_ || class_keep_while_2d_alive_ || class_decay_visible_only_ || vehicle_extent_prior_) {
+        if (yolo_id_per_camera_ || class_keep_while_2d_alive_ || class_decay_visible_only_ || vehicle_extent_prior_ || vehicle_extent_heading_) {
             std::vector<double> v = yolo_assoc_ms_;
             std::sort(v.begin(), v.end());
             RCLCPP_INFO(get_logger(), "yolo assoc (total): per-camera id new-camera %zu same %zu changed %zu | class kept by a live 2D "
-                        "instance %zu ticks | decay skipped as hidden %zu ticks | vehicle boxes extended %zu | check cost "
+                        "instance %zu ticks | decay skipped as hidden %zu ticks | vehicle boxes extended %zu (heading: unknown %zu, "
+                        "side-on %zu) | check cost "
                         "median %.3f ms max %.3f ms over %zu checks (last 50 ticks)", yolo_cam_new_, yolo_cam_same_,
-                        yolo_cam_changed_, kept_2d_alive_, decay_hidden_, veh_extended_, v.empty() ? 0.0 : v[v.size() / 2],
+                        yolo_cam_changed_, kept_2d_alive_, decay_hidden_, veh_extended_, veh_heading_unknown_, veh_heading_side_, v.empty() ? 0.0 : v[v.size() / 2],
                         v.empty() ? 0.0 : v.back(), v.size());
             yolo_assoc_ms_.clear();
         }
@@ -3376,7 +3390,7 @@ private:
     // track_person_min_height, and its centre pushed track_person_ray_offset further along the LiDAR ray.
     // track_vehicle_extent_prior (see its parameter): extend a vehicle's published box away from the sensor along the ray
     void completeVehicleBox(const Track& tr, Eigen::Vector3d& center, vision_msgs::msg::BoundingBox3D::_size_type& size) {
-        if (!vehicle_extent_prior_ || !lidar_tf_ok_) return;
+        if ((!vehicle_extent_prior_ && !vehicle_extent_heading_) || !lidar_tf_ok_) return;
         static const std::map<std::string, std::pair<double, double>> prior = {
             {"car", {4.6, 1.9}}, {"truck", {6.9, 2.5}}, {"bus", {11.0, 2.9}}, {"motorbike", {2.1, 0.8}}, {"bicycle", {1.7, 0.6}}};
         const auto pr = prior.find(tr.best_class);
@@ -3387,6 +3401,25 @@ private:
         const auto& q = tr.orientation;
         const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
         const Eigen::Vector2d ax(std::cos(yaw), std::sin(yaw));
+        if (vehicle_extent_heading_) {
+            Eigen::Vector2d heading;
+            const Eigen::Vector3d v = tr.kf.vel();
+            if (planarSpeed(v) >= vehicle_extent_heading_speed_) heading = Eigen::Vector2d(v.x(), v.y()).normalized();
+            else if (size.x >= vehicle_extent_heading_aspect_ * size.y) heading = ax;
+            else if (size.y >= vehicle_extent_heading_aspect_ * size.x) heading = Eigen::Vector2d(-ax.y(), ax.x());
+            else { ++veh_heading_unknown_; return; }
+            if (std::abs(heading.dot(ray)) < vehicle_extent_heading_cos_) { ++veh_heading_side_; return; }
+            // end-on: the box axis closer to the ray takes the class length
+            const bool x_ray = std::abs(ax.dot(ray)) >= std::sqrt(0.5);
+            double& s_r = x_ray ? size.x : size.y;
+            if (s_r >= pr->second.first) return;
+            const double ext = pr->second.first - s_r;
+            center.x() += 0.5 * ext * ray.x();
+            center.y() += 0.5 * ext * ray.y();
+            s_r = pr->second.first;
+            ++veh_extended_;
+            return;
+        }
         const bool x_on_ray = std::abs(ax.dot(ray)) >= std::sqrt(0.5);
         double& s_ray = x_on_ray ? size.x : size.y;
         const double s_cross = x_on_ray ? size.y : size.x;
@@ -3916,6 +3949,9 @@ private:
     bool class_anchor_carrier_{false};
     bool yolo_id_per_camera_{false}, class_keep_while_2d_alive_{false}, class_decay_visible_only_{false}, vehicle_extent_prior_{false};
     size_t yolo_cam_new_{0}, yolo_cam_same_{0}, yolo_cam_changed_{0}, kept_2d_alive_{0}, decay_hidden_{0}, veh_extended_{0};
+    bool vehicle_extent_heading_{false};
+    double vehicle_extent_heading_cos_{0.866}, vehicle_extent_heading_speed_{1.0}, vehicle_extent_heading_aspect_{1.5};
+    size_t veh_heading_unknown_{0}, veh_heading_side_{0};
     std::vector<double> yolo_assoc_ms_;
     size_t anchor_carrier_left_{0}, anchor_carrier_blocked_{0};
     int class_anchor_min_votes_{2};
