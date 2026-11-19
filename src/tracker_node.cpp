@@ -510,6 +510,7 @@ struct Track {
     std::deque<std::array<double, 3>> cons_hist;   // (stamp, x, y) of the observed centre, track_motion_consistency_window
     int unmatched_streak = 0;
     bool pub_dynamic = false;
+    std::vector<Eigen::Vector2d> shape_hull;   // track_shape_assoc: ground occupied while still (convex hull of footprints)
     bool retired = false;
     // inherited motion state on probation (track_inherit_motion_probation): stamp and inherited speed, < 0 = none
     double inherit_stamp = -1.0, inherit_speed = 0.0;
@@ -793,6 +794,26 @@ public:
         // track_publish_coasting_ticks: a confirmed track published dynamic on its last tick keeps being published
         // (dynamic, at its KF prediction) for up to this many consecutive unmatched ticks. 0 = off (v1: never).
         publish_coasting_ticks_ = declare_parameter<int>("track_publish_coasting_ticks", 0);
+        // track_publish_coasting_pd_ticks (default 0 = off): a confirmed STILL track of a movable class (potentially
+        // dynamic) stays published as potentially_dynamic, at its last position, for up to this many consecutive
+        // unmatched ticks. A still object cannot have gone anywhere because one scan missed it (occluded by a passer-by,
+        // cluster merged or dropped for a tick); without it every missed tick is a missed PD (19/11 audit: coasting
+        // = 8-20% of the lost PD rows on CODa).
+        publish_coasting_pd_ticks_ = declare_parameter<int>("track_publish_coasting_pd_ticks", 0);
+        // track_shape_assoc (default off): association of a STILL track against the ground it has occupied. A still
+        // object seen from a moving robot shows a different part each scan (front, side, whole) and often arrives in
+        // pieces, so the centre of its box jumps by up to half its length while the object does not move; the hard
+        // gates on the centre (distance, implied speed, velocity direction, top height, size, natural motion) read
+        // those jumps as motion and refuse the match, and the object is re-born as a new track without class (19/11
+        // audit: 13-33 re-births per vehicle per CODa window, PD lost out of FOV mostly by re-birth). Here a still
+        // track keeps the convex hull of the footprints it was matched with while still; a detection whose centre and
+        // at least 3 of its 4 footprint corners lie within track_shape_assoc_margin of that hull is the same object
+        // seen differently: those gates are skipped and the score uses distance 0 to the shape. A detection outside
+        // the shape is gated as before. The hull is reset when the track moves, and when it would grow beyond
+        // track_shape_assoc_max_length (the largest movable class: a bus).
+        shape_assoc_ = declare_parameter<bool>("track_shape_assoc", false);
+        shape_assoc_margin_ = declare_parameter<double>("track_shape_assoc_margin", 0.3);
+        shape_assoc_max_length_ = declare_parameter<double>("track_shape_assoc_max_length", 12.0);
         // SIZE GATE FOR LARGE MOVERS. The size gate (track_dynamic_constrain_size) keeps an unclassified object larger
         // than the target from ever being dynamic, so a car, cart or bus outside every camera FOV is never reported as
         // moving. track_size_gate_travel_window [s] (< 0 = off): an over-sized unclassified track passes the gate when,
@@ -2226,6 +2247,9 @@ private:
         if (class_anchor_carrier_)
             RCLCPP_INFO(get_logger(), "class anchors: %zu, erased as the carrier left %zu, transfers blocked by a live carrier %zu (total)",
                         class_anchors_.size(), anchor_carrier_left_, anchor_carrier_blocked_);
+        if (shape_assoc_ || publish_coasting_pd_ticks_ > 0)
+            RCLCPP_INFO(get_logger(), "shape assoc: %zu in-shape candidates, %zu hull resets; PD coasting publications %zu (total)",
+                        shape_in_matches_, shape_hull_resets_, pd_coast_pubs_);
         if (travel_proof_inherit_min_dist_ > 0.0)
         {
             RCLCPP_INFO(get_logger(), "path history inherited by %d new tracks in the last 50 ticks", proof_inherits_);
@@ -2316,22 +2340,24 @@ private:
                 const double gate_size = lidar_only_outside_fov ? outside_fov_max_size_diff_ : max_size_diff_;
 
                 const double predDist = std::hypot(c.x - predicted_pos[ti].x(), c.y - predicted_pos[ti].y());
+                const bool in_shape = inShape(tr, d.bbox);   // track_shape_assoc: centre-based hard gates do not apply
+                if (in_shape) ++shape_in_matches_;
                 // partial-view jitter allowance (track_jitter_footprint_scale): see the parameter's own comment
                 const double jitter = jitter_fp_scale_ > 0.0
                     ? jitter_fp_scale_ * 0.5 * trackExtent(tr) : 0.0;
-                if (predDist >= gate_dist + jitter) { noteReject(ti, di, "dist"); continue; }
+                if (!in_shape && predDist >= gate_dist + jitter) { noteReject(ti, di, "dist"); continue; }
                 // second observation of a track without a velocity estimate (track_two_point_init): only the physical
                 // per-scan displacement bound, scaled by the scans elapsed since the first observation
                 const bool no_vel = two_point_init_ && tr.hits == 1;
                 if (no_vel) {
                     const double elapsed = tr.last_obs_stamp > 0.0 ? stamp - tr.last_obs_stamp : dt;
                     const double bound = max_natural_motion_dist_ * std::max(1.0, elapsed / std::max(dt, 1e-3));
-                    if (std::hypot(c.x - tr.last_obs.x, c.y - tr.last_obs.y) > bound + jitter) { noteReject(ti, di, "speed"); continue; }
+                    if (!in_shape && std::hypot(c.x - tr.last_obs.x, c.y - tr.last_obs.y) > bound + jitter) { noteReject(ti, di, "speed"); continue; }
                 }
                 const double reqSpeed = std::max(0.0, predDist - jitter) / std::max(dt, 1e-3);
-                if (!no_vel && reqSpeed >= gate_speed) { noteReject(ti, di, "speed"); continue; }
+                if (!in_shape && !no_vel && reqSpeed >= gate_speed) { noteReject(ti, di, "speed"); continue; }
                 const double sizeDiff = relSizeDiff(tr.size, d.bbox.size, min_size_diff_floor_);
-                if (sizeDiff >= gate_size) { noteReject(ti, di, "size"); continue; }
+                if (!in_shape && sizeDiff >= gate_size) { noteReject(ti, di, "size"); continue; }
                 // HEIGHT: compare the candidate's TOP (box max z) with the track's smoothed top. Footprint size
                 // alone can't tell a person from a table/cart of similar footprint, which is how a track slid onto
                 // nearby clutter when its object turned or lost its camera points. The TOP, not the height: the
@@ -2342,7 +2368,7 @@ private:
                 const double det_top = c.z + 0.5 * d.bbox.size.z;
                 const bool height_known = tr.top_samples >= height_min_samples_;
                 const double topDiff = height_known ? std::abs(det_top - tr.top_z) : 0.0;
-                if (topDiff > max_top_diff_) { noteReject(ti, di, "height"); continue; }
+                if (!in_shape && topDiff > max_top_diff_) { noteReject(ti, di, "height"); continue; }
                 // Classified-track baseline size gate (no v1 equivalent): the check above compares the
                 // candidate against tr.size, the LATEST matched size — which can drift gradually tick-by-tick,
                 // never individually exceeding gate_size, while compounding into a large cumulative change.
@@ -2365,7 +2391,7 @@ private:
                 if (isDynamicClass(tr.best_class) && det_class.empty() && tr.yolo_x_width > 0.0 && tr.yolo_y_width > 0.0) {
                     const double bx = (d.bbox.size.x - tr.yolo_x_width) / std::max(tr.yolo_x_width, 0.01);
                     const double by = (d.bbox.size.y - tr.yolo_y_width) / std::max(tr.yolo_y_width, 0.01);
-                    if (bx > yolo_base_mismatch_thresh_ || by > yolo_base_mismatch_thresh_) {
+                    if (!in_shape && (bx > yolo_base_mismatch_thresh_ || by > yolo_base_mismatch_thresh_)) {
                         noteReject(ti, di, "yolo_base_growth");
                         continue;
                     }
@@ -2389,14 +2415,14 @@ private:
                 // box, whose centres differ by ~0.2-0.3 m = 2-3 m/s over one LiDAR tick), not by real motion, and
                 // rejecting it there spawned a duplicate track next to the real one. The soft velErr penalty in
                 // the score below still applies.
-                if (!no_vel && velErr > veldir_gate && predDist > std::max(veldir_gate_min_innovation_, jitter)) {
+                if (!in_shape && !no_vel && velErr > veldir_gate && predDist > std::max(veldir_gate_min_innovation_, jitter)) {
                     noteReject(ti, di, "veldir");
                     continue;
                 }
 
                 // Natural-motion gate (v1: isNaturalMotion — see its own comment) — only for a track with no
                 // identity evidence of its own yet: not confirmed, not classified either side.
-                if (!tr.confirmed && !yolo_exempt &&
+                if (!in_shape && !tr.confirmed && !yolo_exempt &&
                     !isNaturalMotion(tr, Eigen::Vector3d(c.x, c.y, c.z), predicted_pos[ti], inside_fov_curr, large_pair, no_vel, jitter)) {
                     noteReject(ti, di, "natural_motion");
                     continue;
@@ -2435,9 +2461,13 @@ private:
                     class_score = -class_continuity_weight_ * (prevDist / gate_dist);
                 }
 
-                double score = -w_pos_ * (predDist / gate_dist) - w_size_ * sizeDiff + w_iou_ * predIou -
-                               w_prev_pos_ * (prevDist / gate_dist) + w_prev_iou_ * prevIou + class_score -
-                               match_veldir_weight_ * velErr - w_height_ * topDiff;
+                // in_shape: distance 0 to the occupied shape; size/top/direction terms capped at their gates
+                double score = in_shape
+                    ? -w_size_ * std::min(sizeDiff, gate_size) + w_iou_ * predIou + w_prev_iou_ * prevIou + class_score -
+                          match_veldir_weight_ * std::min(velErr, veldir_gate) - w_height_ * std::min(topDiff, max_top_diff_)
+                    : -w_pos_ * (predDist / gate_dist) - w_size_ * sizeDiff + w_iou_ * predIou -
+                          w_prev_pos_ * (prevDist / gate_dist) + w_prev_iou_ * prevIou + class_score -
+                          match_veldir_weight_ * velErr - w_height_ * topDiff;
                 // Generic stability bonus for any already-confirmed track (v1: confirmedTrackAssocBonus_) —
                 // independent of class/FOV, on top of (not instead of) the outside-FOV-specific bonus below.
                 if (tr.confirmed) score += confirmed_track_bonus_;
@@ -2736,6 +2766,7 @@ private:
             // Captured BEFORE the overwrite below, for the first-classification diagnostic right after voteClass().
             const geometry_msgs::msg::Point prev_obs = tr.last_obs;
             const bool was_unclassified = tr.best_class.empty();
+            updateShape(tr, d.bbox);
             tr.last_obs = d.bbox.center.position;
             tr.last_obs_stamp = stamp;
             if (tr.inherit_stamp > 0.0 && stamp - tr.inherit_stamp >= inherit_probation_) {   // track_inherit_motion_probation
@@ -3119,6 +3150,7 @@ private:
             tr.last_obs = d.bbox.center.position;
             tr.last_obs_stamp = stamp;
             tr.hits = 1;
+            updateShape(tr, d.bbox);
             // Same LiDAR-only fallback as the matched branch above (already resolved GLOBALLY) — a brand-new
             // track beyond the depth camera's range should be able to pick up its YOLO class immediately too,
             // not just on a later matched tick.
@@ -3353,7 +3385,10 @@ private:
             // coasting publication (track_publish_coasting_ticks): a track published dynamic on its last tick stays
             // published for a few unmatched ticks, at its KF prediction
             const bool coasting = !matched_ids.count(id);
-            if (coasting && !(publish_coasting_ticks_ > 0 && tr.pub_dynamic && !tr.retired &&
+            // track_publish_coasting_pd_ticks: a still track of a movable class (PD on its last tick) stays published too
+            const bool coast_pd = coasting && publish_coasting_pd_ticks_ > 0 && !tr.pub_dynamic && !tr.retired &&
+                                  potentiallyDynamic(tr) && tr.unmatched_streak <= publish_coasting_pd_ticks_;
+            if (coasting && !coast_pd && !(publish_coasting_ticks_ > 0 && tr.pub_dynamic && !tr.retired &&
                               tr.unmatched_streak <= publish_coasting_ticks_)) {
                 dbgCsv(header, id, tr, false, -1, -1, true, "missed");
                 continue;
@@ -3395,7 +3430,8 @@ private:
                 dbg_size_ok = sizeOk || tr.large_travel;
             }
             if (coasting) {
-                if (!dynamic) { dbgCsv(header, id, tr, false, confirm_ticks, sticky_count, dbg_size_ok, "missed"); continue; }
+                if (!dynamic && !coast_pd) { dbgCsv(header, id, tr, false, confirm_ticks, sticky_count, dbg_size_ok, "missed"); continue; }
+                if (!dynamic) ++pd_coast_pubs_;
             } else {
                 tr.pub_dynamic = dynamic;
             }
@@ -3667,6 +3703,75 @@ private:
     bool disocclusion_require_unseen_{false};
     double disocclusion_seen_max_innov_{-1.0};
     int publish_coasting_ticks_{0};
+    int publish_coasting_pd_ticks_{0};
+    bool shape_assoc_{false};
+    double shape_assoc_margin_{0.3}, shape_assoc_max_length_{12.0};
+    size_t shape_in_matches_ = 0, shape_hull_resets_ = 0, pd_coast_pubs_ = 0;
+
+    // footprint corners (x, y) of a detection box, yaw from its orientation
+    static std::array<Eigen::Vector2d, 4> footprintCorners(const vision_msgs::msg::BoundingBox3D& b) {
+        const auto& q = b.center.orientation;
+        const double yaw = std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+        const double c = std::cos(yaw), s = std::sin(yaw), hx = 0.5 * b.size.x, hy = 0.5 * b.size.y;
+        std::array<Eigen::Vector2d, 4> out;
+        const double sx[4] = {1, 1, -1, -1}, sy[4] = {1, -1, -1, 1};
+        for (int k = 0; k < 4; ++k)
+            out[static_cast<size_t>(k)] = Eigen::Vector2d(b.center.position.x + c * sx[k] * hx - s * sy[k] * hy,
+                                                          b.center.position.y + s * sx[k] * hx + c * sy[k] * hy);
+        return out;
+    }
+    // convex hull (Andrew's monotone chain), counter-clockwise
+    static std::vector<Eigen::Vector2d> convexHull(std::vector<Eigen::Vector2d> p) {
+        if (p.size() < 3) return p;
+        std::sort(p.begin(), p.end(), [](const Eigen::Vector2d& a, const Eigen::Vector2d& b) { return a.x() < b.x() || (a.x() == b.x() && a.y() < b.y()); });
+        auto cross = [](const Eigen::Vector2d& o, const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
+            return (a.x() - o.x()) * (b.y() - o.y()) - (a.y() - o.y()) * (b.x() - o.x()); };
+        std::vector<Eigen::Vector2d> h(2 * p.size());
+        size_t k = 0;
+        for (size_t i = 0; i < p.size(); ++i) { while (k >= 2 && cross(h[k - 2], h[k - 1], p[i]) <= 0) --k; h[k++] = p[i]; }
+        for (size_t i = p.size() - 1, t = k + 1; i > 0; --i) { while (k >= t && cross(h[k - 2], h[k - 1], p[i - 1]) <= 0) --k; h[k++] = p[i - 1]; }
+        h.resize(k - 1);
+        return h;
+    }
+    // distance from q to a convex polygon (0 inside)
+    static double hullDistance(const std::vector<Eigen::Vector2d>& h, const Eigen::Vector2d& q) {
+        if (h.size() < 3) return std::numeric_limits<double>::max();
+        bool inside = true;
+        double best = std::numeric_limits<double>::max();
+        for (size_t i = 0; i < h.size(); ++i) {
+            const Eigen::Vector2d& a = h[i];
+            const Eigen::Vector2d& b = h[(i + 1) % h.size()];
+            const Eigen::Vector2d e = b - a, w = q - a;
+            if (e.x() * w.y() - e.y() * w.x() < 0) inside = false;
+            const double t = std::clamp(w.dot(e) / std::max(e.squaredNorm(), 1e-12), 0.0, 1.0);
+            best = std::min(best, (w - t * e).norm());
+        }
+        return inside ? 0.0 : best;
+    }
+    static double hullDiameter(const std::vector<Eigen::Vector2d>& h) {
+        double d = 0.0;
+        for (size_t i = 0; i < h.size(); ++i) for (size_t j = i + 1; j < h.size(); ++j) d = std::max(d, (h[i] - h[j]).norm());
+        return d;
+    }
+    // track_shape_assoc: grow the still track's occupied shape with this detection, or reset it
+    void updateShape(Track& tr, const vision_msgs::msg::BoundingBox3D& b) {
+        if (!shape_assoc_) return;
+        const bool still = !tr.pub_dynamic && planarSpeed(tr.kf.vel()) < dynamic_speed_thresh_;
+        const auto cs = footprintCorners(b);
+        if (!still) { tr.shape_hull.clear(); return; }
+        std::vector<Eigen::Vector2d> pts = tr.shape_hull;
+        pts.insert(pts.end(), cs.begin(), cs.end());
+        auto h = convexHull(pts);
+        if (hullDiameter(h) > shape_assoc_max_length_) { h = convexHull(std::vector<Eigen::Vector2d>(cs.begin(), cs.end())); ++shape_hull_resets_; }
+        tr.shape_hull = std::move(h);
+    }
+    bool inShape(const Track& tr, const vision_msgs::msg::BoundingBox3D& b) const {
+        if (!shape_assoc_ || tr.shape_hull.size() < 3 || tr.pub_dynamic || planarSpeed(tr.kf.vel()) >= dynamic_speed_thresh_) return false;
+        if (hullDistance(tr.shape_hull, Eigen::Vector2d(b.center.position.x, b.center.position.y)) > shape_assoc_margin_) return false;
+        int n = 0;
+        for (const auto& c : footprintCorners(b)) if (hullDistance(tr.shape_hull, c) <= shape_assoc_margin_) ++n;
+        return n >= 3;
+    }
     double size_travel_window_{-1.0}, size_travel_min_dist_{2.0};
     double travel_proof_window_{-1.0}, travel_proof_body_lengths_{1.0}, travel_proof_min_dist_{1.0}, travel_proof_straightness_{0.8}, travel_proof_step_ratio_{0.33}, travel_proof_regular_frac_{0.7};
     bool travel_proof_occlusion_veto_{false}, travel_proof_point_veto_{false};
