@@ -740,35 +740,41 @@ private:
     size_t leaf_conn_n_ = 0, leaf_conn_pts_in_ = 0, leaf_conn_pts_kept_ = 0;
     double leaf_conn_ms_ = 0.0;
 
-    // largest group of points linked by gaps <= r (union-find over a hash grid of cell r), as a keep mask
+    // largest group of points linked by gaps of about r: points are binned in cells of r/2, cells are the nodes and two
+    // occupied cells touching (26-neighbourhood) are linked, so two points link when 0 < gap <= ~r (at most r/2*2*sqrt(3)
+    // in the worst corner case). Cost grows with the occupied cells, not with the points (dense depth leaves).
     static std::vector<char> largestConnected(const std::vector<Eigen::Vector3f>& p, double r) {
-        const size_t n = p.size();
-        std::vector<int> par(n);
-        for (size_t i = 0; i < n; ++i) par[i] = static_cast<int>(i);
-        std::function<int(int)> find = [&](int x) { while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; } return x; };
-        auto key = [r](const Eigen::Vector3f& q, int dx, int dy, int dz) {
-            const int64_t ix = static_cast<int64_t>(std::floor(q.x() / r)) + dx, iy = static_cast<int64_t>(std::floor(q.y() / r)) + dy,
-                          iz = static_cast<int64_t>(std::floor(q.z() / r)) + dz;
-            return (ix * 73856093) ^ (iy * 19349663) ^ (iz * 83492791);
+        const double c = 0.5 * r;
+        auto cellOf = [c](const Eigen::Vector3f& q) {
+            return Eigen::Vector3i(static_cast<int>(std::floor(q.x() / c)), static_cast<int>(std::floor(q.y() / c)), static_cast<int>(std::floor(q.z() / c)));
         };
-        std::unordered_map<int64_t, std::vector<int>> grid;
-        for (size_t i = 0; i < n; ++i) grid[key(p[i], 0, 0, 0)].push_back(static_cast<int>(i));
-        const float r2 = static_cast<float>(r * r);
-        for (size_t i = 0; i < n; ++i)
+        auto key = [](const Eigen::Vector3i& k) {
+            return (static_cast<int64_t>(k.x()) * 73856093) ^ (static_cast<int64_t>(k.y()) * 19349663) ^ (static_cast<int64_t>(k.z()) * 83492791);
+        };
+        std::unordered_map<int64_t, int> cellId;
+        std::vector<Eigen::Vector3i> cells;
+        std::vector<int> pointCell(p.size());
+        for (size_t i = 0; i < p.size(); ++i) {
+            const Eigen::Vector3i k = cellOf(p[i]);
+            auto [it, fresh] = cellId.emplace(key(k), static_cast<int>(cells.size()));
+            if (fresh) cells.push_back(k);
+            pointCell[i] = it->second;
+        }
+        std::vector<int> par(cells.size());
+        for (size_t i = 0; i < cells.size(); ++i) par[i] = static_cast<int>(i);
+        auto find = [&par](int x) { while (par[static_cast<size_t>(x)] != x) { par[static_cast<size_t>(x)] = par[static_cast<size_t>(par[static_cast<size_t>(x)])]; x = par[static_cast<size_t>(x)]; } return x; };
+        for (size_t i = 0; i < cells.size(); ++i)
             for (int dx = -1; dx <= 1; ++dx) for (int dy = -1; dy <= 1; ++dy) for (int dz = -1; dz <= 1; ++dz) {
-                const auto it = grid.find(key(p[i], dx, dy, dz));
-                if (it == grid.end()) continue;
-                for (int j : it->second)
-                    if (j > static_cast<int>(i) && (p[i] - p[static_cast<size_t>(j)]).squaredNorm() <= r2) {
-                        const int a = find(static_cast<int>(i)), b = find(j);
-                        if (a != b) par[a] = b;
-                    }
+                const auto it = cellId.find(key(cells[i] + Eigen::Vector3i(dx, dy, dz)));
+                if (it == cellId.end()) continue;
+                const int a = find(static_cast<int>(i)), b = find(it->second);
+                if (a != b) par[static_cast<size_t>(a)] = b;
             }
-        std::unordered_map<int, int> cnt;
-        int best = -1, bestN = 0;
-        for (size_t i = 0; i < n; ++i) { const int c = find(static_cast<int>(i)); if (++cnt[c] > bestN) { bestN = cnt[c]; best = c; } }
-        std::vector<char> keep(n, 0);
-        for (size_t i = 0; i < n; ++i) keep[i] = find(static_cast<int>(i)) == best;
+        std::vector<int> cnt(cells.size(), 0);
+        int best = 0;
+        for (size_t i = 0; i < p.size(); ++i) { const int g = find(pointCell[i]); if (++cnt[static_cast<size_t>(g)] > cnt[static_cast<size_t>(best)]) best = g; }
+        std::vector<char> keep(p.size(), 0);
+        for (size_t i = 0; i < p.size(); ++i) keep[i] = find(pointCell[i]) == best;
         return keep;
     }
     double lidar_leaf_stamp_{-1e9};
