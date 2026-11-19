@@ -217,6 +217,7 @@
 #include <random>
 #include <string>
 #include <unordered_map>
+#include <functional>
 #include <deque>
 #include <vector>
 #include <memory>
@@ -377,6 +378,15 @@ public:
         yolo_leaf_min_box_coverage_ = this->declare_parameter("yolo_leaf_min_box_coverage", 0.5);
         // mask method: a detection whose mask yields no leaf falls back to its own box (box method, same detection)
         yolo_leaf_mask_box_fallback_ = this->declare_parameter("yolo_leaf_mask_box_fallback", false);
+        // mask method, physical alternative to the depth window (default off): a LiDAR/depth point inside an instance mask
+        // belongs to that instance unless it is cut off from it in 3D. The leaf is the largest group of mask points linked
+        // by gaps <= max(yolo_leaf_connect_radius, yolo_leaf_connect_radius_per_m * median camera depth) (the beam
+        // spacing grows with range); background seen past the silhouette edge (a wall, a canopy behind a car) is a
+        // separate group and is dropped. No cap along the camera axis, so a car seen obliquely keeps its whole visible
+        // length (the +-yolo_leaf_depth_tolerance window keeps a ~0.6 m slice of it, measured 19/11 on CODa: 5.7 m -> 1.4 m).
+        yolo_leaf_connected_ = this->declare_parameter("yolo_leaf_connected", false);
+        yolo_leaf_connect_radius_ = this->declare_parameter("yolo_leaf_connect_radius", 0.5);
+        yolo_leaf_connect_radius_per_m_ = this->declare_parameter("yolo_leaf_connect_radius_per_m", 0.0);
         // Same class list the YOLO detection nodes use (cfg/coco.names by default) — loaded here only to turn a
         // detection's class STRING into a small numeric index for the semantic-leaves cloud (see
         // publishSemanticLeaves's own comment on why a number, not the string, travels on the wire).
@@ -725,6 +735,42 @@ private:
     double lidar_processed_voxel_max_range_ = 0.0;
     double yolo_leaf_min_box_coverage_ = 0.5;
     bool yolo_leaf_mask_box_fallback_ = false;
+    bool yolo_leaf_connected_ = false;
+    double yolo_leaf_connect_radius_ = 0.5, yolo_leaf_connect_radius_per_m_ = 0.0;
+    size_t leaf_conn_n_ = 0, leaf_conn_pts_in_ = 0, leaf_conn_pts_kept_ = 0;
+    double leaf_conn_ms_ = 0.0;
+
+    // largest group of points linked by gaps <= r (union-find over a hash grid of cell r), as a keep mask
+    static std::vector<char> largestConnected(const std::vector<Eigen::Vector3f>& p, double r) {
+        const size_t n = p.size();
+        std::vector<int> par(n);
+        for (size_t i = 0; i < n; ++i) par[i] = static_cast<int>(i);
+        std::function<int(int)> find = [&](int x) { while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; } return x; };
+        auto key = [r](const Eigen::Vector3f& q, int dx, int dy, int dz) {
+            const int64_t ix = static_cast<int64_t>(std::floor(q.x() / r)) + dx, iy = static_cast<int64_t>(std::floor(q.y() / r)) + dy,
+                          iz = static_cast<int64_t>(std::floor(q.z() / r)) + dz;
+            return (ix * 73856093) ^ (iy * 19349663) ^ (iz * 83492791);
+        };
+        std::unordered_map<int64_t, std::vector<int>> grid;
+        for (size_t i = 0; i < n; ++i) grid[key(p[i], 0, 0, 0)].push_back(static_cast<int>(i));
+        const float r2 = static_cast<float>(r * r);
+        for (size_t i = 0; i < n; ++i)
+            for (int dx = -1; dx <= 1; ++dx) for (int dy = -1; dy <= 1; ++dy) for (int dz = -1; dz <= 1; ++dz) {
+                const auto it = grid.find(key(p[i], dx, dy, dz));
+                if (it == grid.end()) continue;
+                for (int j : it->second)
+                    if (j > static_cast<int>(i) && (p[i] - p[static_cast<size_t>(j)]).squaredNorm() <= r2) {
+                        const int a = find(static_cast<int>(i)), b = find(j);
+                        if (a != b) par[a] = b;
+                    }
+            }
+        std::unordered_map<int, int> cnt;
+        int best = -1, bestN = 0;
+        for (size_t i = 0; i < n; ++i) { const int c = find(static_cast<int>(i)); if (++cnt[c] > bestN) { bestN = cnt[c]; best = c; } }
+        std::vector<char> keep(n, 0);
+        for (size_t i = 0; i < n; ++i) keep[i] = find(static_cast<int>(i)) == best;
+        return keep;
+    }
     double lidar_leaf_stamp_{-1e9};
     // yolo_leaf_sync: the last scans, so a leaf built late (when YOLO answers) takes the scan nearest its OWN frame
     std::deque<std::pair<double, std::shared_ptr<const pcl::PointCloud<pcl::PointXYZ>>>> lidar_leaf_ring_;
@@ -1718,9 +1764,33 @@ private:
                     for (const auto& dp : pv) depths.push_back(dp.first);
                     // an occluder in front of the object can fall inside its mask (a bollard before a van): the
                     // same box-width coverage test as the box method
-                    const auto [depthLo, depthHi] = depthModeValleyWindow(depths, &usByLabel[label], widthByLabel[label], cam.depth_max);
                     const auto& info = byLabel.at(label);
                     Leaf leaf{info.first, info.second, {}};
+                    if (yolo_leaf_connected_) {  // see yolo_leaf_connected's own comment
+                        const auto t0 = std::chrono::steady_clock::now();
+                        std::vector<Eigen::Vector3f> q;
+                        q.reserve(pv.size());
+                        for (const auto& dp : pv) q.push_back(dp.second);
+                        std::vector<float> ds = depths;
+                        std::nth_element(ds.begin(), ds.begin() + static_cast<long>(ds.size() / 2), ds.end());
+                        const double r = std::max(yolo_leaf_connect_radius_, yolo_leaf_connect_radius_per_m_ * ds[ds.size() / 2]);
+                        const auto keep = largestConnected(q, r);
+                        for (size_t i = 0; i < pv.size(); ++i)
+                            if (keep[i]) {
+                                const auto& pd = pv[i].second;
+                                const Eigen::Vector4d pg = T_global_depth * Eigen::Vector4d(pd.x(), pd.y(), pd.z(), 1.0);
+                                leaf.pts.emplace_back(static_cast<float>(pg.x()), static_cast<float>(pg.y()), static_cast<float>(pg.z()));
+                            }
+                        ++leaf_conn_n_; leaf_conn_pts_in_ += pv.size(); leaf_conn_pts_kept_ += leaf.pts.size();
+                        leaf_conn_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                        if (leaf_conn_n_ % 500 == 0)
+                            RCLCPP_INFO(this->get_logger(), "yolo_leaf_connected: %zu leaves, points kept %.1f%%, %.3f ms per leaf",
+                                        leaf_conn_n_, 100.0 * static_cast<double>(leaf_conn_pts_kept_) / static_cast<double>(std::max<size_t>(1, leaf_conn_pts_in_)),
+                                        leaf_conn_ms_ / static_cast<double>(leaf_conn_n_));
+                        if (static_cast<int>(leaf.pts.size()) >= yolo_leaf_min_points_) { leaves.push_back(std::move(leaf)); leafLabels.insert(label); }
+                        continue;
+                    }
+                    const auto [depthLo, depthHi] = depthModeValleyWindow(depths, &usByLabel[label], widthByLabel[label], cam.depth_max);
                     for (const auto& dp : pv)
                         if (dp.first >= depthLo && dp.first <= depthHi) {
                             const Eigen::Vector4d pg = T_global_depth * Eigen::Vector4d(dp.second.x(), dp.second.y(), dp.second.z(), 1.0);
