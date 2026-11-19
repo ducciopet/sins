@@ -226,6 +226,10 @@
 class PreprocessingNode : public rclcpp::Node {
 public:
     PreprocessingNode() : Node("preprocessing_node"), rng_(std::random_device{}()) {
+        // random_seed >= 0: fixed seed for the random sampling (RANSAC, subsampling), so that two replays of the same bag
+        // draw the same samples (19/11: identical laptop runs differed by up to 18 MOTA points); < 0 = seeded from the
+        // OS at every start (the behaviour so far)
+        if (const int seed = static_cast<int>(this->declare_parameter("random_seed", -1)); seed >= 0) rng_.seed(static_cast<unsigned>(seed));
         lidar_topic_ = this->declare_parameter("lidar_topic", std::string("/velodyne_points"));
         odom_topic_ = this->declare_parameter("odom_topic", std::string("/odometry/filtered"));
 

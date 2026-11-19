@@ -177,6 +177,10 @@ using sins::WallBBoxRegistry;
 class StaticStructuresNode : public rclcpp::Node {
 public:
     StaticStructuresNode() : Node("static_structures_node"), rng_(std::random_device{}()) {
+        // random_seed >= 0: fixed seed for the random sampling (RANSAC, subsampling), so that two replays of the same bag
+        // draw the same samples (19/11: identical laptop runs differed by up to 18 MOTA points); < 0 = seeded from the
+        // OS at every start (the behaviour so far)
+        if (const int seed = static_cast<int>(this->declare_parameter("random_seed", -1)); seed >= 0) rng_.seed(static_cast<unsigned>(seed));
         lidar_frame_ = this->declare_parameter("lidar_frame", std::string("velodyne"));
         base_frame_ = this->declare_parameter("base_frame", std::string("base_link"));
         global_frame_ = this->declare_parameter("global_frame", std::string("odom"));
