@@ -511,6 +511,7 @@ struct Track {
     int unmatched_streak = 0;
     bool pub_dynamic = false;
     std::vector<Eigen::Vector2d> shape_hull;   // track_shape_assoc: ground occupied while still (convex hull of footprints)
+    std::deque<std::pair<double, double>> shape_diam_hist;   // (stamp, hull diameter): the shape is settled once it stops growing
     bool retired = false;
     // inherited motion state on probation (track_inherit_motion_probation): stamp and inherited speed, < 0 = none
     double inherit_stamp = -1.0, inherit_speed = 0.0;
@@ -814,6 +815,10 @@ public:
         shape_assoc_ = declare_parameter<bool>("track_shape_assoc", false);
         shape_assoc_margin_ = declare_parameter<double>("track_shape_assoc_margin", 0.3);
         shape_assoc_max_length_ = declare_parameter<double>("track_shape_assoc_max_length", 12.0);
+        // ...and only once the shape is settled (a still object, not a mover not yet declared dynamic): it grew less than
+        // track_shape_settle_growth [m] over the last track_shape_settle_window [s]
+        shape_settle_window_ = declare_parameter<double>("track_shape_settle_window", 1.0);
+        shape_settle_growth_ = declare_parameter<double>("track_shape_settle_growth", 0.3);
         // SIZE GATE FOR LARGE MOVERS. The size gate (track_dynamic_constrain_size) keeps an unclassified object larger
         // than the target from ever being dynamic, so a car, cart or bus outside every camera FOV is never reported as
         // moving. track_size_gate_travel_window [s] (< 0 = off): an over-sized unclassified track passes the gate when,
@@ -2766,7 +2771,7 @@ private:
             // Captured BEFORE the overwrite below, for the first-classification diagnostic right after voteClass().
             const geometry_msgs::msg::Point prev_obs = tr.last_obs;
             const bool was_unclassified = tr.best_class.empty();
-            updateShape(tr, d.bbox);
+            updateShape(tr, d.bbox, stamp);
             tr.last_obs = d.bbox.center.position;
             tr.last_obs_stamp = stamp;
             if (tr.inherit_stamp > 0.0 && stamp - tr.inherit_stamp >= inherit_probation_) {   // track_inherit_motion_probation
@@ -3150,7 +3155,7 @@ private:
             tr.last_obs = d.bbox.center.position;
             tr.last_obs_stamp = stamp;
             tr.hits = 1;
-            updateShape(tr, d.bbox);
+            updateShape(tr, d.bbox, stamp);
             // Same LiDAR-only fallback as the matched branch above (already resolved GLOBALLY) — a brand-new
             // track beyond the depth camera's range should be able to pick up its YOLO class immediately too,
             // not just on a later matched tick.
@@ -3495,6 +3500,8 @@ private:
             d.header = arr.header;
             d.id = "track_" + std::to_string(id);
             Eigen::Vector3d box_center = tr.kf.pos();
+            if (coast_pd && !dynamic)   // a still object missed this tick stays where it was last seen (its KF velocity is noise)
+                box_center = Eigen::Vector3d(tr.last_obs.x, tr.last_obs.y, tr.last_obs.z);
             auto box_size = tr.size;
             if (tr.group_rep == id) { box_center = tr.group_center; box_size = tr.group_size; }
             else completePersonBox(tr, box_center, box_size);
@@ -3718,7 +3725,7 @@ private:
     int publish_coasting_ticks_{0};
     int publish_coasting_pd_ticks_{0};
     bool shape_assoc_{false};
-    double shape_assoc_margin_{0.3}, shape_assoc_max_length_{12.0};
+    double shape_assoc_margin_{0.3}, shape_assoc_max_length_{12.0}, shape_settle_window_{1.0}, shape_settle_growth_{0.3};
     size_t shape_in_matches_ = 0, shape_hull_resets_ = 0, pd_coast_pubs_ = 0;
 
     // footprint corners (x, y) of a detection box, yaw from its orientation
@@ -3767,19 +3774,31 @@ private:
         return d;
     }
     // track_shape_assoc: grow the still track's occupied shape with this detection, or reset it
-    void updateShape(Track& tr, const vision_msgs::msg::BoundingBox3D& b) {
+    void updateShape(Track& tr, const vision_msgs::msg::BoundingBox3D& b, double stamp) {
         if (!shape_assoc_) return;
         const bool still = !tr.pub_dynamic;   // the debounced motion decision: the KF speed of a still object seen in pieces is not ~0 (19/11: >= 0.25 m/s on 60-70% of the ticks near parked vehicles)
         const auto cs = footprintCorners(b);
-        if (!still) { tr.shape_hull.clear(); return; }
+        if (!still) { tr.shape_hull.clear(); tr.shape_diam_hist.clear(); return; }
         std::vector<Eigen::Vector2d> pts = tr.shape_hull;
         pts.insert(pts.end(), cs.begin(), cs.end());
         auto h = convexHull(pts);
-        if (hullDiameter(h) > shape_assoc_max_length_) { h = convexHull(std::vector<Eigen::Vector2d>(cs.begin(), cs.end())); ++shape_hull_resets_; }
+        if (hullDiameter(h) > shape_assoc_max_length_) {
+            h = convexHull(std::vector<Eigen::Vector2d>(cs.begin(), cs.end())); tr.shape_diam_hist.clear(); ++shape_hull_resets_; }
         tr.shape_hull = std::move(h);
+        tr.shape_diam_hist.push_back({stamp, hullDiameter(tr.shape_hull)});
+        while (tr.shape_diam_hist.size() > 2 && stamp - tr.shape_diam_hist[1].first >= shape_settle_window_) tr.shape_diam_hist.pop_front();
+    }
+    // the occupied ground has stopped growing: over the last shape_settle_window seconds the hull grew less than
+    // shape_settle_growth. A walking person's hull grows every tick (never settled); a parked car seen part by part grows
+    // while new parts appear, then settles at its own size.
+    bool shapeSettled(const Track& tr) const {
+        if (tr.shape_diam_hist.size() < 2) return false;
+        const auto& a = tr.shape_diam_hist.front();
+        const auto& b = tr.shape_diam_hist.back();
+        return b.first - a.first >= shape_settle_window_ && b.second - a.second < shape_settle_growth_;
     }
     bool inShape(const Track& tr, const vision_msgs::msg::BoundingBox3D& b) const {
-        if (!shape_assoc_ || tr.shape_hull.size() < 3 || tr.pub_dynamic) return false;
+        if (!shape_assoc_ || tr.shape_hull.size() < 3 || tr.pub_dynamic || !shapeSettled(tr)) return false;
         if (hullDistance(tr.shape_hull, Eigen::Vector2d(b.center.position.x, b.center.position.y)) > shape_assoc_margin_) return false;
         int n = 0;
         for (const auto& c : footprintCorners(b)) if (hullDistance(tr.shape_hull, c) <= shape_assoc_margin_) ++n;
