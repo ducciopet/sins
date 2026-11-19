@@ -144,6 +144,7 @@
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
+#include <vision_msgs/msg/detection3_d_array.hpp>
 // Depth<->color factory extrinsic — needed only for cameras whose
 // voxelized_depth_topic is a native (depth-optical-frame) cloud, not the
 // deprojected (color-optical-frame) one. See CameraSource::is_native_depth_frame
@@ -211,6 +212,12 @@ public:
         ransac_confidence_ = this->declare_parameter("ransac_confidence", 0.99);
         wall_vertical_angle_deg_ = this->declare_parameter("wall_vertical_angle_deg", 5.0);
         wall_bbox_max_aspect_ratio_ = this->declare_parameter("wall_bbox_max_aspect_ratio", 5.0);
+        // wall_veto_tracks_topic (empty = off): a wall centred inside the box (+ wall_veto_margin) of a tracked object
+        // published dynamic or potentially_dynamic is not a wall but the side of a movable object (a van, a pickup, a
+        // truck: tall and flat enough to pass the wall tests). It is not published, so preprocessing does not strip its
+        // points. 19/11 audit: on CODa a wall was centred on 33% of the vehicle rows (service vehicles 74%).
+        wall_veto_tracks_topic_ = this->declare_parameter("wall_veto_tracks_topic", std::string(""));
+        wall_veto_margin_ = this->declare_parameter("wall_veto_margin", 0.3);
         // Rendered/published wall thickness (buildBoxFromPlane's size.x(), the box's along-normal extent) is
         // its own knob, decoupled from ransac_inlier_threshold_ (which stays the RANSAC point-to-plane fit
         // tolerance): thickening the visual box shouldn't loosen what counts as a plane inlier.
@@ -303,6 +310,21 @@ public:
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_, this, false);
 
+        if (!wall_veto_tracks_topic_.empty())
+            sub_veto_tracks_ = this->create_subscription<vision_msgs::msg::Detection3DArray>(
+                wall_veto_tracks_topic_, rclcpp::QoS(10), [this](const vision_msgs::msg::Detection3DArray::ConstSharedPtr& m) {
+                    std::vector<VetoBox> boxes;
+                    for (const auto& d : m->detections) {
+                        if (d.results.empty()) continue;
+                        const auto& st = d.results[0].hypothesis.class_id;
+                        if (st != "dynamic" && st != "potentially_dynamic") continue;
+                        const auto& q = d.bbox.center.orientation;
+                        boxes.push_back({d.bbox.center.position.x, d.bbox.center.position.y,
+                                         std::atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z)),
+                                         0.5 * d.bbox.size.x + wall_veto_margin_, 0.5 * d.bbox.size.y + wall_veto_margin_});
+                    }
+                    veto_boxes_ = std::move(boxes);
+                });
         pub_wall_markers_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
             "/sins/static_structures/wall_markers", rclcpp::QoS(10));
         // Raw RANSAC inlier points behind wall_markers' ns="wall_bbox" boxes
@@ -1556,6 +1578,12 @@ private:
         const std::vector<WallBBox> tracked = splitAtJunctions(wall_registry_->bboxes());
         for (size_t i = 0; i < tracked.size(); ++i) {
             const auto& box = tracked[i];
+            bool vetoed = false;   // wall_veto_tracks_topic: the side of a tracked movable object
+            for (const auto& v : veto_boxes_) {
+                const double dx = box.center.x() - v.x, dy = box.center.y() - v.y, c = std::cos(v.yaw), s = std::sin(v.yaw);
+                if (std::abs(dx * c + dy * s) <= v.hx && std::abs(-dx * s + dy * c) <= v.hy) { vetoed = true; break; }
+            }
+            if (vetoed) { ++walls_vetoed_; continue; }
             visualization_msgs::msg::Marker m;
             m.header.frame_id = global_frame_;
             m.header.stamp = stamp;
@@ -1678,6 +1706,12 @@ private:
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_odom_;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_lidar_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr pub_wall_markers_;
+    struct VetoBox { double x, y, yaw, hx, hy; };
+    std::string wall_veto_tracks_topic_;
+    double wall_veto_margin_{0.3};
+    std::vector<VetoBox> veto_boxes_;
+    size_t walls_vetoed_ = 0;
+    rclcpp::Subscription<vision_msgs::msg::Detection3DArray>::SharedPtr sub_veto_tracks_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_wall_points_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_gseg3d_lidar_ground_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_gseg3d_lidar_non_ground_;

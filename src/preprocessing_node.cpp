@@ -429,6 +429,11 @@ public:
         // onWallMarkers(), see the file header) is dropped from the
         // published (LiDAR and depth) clouds.
         wall_removal_margin_ = this->declare_parameter("wall_removal_margin", 0.10);
+        // false: LiDAR points near the static_structures walls are kept (the floor/roof crop is unchanged). The wall
+        // detector takes any vertical surface >= wall2d_min_vertical_extent tall and >= wall2d_min_length long, which
+        // outdoors includes the sides of vans, pickups and trucks (19/11 audit: a wall centred on 33% of the CODa vehicle
+        // rows); building facades then reach the clusterer and are rejected by the size test or tracked as static.
+        wall_removal_enabled_ = this->declare_parameter("wall_removal_enabled", true);
         // [m] how far past a wall's own in-plane extent (its tracked box) points are still stripped — see isNearAnyWall()
         wall_removal_extent_margin_ = this->declare_parameter("wall_removal_extent_margin", 0.20);
 
@@ -785,6 +790,7 @@ private:
     double depth_trigger_max_wait_sec_{0.15};
     double depth_processed_voxel_occupied_thresh_{5.0};
     double wall_removal_margin_{0.10};
+    bool wall_removal_enabled_{true};
     double wall_removal_extent_margin_{0.20};
 
     // A plane n·p + d = 0. Always global frame here (both wall_planes_global_
@@ -1117,6 +1123,7 @@ private:
     // observed on a lab bag: a person standing still 5 m from a 3.6 m wall, on the line of its extension, lost
     // ~60% of their LiDAR points the moment that wall was registered, and with them their detection.
     bool isNearAnyWall(const Eigen::Vector3d& p_global) const {
+        if (!wall_removal_enabled_) return false;   // wall_removal_enabled: see its own comment
         for (const auto& w : wall_planes_global_) {
             if (w.plane.distance(p_global) >= wall_removal_margin_) continue;
             const Eigen::Vector3d local = w.R.transpose() * (p_global - w.center);

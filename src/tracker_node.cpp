@@ -3380,14 +3380,27 @@ private:
         obstacles.header = arr.header;
         std::set<int> now_ids;
 
+        // track_publish_coasting_pd_ticks: footprints of the tracks matched this tick — a coasting still track whose place
+        // is now taken by one of them is the same object re-acquired by another track, not a second object
+        std::vector<std::pair<Eigen::Vector2d, double>> matched_fp;   // (centre, half of the longer side)
+        if (publish_coasting_pd_ticks_ > 0)
+            for (const auto& [mid, mt] : tracks_)
+                if (matched_ids.count(mid))
+                    matched_fp.push_back({Eigen::Vector2d(mt.last_obs.x, mt.last_obs.y), 0.5 * std::max(mt.size.x, mt.size.y)});
         for (auto& [id, tr] : tracks_) {
             if (!tr.confirmed) { dbgCsv(header, id, tr, matched_ids.count(id) > 0, -1, -1, true, "unconfirmed"); continue; }  // internal propagation only until confirmed — never published, matching v1
             // coasting publication (track_publish_coasting_ticks): a track published dynamic on its last tick stays
             // published for a few unmatched ticks, at its KF prediction
             const bool coasting = !matched_ids.count(id);
             // track_publish_coasting_pd_ticks: a still track of a movable class (PD on its last tick) stays published too
-            const bool coast_pd = coasting && publish_coasting_pd_ticks_ > 0 && !tr.pub_dynamic && !tr.retired &&
-                                  potentiallyDynamic(tr) && tr.unmatched_streak <= publish_coasting_pd_ticks_;
+            bool coast_pd = coasting && publish_coasting_pd_ticks_ > 0 && !tr.pub_dynamic && !tr.retired &&
+                            potentiallyDynamic(tr) && tr.unmatched_streak <= publish_coasting_pd_ticks_;
+            if (coast_pd) {
+                const Eigen::Vector2d me(tr.last_obs.x, tr.last_obs.y);
+                const double r = 0.5 * std::max(tr.size.x, tr.size.y);
+                for (const auto& [c, mr] : matched_fp)
+                    if ((c - me).norm() < r + mr) { coast_pd = false; break; }   // footprints overlap: place taken
+            }
             if (coasting && !coast_pd && !(publish_coasting_ticks_ > 0 && tr.pub_dynamic && !tr.retired &&
                               tr.unmatched_streak <= publish_coasting_ticks_)) {
                 dbgCsv(header, id, tr, false, -1, -1, true, "missed");
@@ -3756,7 +3769,7 @@ private:
     // track_shape_assoc: grow the still track's occupied shape with this detection, or reset it
     void updateShape(Track& tr, const vision_msgs::msg::BoundingBox3D& b) {
         if (!shape_assoc_) return;
-        const bool still = !tr.pub_dynamic && planarSpeed(tr.kf.vel()) < dynamic_speed_thresh_;
+        const bool still = !tr.pub_dynamic;   // the debounced motion decision: the KF speed of a still object seen in pieces is not ~0 (19/11: >= 0.25 m/s on 60-70% of the ticks near parked vehicles)
         const auto cs = footprintCorners(b);
         if (!still) { tr.shape_hull.clear(); return; }
         std::vector<Eigen::Vector2d> pts = tr.shape_hull;
@@ -3766,7 +3779,7 @@ private:
         tr.shape_hull = std::move(h);
     }
     bool inShape(const Track& tr, const vision_msgs::msg::BoundingBox3D& b) const {
-        if (!shape_assoc_ || tr.shape_hull.size() < 3 || tr.pub_dynamic || planarSpeed(tr.kf.vel()) >= dynamic_speed_thresh_) return false;
+        if (!shape_assoc_ || tr.shape_hull.size() < 3 || tr.pub_dynamic) return false;
         if (hullDistance(tr.shape_hull, Eigen::Vector2d(b.center.position.x, b.center.position.y)) > shape_assoc_margin_) return false;
         int n = 0;
         for (const auto& c : footprintCorners(b)) if (hullDistance(tr.shape_hull, c) <= shape_assoc_margin_) ++n;

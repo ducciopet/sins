@@ -108,6 +108,7 @@ add_executable(static_structures_node src/static_structures_node.cpp)
 
 ament_target_dependencies(static_structures_node
   rclcpp
+  vision_msgs
   geometry_msgs
   sensor_msgs
   nav_msgs
