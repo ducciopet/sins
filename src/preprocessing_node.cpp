@@ -225,6 +225,15 @@
 
 class PreprocessingNode : public rclcpp::Node {
 public:
+    ~PreprocessingNode() override {   // final counters (a window may have fewer fallbacks than the periodic log step)
+        if (yolo_leaf_fallback_connected_)
+            std::fprintf(stderr, "[preprocessing_node] yolo_leaf_fallback_connected final: %zu box fallbacks, %zu with a leaf, %.3f ms per fallback\n",
+                         leaf_fb_n_, leaf_fb_found_, leaf_fb_n_ ? leaf_fb_ms_ / static_cast<double>(leaf_fb_n_) : 0.0);
+        if (yolo_leaf_connected_)
+            std::fprintf(stderr, "[preprocessing_node] yolo_leaf_connected final: %zu leaves, points kept %.1f%%, %.3f ms per leaf\n",
+                         leaf_conn_n_, 100.0 * static_cast<double>(leaf_conn_pts_kept_) / static_cast<double>(std::max<size_t>(1, leaf_conn_pts_in_)),
+                         leaf_conn_n_ ? leaf_conn_ms_ / static_cast<double>(leaf_conn_n_) : 0.0);
+    }
     PreprocessingNode() : Node("preprocessing_node"), rng_(std::random_device{}()) {
         // random_seed >= 0: fixed seed for the random sampling (RANSAC, subsampling), so that two replays of the same bag
         // draw the same samples (19/11: identical laptop runs differed by up to 18 MOTA points); < 0 = seeded from the
@@ -756,6 +765,7 @@ private:
     size_t leaf_conn_n_ = 0, leaf_conn_pts_in_ = 0, leaf_conn_pts_kept_ = 0;
     double leaf_conn_ms_ = 0.0;
     size_t leaf_fb_n_ = 0, leaf_fb_found_ = 0;
+    double leaf_fb_ms_ = 0.0;
 
     // largest group of points linked by gaps of about r: points are binned in cells of r/2, cells are the nodes and two
     // occupied cells touching (26-neighbourhood) are linked, so two points link when 0 < gap <= ~r (at most r/2*2*sqrt(3)
@@ -1857,6 +1867,7 @@ private:
                         const auto& info = byLabel.at(label);
                         Leaf leaf{info.first, info.second, {}};
                         if (yolo_leaf_fallback_connected_) {  // see yolo_leaf_fallback_connected's own comment
+                            const auto t0 = std::chrono::steady_clock::now();
                             std::vector<Eigen::Vector3f> q;
                             q.reserve(pv.size());
                             for (const auto& dp : pv) q.push_back(dp.second);
@@ -1885,8 +1896,10 @@ private:
                                     leaf.pts.emplace_back(static_cast<float>(pg.x()), static_cast<float>(pg.y()), static_cast<float>(pg.z()));
                                 }
                             ++leaf_fb_n_; leaf_fb_found_ += found ? 1 : 0;
-                            if (leaf_fb_n_ % 200 == 0)
-                                RCLCPP_INFO(this->get_logger(), "yolo_leaf_fallback_connected: %zu box fallbacks, %zu with a leaf", leaf_fb_n_, leaf_fb_found_);
+                            leaf_fb_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                            if (leaf_fb_n_ % 50 == 0)
+                                RCLCPP_INFO(this->get_logger(), "yolo_leaf_fallback_connected: %zu box fallbacks, %zu with a leaf, %.3f ms per fallback",
+                                            leaf_fb_n_, leaf_fb_found_, leaf_fb_ms_ / static_cast<double>(leaf_fb_n_));
                             if (static_cast<int>(leaf.pts.size()) >= yolo_leaf_min_points_) leaves.push_back(std::move(leaf));
                             continue;
                         }
