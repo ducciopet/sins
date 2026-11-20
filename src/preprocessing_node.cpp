@@ -391,6 +391,12 @@ public:
         yolo_leaf_connected_ = this->declare_parameter("yolo_leaf_connected", false);
         yolo_leaf_connect_radius_ = this->declare_parameter("yolo_leaf_connect_radius", 0.5);
         yolo_leaf_connect_radius_per_m_ = this->declare_parameter("yolo_leaf_connect_radius_per_m", 0.0);
+        // yolo_leaf_fallback_connected (default off): the mask->box fallback (a detection whose mask yields no leaf) also uses
+        // 3D connectivity instead of the depth window: the box points are split into groups linked by gaps <= the same
+        // radius, and the leaf is the NEAREST group (median camera depth) with >= yolo_leaf_min_points points spanning
+        // >= yolo_leaf_min_box_coverage of the box width (an occluder in front, a bollard, covers a sliver of it; the
+        // wall behind is farther). No distance window anywhere on the points of a YOLO detection.
+        yolo_leaf_fallback_connected_ = this->declare_parameter("yolo_leaf_fallback_connected", false);
         // Same class list the YOLO detection nodes use (cfg/coco.names by default) — loaded here only to turn a
         // detection's class STRING into a small numeric index for the semantic-leaves cloud (see
         // publishSemanticLeaves's own comment on why a number, not the string, travels on the wire).
@@ -745,14 +751,17 @@ private:
     double yolo_leaf_min_box_coverage_ = 0.5;
     bool yolo_leaf_mask_box_fallback_ = false;
     bool yolo_leaf_connected_ = false;
+    bool yolo_leaf_fallback_connected_ = false;
     double yolo_leaf_connect_radius_ = 0.5, yolo_leaf_connect_radius_per_m_ = 0.0;
     size_t leaf_conn_n_ = 0, leaf_conn_pts_in_ = 0, leaf_conn_pts_kept_ = 0;
     double leaf_conn_ms_ = 0.0;
+    size_t leaf_fb_n_ = 0, leaf_fb_found_ = 0;
 
     // largest group of points linked by gaps of about r: points are binned in cells of r/2, cells are the nodes and two
     // occupied cells touching (26-neighbourhood) are linked, so two points link when 0 < gap <= ~r (at most r/2*2*sqrt(3)
     // in the worst corner case). Cost grows with the occupied cells, not with the points (dense depth leaves).
-    static std::vector<char> largestConnected(const std::vector<Eigen::Vector3f>& p, double r) {
+    // group id (any int) of every point
+    static std::vector<int> connectedGroups(const std::vector<Eigen::Vector3f>& p, double r) {
         const double c = 0.5 * r;
         auto cellOf = [c](const Eigen::Vector3f& q) {
             return Eigen::Vector3i(static_cast<int>(std::floor(q.x() / c)), static_cast<int>(std::floor(q.y() / c)), static_cast<int>(std::floor(q.z() / c)));
@@ -779,11 +788,17 @@ private:
                 const int a = find(static_cast<int>(i)), b = find(it->second);
                 if (a != b) par[static_cast<size_t>(a)] = b;
             }
-        std::vector<int> cnt(cells.size(), 0);
-        int best = 0;
-        for (size_t i = 0; i < p.size(); ++i) { const int g = find(pointCell[i]); if (++cnt[static_cast<size_t>(g)] > cnt[static_cast<size_t>(best)]) best = g; }
+        std::vector<int> group(p.size());
+        for (size_t i = 0; i < p.size(); ++i) group[i] = find(pointCell[i]);
+        return group;
+    }
+    static std::vector<char> largestConnected(const std::vector<Eigen::Vector3f>& p, double r) {
+        const auto group = connectedGroups(p, r);
+        std::unordered_map<int, int> cnt;
+        int best = -1, bestN = 0;
+        for (const int g : group) if (++cnt[g] > bestN) { bestN = cnt[g]; best = g; }
         std::vector<char> keep(p.size(), 0);
-        for (size_t i = 0; i < p.size(); ++i) keep[i] = find(pointCell[i]) == best;
+        for (size_t i = 0; i < p.size(); ++i) keep[i] = group[i] == best;
         return keep;
     }
     double lidar_leaf_stamp_{-1e9};
@@ -1839,9 +1854,43 @@ private:
                         if (static_cast<int>(pv.size()) < yolo_leaf_min_points_) continue;
                         std::vector<float> depths;
                         for (const auto& dp : pv) depths.push_back(dp.first);
-                        const auto [depthLo, depthHi] = depthModeValleyWindow(depths, &boxUs[label], widthByLabel[label], cam.depth_max);
                         const auto& info = byLabel.at(label);
                         Leaf leaf{info.first, info.second, {}};
+                        if (yolo_leaf_fallback_connected_) {  // see yolo_leaf_fallback_connected's own comment
+                            std::vector<Eigen::Vector3f> q;
+                            q.reserve(pv.size());
+                            for (const auto& dp : pv) q.push_back(dp.second);
+                            std::vector<float> ds = depths;
+                            std::nth_element(ds.begin(), ds.begin() + static_cast<long>(ds.size() / 2), ds.end());
+                            const double r = std::max(yolo_leaf_connect_radius_, yolo_leaf_connect_radius_per_m_ * ds[ds.size() / 2]);
+                            const auto group = connectedGroups(q, r);
+                            std::unordered_map<int, std::vector<size_t>> members;
+                            for (size_t i = 0; i < group.size(); ++i) members[group[i]].push_back(i);
+                            const double boxW = std::max(1e-6, widthByLabel[label]);
+                            int best = 0; bool found = false; float bestDepth = std::numeric_limits<float>::max();
+                            for (auto& [g, idx] : members) {
+                                if (static_cast<int>(idx.size()) < yolo_leaf_min_points_) continue;
+                                float umin = std::numeric_limits<float>::max(), umax = -umin;
+                                std::vector<float> gd;
+                                gd.reserve(idx.size());
+                                for (const size_t i : idx) { umin = std::min(umin, boxUs[label][i]); umax = std::max(umax, boxUs[label][i]); gd.push_back(pv[i].first); }
+                                if ((umax - umin) / boxW < yolo_leaf_min_box_coverage_) continue;
+                                std::nth_element(gd.begin(), gd.begin() + static_cast<long>(gd.size() / 2), gd.end());
+                                if (gd[gd.size() / 2] < bestDepth) { bestDepth = gd[gd.size() / 2]; best = g; found = true; }
+                            }
+                            if (found)
+                                for (const size_t i : members[best]) {
+                                    const auto& pd = pv[i].second;
+                                    const Eigen::Vector4d pg = T_global_depth * Eigen::Vector4d(pd.x(), pd.y(), pd.z(), 1.0);
+                                    leaf.pts.emplace_back(static_cast<float>(pg.x()), static_cast<float>(pg.y()), static_cast<float>(pg.z()));
+                                }
+                            ++leaf_fb_n_; leaf_fb_found_ += found ? 1 : 0;
+                            if (leaf_fb_n_ % 200 == 0)
+                                RCLCPP_INFO(this->get_logger(), "yolo_leaf_fallback_connected: %zu box fallbacks, %zu with a leaf", leaf_fb_n_, leaf_fb_found_);
+                            if (static_cast<int>(leaf.pts.size()) >= yolo_leaf_min_points_) leaves.push_back(std::move(leaf));
+                            continue;
+                        }
+                        const auto [depthLo, depthHi] = depthModeValleyWindow(depths, &boxUs[label], widthByLabel[label], cam.depth_max);
                         for (const auto& dp : pv)
                             if (dp.first >= depthLo && dp.first <= depthHi) {
                                 const Eigen::Vector4d pg = T_global_depth * Eigen::Vector4d(dp.second.x(), dp.second.y(), dp.second.z(), 1.0);
