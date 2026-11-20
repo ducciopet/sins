@@ -649,6 +649,12 @@ public:
         min_match_score_ = declare_parameter<double>("track_min_match_score", -2.5);     // v1: min_match_score
 
         min_hits_ = declare_parameter<int>("track_min_hits", 4);                         // v1: min_confirm_hits
+        // track_min_hits_semantic (< 0 = off = track_min_hits): matches needed to confirm a track whose detection THIS tick
+        // carries a YOLO class from a camera leaf (not the LiDAR-only fallback). track_min_hits protects against LiDAR
+        // noise (a cluster that appears for a scan or two); a camera instance of a movable class on the same object is an
+        // independent sensor's evidence that the object exists, so the wait (4 x 100 ms) only costs the first frames of
+        // every person or vehicle that enters the view.
+        min_hits_semantic_ = declare_parameter<int>("track_min_hits_semantic", -1);
         max_missed_ = declare_parameter<int>("track_max_missed", 5);                     // v1: max_missed_frames
         // Classified tracks coast longer (v1: maxMissedFramesYolo_ vs maxMissedFrames_, a 3x ratio there —
         // kept here applied to THIS file's own max_missed_ above, whatever it's set to): a track with a
@@ -2739,7 +2745,8 @@ private:
             // file's architecture, since that gate already ran as a hard candidate-generation reject above —
             // a matched detection has necessarily already passed it.) Sticky: once confirmed, stays confirmed
             // until dropped.
-            if (!tr.confirmed && tr.hits >= min_hits_) {
+            if (!tr.confirmed && tr.hits >= std::min(min_hits_, (min_hits_semantic_ >= 0 && isDynamicClass(detectionClass(d)))
+                                                          ? min_hits_semantic_ : min_hits_)) {
                 const auto fb_it = fallback_class.find(static_cast<size_t>(di));
                 const bool classified_now = isDynamicClass(tr.best_class) || isDynamicClass(detectionClass(d)) ||
                                             (fb_it != fallback_class.end() && isDynamicClass(fb_it->second));
@@ -3647,7 +3654,7 @@ private:
     double veldir_gate_min_innovation_{0.30};
     double max_match_dist_{2.0}, max_match_speed_{8.0}, max_size_diff_{0.8}, min_size_diff_floor_{0.15};
     double w_pos_{1.0}, w_size_{0.35}, w_iou_{0.15}, w_prev_pos_{0.25}, w_prev_iou_{0.10}, min_match_score_{-2.5};
-    int min_hits_{4}, max_missed_{5};
+    int min_hits_{4}, max_missed_{5}, min_hits_semantic_{-1};
     int max_missed_classified_{15};
     double dynamic_speed_thresh_{0.35};
     double stationary_speed_thresh_{0.10};
