@@ -801,6 +801,10 @@ public:
         // track_publish_coasting_ticks: a confirmed track published dynamic on its last tick keeps being published
         // (dynamic, at its KF prediction) for up to this many consecutive unmatched ticks. 0 = off (v1: never).
         publish_coasting_ticks_ = declare_parameter<int>("track_publish_coasting_ticks", 0);
+        // track_publish_coasting_established (default false): coasting publication only for a track with established motion
+        // (dynamic class, or dynamic on >= track_dynamic_sticky_frames of its sticky window) and not where a matched
+        // track's footprint now is (20/11: with plain coasting 3 the persons found rose 82.3 -> 85.2% but FP +47%).
+        publish_coasting_established_ = declare_parameter<bool>("track_publish_coasting_established", false);
         // track_publish_coasting_pd_ticks (default 0 = off): a confirmed STILL track of a movable class (potentially
         // dynamic) stays published as potentially_dynamic, at its last position, for up to this many consecutive
         // unmatched ticks. A still object cannot have gone anywhere because one scan missed it (occluded by a passer-by,
@@ -3395,7 +3399,7 @@ private:
         // track_publish_coasting_pd_ticks: footprints of the tracks matched this tick — a coasting still track whose place
         // is now taken by one of them is the same object re-acquired by another track, not a second object
         std::vector<std::pair<Eigen::Vector2d, double>> matched_fp;   // (centre, half of the longer side)
-        if (publish_coasting_pd_ticks_ > 0)
+        if (publish_coasting_pd_ticks_ > 0 || (publish_coasting_ticks_ > 0 && publish_coasting_established_))
             for (const auto& [mid, mt] : tracks_)
                 if (matched_ids.count(mid))
                     matched_fp.push_back({Eigen::Vector2d(mt.last_obs.x, mt.last_obs.y), 0.5 * std::max(mt.size.x, mt.size.y)});
@@ -3413,8 +3417,21 @@ private:
                 for (const auto& [c, mr] : matched_fp)
                     if ((c - me).norm() < r + mr) { coast_pd = false; break; }   // footprints overlap: place taken
             }
-            if (coasting && !coast_pd && !(publish_coasting_ticks_ > 0 && tr.pub_dynamic && !tr.retired &&
-                              tr.unmatched_streak <= publish_coasting_ticks_)) {
+            bool coast_d = coasting && publish_coasting_ticks_ > 0 && tr.pub_dynamic && !tr.retired &&
+                           tr.unmatched_streak <= publish_coasting_ticks_;
+            if (coast_d && publish_coasting_established_) {
+                // only a track whose motion is established (a dynamic class, or dynamic on enough ticks of the sticky
+                // window) coasts: a fragment or ghost dynamic for a tick or two must not persist; and not where a
+                // matched track now sits (the object was re-acquired under a new id: the coast would be a duplicate)
+                int dyn_count = 0;
+                for (bool b : tr.dynamic_hist) if (b) ++dyn_count;
+                coast_d = isDynamicClass(tr.best_class) || dyn_count >= dynamic_sticky_frames_;
+                const Eigen::Vector3d pp = tr.kf.pos();
+                const double r = 0.5 * std::max(tr.size.x, tr.size.y);
+                for (const auto& [c, mr] : matched_fp)
+                    if (coast_d && (c - Eigen::Vector2d(pp.x(), pp.y())).norm() < r + mr) coast_d = false;
+            }
+            if (coasting && !coast_pd && !coast_d) {
                 dbgCsv(header, id, tr, false, -1, -1, true, "missed");
                 continue;
             }  // predicted-only this tick (missed) — never published either way, matching v1
@@ -3730,6 +3747,7 @@ private:
     bool disocclusion_require_unseen_{false};
     double disocclusion_seen_max_innov_{-1.0};
     int publish_coasting_ticks_{0};
+    bool publish_coasting_established_{false};
     int publish_coasting_pd_ticks_{0};
     bool shape_assoc_{false};
     double shape_assoc_margin_{0.3}, shape_assoc_max_length_{12.0}, shape_settle_window_{1.0}, shape_settle_growth_{0.3};
