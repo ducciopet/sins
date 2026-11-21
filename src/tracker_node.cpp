@@ -691,6 +691,11 @@ public:
         dynamic_confirm_ticks_unclassified_ = declare_parameter<int>("track_dynamic_confirm_ticks_unclassified", 8);
         // ...and outside every camera FOV, where nothing can be classified and a long wait only delays real movers.
         dynamic_confirm_ticks_unclassified_out_fov_ = declare_parameter<int>("track_dynamic_confirm_ticks_unclassified_out_fov", 5);
+        // >= 0 (default -1 = off, 21/11): an unclassified track whose box has the size of a standing person (track_dynamic_target_size
+        // +- track_dynamic_size_tolerance, the size gate below) needs only this many ticks of motion evidence, in or out of a camera
+        // FOV. The evidence itself is unchanged (net displacement from birth, consistency window, KF/point checks): only the wait is
+        // shorter. For persons the cameras never see (CODa: 71% of the lost moving persons out of FOV).
+        person_size_confirm_ticks_ = declare_parameter<int>("track_person_size_confirm_ticks", -1);
         // MOTION-EARNED PD: an unclassified track that has been published dynamic for this many ticks is
         // potentially_dynamic when it stops, instead of static — the camera never saw it (e.g. a person walking
         // behind a robot with no rear camera), but it has shown it moves. Kept while the track lives; revoked,
@@ -3446,7 +3451,12 @@ private:
             const int confirm_ticks = isDynamicClass(tr.best_class) ? dynamic_confirm_ticks_
                                     : insideAnyCameraFov(tr.kf.pos()) ? dynamic_confirm_ticks_unclassified_
                                     : dynamic_confirm_ticks_unclassified_out_fov_;
-            const bool debounced_dynamic = tr.dynamic_ticks >= confirm_ticks;
+            const bool person_sized = std::abs(tr.size.x - dynamic_target_size_.x()) < dynamic_size_tolerance_.x() &&
+                                      std::abs(tr.size.y - dynamic_target_size_.y()) < dynamic_size_tolerance_.y() &&
+                                      std::abs(tr.size.z - dynamic_target_size_.z()) < dynamic_size_tolerance_.z();
+            const int confirm_eff = (person_size_confirm_ticks_ >= 0 && !isDynamicClass(tr.best_class) && person_sized)
+                                    ? std::min(confirm_ticks, person_size_confirm_ticks_) : confirm_ticks;
+            const bool debounced_dynamic = tr.dynamic_ticks >= confirm_eff;
             // Sticky-dynamic shortcut (v1 PATH 2, see the constructor's own comment): once enough of the
             // track's recent history was dynamic, don't require the FULL fresh debounce streak again after one
             // noisy dip — a single tick's instantaneous speed still has to clear the bar, though.
@@ -3678,6 +3688,7 @@ private:
     int dynamic_confirm_ticks_{3};
     int dynamic_confirm_ticks_unclassified_{8};
     int dynamic_confirm_ticks_unclassified_out_fov_{5};
+    int person_size_confirm_ticks_{-1};
     int motion_pd_min_dynamic_ticks_{20};
     int first_class_static_confirm_ticks_{5};
     double decay_fov_border_frac_{0.10};
