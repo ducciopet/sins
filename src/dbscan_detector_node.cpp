@@ -76,6 +76,7 @@ struct SourceResult {
     size_t flat_boxes = 0;    // boxes lower than 0.2 m but longer than 1 m (a wall split into one box per ring)
     size_t large_boxes = 0;   // boxes with a footprint side > 1.5 m (fusion indicator)
     size_t splits = 0;        // clusters split into a tall column + the low rest
+    std::vector<int> box_split_parent;          // per kept box: id of the pre-split DBSCAN cluster when the splitter cut it (else -1)
     double ms = 0.0;
     bool valid = false;
 };
@@ -271,6 +272,11 @@ public:
         // before the cut — a car the LiDAR sees in pieces (glass, dark paint, ring gaps) that one YOLO mask covers.
         yolo_refine_merge_fragments_ = declare_parameter<bool>("yolo_refine_merge_fragments", false);
         yolo_refine_merge_min_inside_ = declare_parameter<double>("yolo_refine_merge_min_inside", 0.5);
+        // true (default off, 21/11): the tall/low split of a LiDAR cluster (split_enabled) is undone at fusion when ONE YOLO
+        // instance covers it — every kept part has >= yolo_refine_merge_min_inside of its points inside a leaf box (+ yolo_refine_margin)
+        // and no other leaf holds >= camera_min_points of any part. Several instances (a crowd, a person beside a car) or none keep
+        // the split. Class-agnostic: the mask decides, no class or size threshold.
+        split_masked_ = declare_parameter<bool>("split_masked", false);
         // OBJECT-SCALE FRAGMENT MERGE (fragment_merge_gap_ratio, < 0 = off): a second grouping of the final objects, at
         // the scale of the pieces themselves instead of DBSCAN's fixed eps. Two pieces join when ALL agree: (1) their
         // horizontal point-to-point gap is at most this ratio x the shorter piece's length (and fragment_merge_max_gap),
@@ -515,17 +521,23 @@ private:
             epsz_i[i] = eps.atZ(r);
         }
         auto clusters = sins::dbscanGrid(res.pts, eps_i, epsz_i, min_pts);
+        std::vector<int> parent;  // pre-split cluster of each cluster (-1 = not split)
         if (split.enabled && yaw_only && !planes.empty()) {
             std::vector<std::vector<int>> refined;
-            for (auto& idx : clusters) {
-                auto parts = splitTallColumns(res.pts, idx, eps_i, epsz_i, min_pts, planes, split);
+            for (size_t ci = 0; ci < clusters.size(); ++ci) {
+                auto parts = splitTallColumns(res.pts, clusters[ci], eps_i, epsz_i, min_pts, planes, split);
                 if (parts.size() > 1) ++res.splits;
-                for (auto& pt : parts) refined.push_back(std::move(pt));
+                for (auto& pt : parts) {
+                    refined.push_back(std::move(pt));
+                    parent.push_back(parts.size() > 1 ? static_cast<int>(ci) : -1);
+                }
             }
             clusters = std::move(refined);
         }
+        parent.resize(clusters.size(), -1);
         res.num_clusters = clusters.size();
-        for (const auto& idx : clusters) {
+        for (size_t ci = 0; ci < clusters.size(); ++ci) {
+            const auto& idx = clusters[ci];
             Eigen::Vector3d up = Eigen::Vector3d::UnitZ();
             if (yaw_only && !planes.empty()) {
                 Eigen::Vector3d c = Eigen::Vector3d::Zero();
@@ -553,6 +565,7 @@ private:
             const int id = static_cast<int>(res.boxes.size());
             res.boxes.push_back(box);
             res.box_points.push_back(idx);
+            res.box_split_parent.push_back(parent[ci]);
             if (std::max(box.size.x(), box.size.y()) > 1.5) ++res.large_boxes;
             if (yaw_only ? (box.size.z() < 0.2 && std::max(box.size.x(), box.size.y()) > 1.0) : false) ++res.flat_boxes;
             for (int i : idx) res.point_cluster[i] = id;
@@ -787,6 +800,8 @@ private:
     double fusion_late_leaves_track_radius_{1.5};
     std::string tracks_topic_;
     bool yolo_refine_merge_fragments_{false};
+    bool split_masked_{false};
+    size_t splits_undone_ = 0, splits_seen_ = 0, split_masked_log_ = 0;
     double yolo_refine_merge_min_inside_{0.5};
     double fragment_merge_gap_ratio_{-1.0}, fragment_merge_max_gap_{1.0}, fragment_merge_min_z_overlap_{0.5}, fragment_merge_width_margin_{0.3};
     double fragment_merge_anchor_min_length_{-1.0};
@@ -1051,6 +1066,72 @@ private:
         return out;
     }
 
+    // split_masked: rejoin the parts of a split LiDAR cluster that one YOLO instance covers (see the parameter's comment).
+    void undoMaskedSplits() {
+        const SourceResult& L = *pending_.lidar;
+        std::map<int, std::vector<size_t>> groups;
+        for (size_t b = 0; b < L.box_split_parent.size(); ++b)
+            if (L.box_split_parent[b] >= 0) groups[L.box_split_parent[b]].push_back(b);
+        std::vector<std::vector<size_t>> joins;
+        for (const auto& [par, parts] : groups) {
+            if (parts.size() < 2) continue;
+            ++splits_seen_;
+            int covering = 0, blocking = 0;
+            for (const auto& [name, src] : pending_.cams) {
+                if (!isLeafSource(name) || !src) continue;
+                for (size_t li = 0; li < src->boxes.size(); ++li) {
+                    const Obb& lb = src->boxes[li];
+                    const Eigen::Matrix3d Rl = lb.rotation.toRotationMatrix().transpose();
+                    bool covers_all = true, touches = false;
+                    for (size_t b : parts) {
+                        size_t n = 0;
+                        for (int q : L.box_points[b]) {
+                            const Eigen::Vector3d d = Rl * (L.pts[q].cast<double>() - lb.center);
+                            if (std::abs(d.x()) <= lb.size.x() * 0.5 + yolo_refine_margin_ && std::abs(d.y()) <= lb.size.y() * 0.5 + yolo_refine_margin_ &&
+                                std::abs(d.z()) <= lb.size.z() * 0.5 + yolo_refine_margin_) ++n;
+                        }
+                        if (static_cast<int>(n) >= camera_min_points_) touches = true;
+                        if (n < yolo_refine_merge_min_inside_ * L.box_points[b].size()) covers_all = false;
+                    }
+                    if (covers_all) ++covering;
+                    else if (touches) ++blocking;
+                }
+            }
+            if (covering >= 1 && blocking == 0) joins.push_back(parts);
+        }
+        if (joins.empty()) return;
+        auto R = std::make_shared<SourceResult>(L);
+        std::vector<char> drop(L.boxes.size(), 0);
+        for (const auto& parts : joins) {
+            std::vector<int> uni;
+            for (size_t b : parts) uni.insert(uni.end(), L.box_points[b].begin(), L.box_points[b].end());
+            Eigen::Vector3d c = Eigen::Vector3d::Zero();
+            for (int q : uni) c += L.pts[q].cast<double>();
+            c /= static_cast<double>(uni.size());
+            Obb box = sins::computeObb(L.pts, uni, yaw_only_, yaw_only_ ? localUp(floor_planes_, c) : Eigen::Vector3d::UnitZ());
+            if (!boxOk(box, L.pts)) continue;
+            R->boxes[parts[0]] = box;
+            R->box_points[parts[0]] = uni;
+            R->box_split_parent[parts[0]] = -1;
+            for (size_t k = 1; k < parts.size(); ++k) drop[parts[k]] = 1;
+            ++splits_undone_;
+        }
+        SourceResult& O = *R;
+        std::vector<Obb> boxes;
+        std::vector<std::vector<int>> bp;
+        std::vector<int> sp;
+        for (size_t b = 0; b < O.boxes.size(); ++b) {
+            if (drop[b]) continue;
+            boxes.push_back(O.boxes[b]); bp.push_back(std::move(O.box_points[b])); sp.push_back(O.box_split_parent[b]);
+        }
+        O.boxes = std::move(boxes); O.box_points = std::move(bp); O.box_split_parent = std::move(sp);
+        O.point_cluster.assign(O.pts.size(), -1);
+        for (size_t b = 0; b < O.box_points.size(); ++b) for (int q : O.box_points[b]) O.point_cluster[q] = static_cast<int>(b);
+        pending_.lidar = R;
+        if (++split_masked_log_ % 50 == 0)
+            RCLCPP_INFO(get_logger(), "split_masked: %zu of %zu split clusters rejoined (one YOLO instance covers them)", splits_undone_, splits_seen_);
+    }
+
     void fuseAndPublish() {
         for (const auto& [name, st] : pending_.cam_stamp)
             if (isLeafSource(name)) {
@@ -1066,6 +1147,7 @@ private:
                         late_leaf_age_ms_[50], late_leaf_age_ms_[90], late_class_only_, late_compensated_, fragments_merged_);
             late_leaf_age_ms_.clear();
         }
+        if (split_masked_ && pending_.lidar) undoMaskedSplits();
         struct Item { unsigned src; const SourceResult* res; size_t idx; };
         std::vector<Item> items;
         if (pending_.lidar) for (size_t i = 0; i < pending_.lidar->boxes.size(); ++i) items.push_back({0, pending_.lidar.get(), i});
