@@ -1107,6 +1107,10 @@ public:
         // observed centre. Physical: a still object does not move; lab seq 1950 / CODa: a static neighbour track whose
         // object lost its cluster took over a passing person's cluster 1.3 m away (pre-existing-track takeovers 14 -> 27).
         static_anchor_r_ = declare_parameter<double>("track_static_anchor_radius", -1.0);
+        // ...and the reject applies only when the candidate lies within this radius [m] of a moving confirmed track's
+        // prediction (published dynamic or of a dynamic class): it blocks the takeover, not a still object's own sliding
+        // centroid (first version without it, chain E 0_w1: -9 MOTA, static tracks re-born on every partial view).
+        static_anchor_claim_r_ = declare_parameter<double>("track_static_anchor_claim_radius", 1.0);
         height_ema_alpha_ = declare_parameter<double>("track_height_ema_alpha", 0.3);
         // Output box completion for "person" tracks (see completePersonBox()).
         person_box_completion_ = declare_parameter<bool>("track_person_box_completion", true);
@@ -2335,6 +2339,14 @@ private:
         if (fragment_merge_margin_ >= 0.0) mergeFragments(msg, points_by_det, track_ids, predicted_pos);
 
         const size_t nt = track_ids.size(), nd = msg->detections.size();
+        // static anchor: predicted positions of the confirmed tracks that move (published dynamic or of a dynamic class)
+        std::vector<std::pair<int, Eigen::Vector2d>> movers;
+        if (static_anchor_r_ > 0.0)
+            for (size_t k = 0; k < nt; ++k) {
+                const Track& m = tracks_.at(track_ids[k]);
+                if (m.confirmed && (m.pub_dynamic || isDynamicClass(m.best_class)))
+                    movers.push_back({track_ids[k], Eigen::Vector2d(predicted_pos[k].x(), predicted_pos[k].y())});
+            }
         struct Cand { size_t det, track; double score; };
         // track_debug_lifecycle: why each (track, detection) pair was NOT a candidate this tick
         std::map<std::pair<size_t, size_t>, const char*> reject_reason;
@@ -2387,7 +2399,14 @@ private:
                 if (static_anchor_r_ > 0.0 && tr.confirmed && !isDynamicClass(tr.best_class) && !tr.pub_dynamic &&
                     tr.dynamic_ticks == 0 && std::none_of(tr.dynamic_hist.begin(), tr.dynamic_hist.end(), [](bool b) { return b; })) {
                     const double r = std::max(static_anchor_r_, 0.5 * std::max(tr.size.x, tr.size.y));
-                    if (std::hypot(c.x - tr.last_obs.x, c.y - tr.last_obs.y) > r) { ++static_anchor_rejects_; noteReject(ti, di, "static_anchor"); continue; }
+                    if (std::hypot(c.x - tr.last_obs.x, c.y - tr.last_obs.y) > r) {
+                        // only where the candidate is a moving track's object (its prediction within the claim radius):
+                        // the takeover case; elsewhere a still object's sliding centroid (partial views) is still followed
+                        bool claimed = false;
+                        for (const auto& [mid, mp] : movers)
+                            if (mid != track_ids[ti] && std::hypot(c.x - mp.x(), c.y - mp.y()) <= static_anchor_claim_r_) { claimed = true; break; }
+                        if (claimed) { ++static_anchor_rejects_; noteReject(ti, di, "static_anchor"); continue; }
+                    }
                 }
                 // second observation of a track without a velocity estimate (track_two_point_init): only the physical
                 // per-scan displacement bound, scaled by the scans elapsed since the first observation
@@ -3719,6 +3738,7 @@ private:
     int person_size_confirm_ticks_{-1};
     double height_same_place_r_{-1.0};
     double static_anchor_r_{-1.0};
+    double static_anchor_claim_r_{1.0};
     size_t static_anchor_rejects_ = 0;
     size_t posture_waived_ = 0;   // height rejects waived as a posture change (logged with the association stats)
     int motion_pd_min_dynamic_ticks_{20};
