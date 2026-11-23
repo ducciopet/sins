@@ -1102,6 +1102,11 @@ public:
         // the footprint and the place, only the top drops (lab seq 1950: a crouch 1.7 -> 0.8 m re-born the track as static).
         // Clutter that a track could slide onto stands BESIDE the object, not on its own last centre.
         height_same_place_r_ = declare_parameter<double>("track_height_drop_same_place_radius", -1.0);
+        // > 0 (default -1 = off, 23/11): a confirmed track that never showed motion (no dynamic class, never published
+        // dynamic, empty dynamic history) re-acquires only within max(this radius, half its footprint) [m] of its last
+        // observed centre. Physical: a still object does not move; lab seq 1950 / CODa: a static neighbour track whose
+        // object lost its cluster took over a passing person's cluster 1.3 m away (pre-existing-track takeovers 14 -> 27).
+        static_anchor_r_ = declare_parameter<double>("track_static_anchor_radius", -1.0);
         height_ema_alpha_ = declare_parameter<double>("track_height_ema_alpha", 0.3);
         // Output box completion for "person" tracks (see completePersonBox()).
         person_box_completion_ = declare_parameter<bool>("track_person_box_completion", true);
@@ -2272,6 +2277,8 @@ private:
         if (class_anchor_carrier_)
             RCLCPP_INFO(get_logger(), "class anchors: %zu, erased as the carrier left %zu, transfers blocked by a live carrier %zu (total)",
                         class_anchors_.size(), anchor_carrier_left_, anchor_carrier_blocked_);
+        if (static_anchor_r_ > 0.0)
+            RCLCPP_INFO(get_logger(), "static anchor: %zu candidate pairs rejected (total)", static_anchor_rejects_);
         if (height_same_place_r_ > 0.0)
             RCLCPP_INFO(get_logger(), "posture: %zu height rejects waived on the track's own spot (total)", posture_waived_);
         if (shape_assoc_ || publish_coasting_pd_ticks_ > 0)
@@ -2373,6 +2380,15 @@ private:
                 const double jitter = jitter_fp_scale_ > 0.0
                     ? jitter_fp_scale_ * 0.5 * trackExtent(tr) : 0.0;
                 if (!in_shape && predDist >= gate_dist + jitter) { noteReject(ti, di, "dist"); continue; }
+                // static anchor (track_static_anchor_radius): a confirmed track that has never shown motion (no dynamic
+                // class, not dynamic now or in its recent history) stands where its object stands; it re-acquires only
+                // within this radius (or half its footprint) of its last observation, so it cannot slide onto a person
+                // walking past after its own object lost its cluster (lab 1950: a static neighbour jumped 1.3 m onto a person)
+                if (static_anchor_r_ > 0.0 && tr.confirmed && !isDynamicClass(tr.best_class) && !tr.pub_dynamic &&
+                    tr.dynamic_ticks == 0 && std::none_of(tr.dynamic_hist.begin(), tr.dynamic_hist.end(), [](bool b) { return b; })) {
+                    const double r = std::max(static_anchor_r_, 0.5 * std::max(tr.size.x, tr.size.y));
+                    if (std::hypot(c.x - tr.last_obs.x, c.y - tr.last_obs.y) > r) { ++static_anchor_rejects_; noteReject(ti, di, "static_anchor"); continue; }
+                }
                 // second observation of a track without a velocity estimate (track_two_point_init): only the physical
                 // per-scan displacement bound, scaled by the scans elapsed since the first observation
                 const bool no_vel = two_point_init_ && tr.hits == 1;
@@ -3702,6 +3718,8 @@ private:
     int dynamic_confirm_ticks_unclassified_out_fov_{5};
     int person_size_confirm_ticks_{-1};
     double height_same_place_r_{-1.0};
+    double static_anchor_r_{-1.0};
+    size_t static_anchor_rejects_ = 0;
     size_t posture_waived_ = 0;   // height rejects waived as a posture change (logged with the association stats)
     int motion_pd_min_dynamic_ticks_{20};
     int first_class_static_confirm_ticks_{5};
