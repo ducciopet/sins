@@ -1099,6 +1099,8 @@ private:
             }
             if (covering >= 1 && blocking == 0) joins.push_back(parts);
         }
+        if (++split_masked_log_ % 100 == 0)   // every 100 fusions, whether or not this one rejoined anything
+            RCLCPP_INFO(get_logger(), "split_masked: %zu of %zu split clusters rejoined (one YOLO instance covers them)", splits_undone_ + joins.size(), splits_seen_);
         if (joins.empty()) return;
         auto R = std::make_shared<SourceResult>(L);
         std::vector<char> drop(L.boxes.size(), 0);
@@ -1128,8 +1130,6 @@ private:
         O.point_cluster.assign(O.pts.size(), -1);
         for (size_t b = 0; b < O.box_points.size(); ++b) for (int q : O.box_points[b]) O.point_cluster[q] = static_cast<int>(b);
         pending_.lidar = R;
-        if (++split_masked_log_ % 50 == 0)
-            RCLCPP_INFO(get_logger(), "split_masked: %zu of %zu split clusters rejoined (one YOLO instance covers them)", splits_undone_, splits_seen_);
     }
 
     void fuseAndPublish() {
