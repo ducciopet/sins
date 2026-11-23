@@ -1097,6 +1097,11 @@ public:
         w_height_ = declare_parameter<double>("track_match_height_weight", 0.5);
         max_top_diff_ = declare_parameter<double>("track_max_top_diff", 1.0);
         height_min_samples_ = declare_parameter<int>("track_height_min_samples", 5);
+        // > 0 (default -1 = off, 23/11): a candidate whose top is LOWER than the track's, within this radius [m] of the
+        // track's last observed centre, gets no height reject and no height penalty: a person crouching or sitting keeps
+        // the footprint and the place, only the top drops (lab seq 1950: a crouch 1.7 -> 0.8 m re-born the track as static).
+        // Clutter that a track could slide onto stands BESIDE the object, not on its own last centre.
+        height_same_place_r_ = declare_parameter<double>("track_height_drop_same_place_radius", -1.0);
         height_ema_alpha_ = declare_parameter<double>("track_height_ema_alpha", 0.3);
         // Output box completion for "person" tracks (see completePersonBox()).
         person_box_completion_ = declare_parameter<bool>("track_person_box_completion", true);
@@ -2267,6 +2272,8 @@ private:
         if (class_anchor_carrier_)
             RCLCPP_INFO(get_logger(), "class anchors: %zu, erased as the carrier left %zu, transfers blocked by a live carrier %zu (total)",
                         class_anchors_.size(), anchor_carrier_left_, anchor_carrier_blocked_);
+        if (height_same_place_r_ > 0.0)
+            RCLCPP_INFO(get_logger(), "posture: %zu height rejects waived on the track's own spot (total)", posture_waived_);
         if (shape_assoc_ || publish_coasting_pd_ticks_ > 0)
             RCLCPP_INFO(get_logger(), "shape assoc: %zu in-shape candidates, %zu hull resets; PD coasting publications %zu (total)",
                         shape_in_matches_, shape_hull_resets_, pd_coast_pubs_);
@@ -2387,7 +2394,12 @@ private:
                 // track has a settled top (track_height_min_samples matched ticks).
                 const double det_top = c.z + 0.5 * d.bbox.size.z;
                 const bool height_known = tr.top_samples >= height_min_samples_;
-                const double topDiff = height_known ? std::abs(det_top - tr.top_z) : 0.0;
+                // posture change (track_height_drop_same_place_radius): a LOWER top on the track's own spot is the same body
+                // crouching/sitting/bending, not clutter beside it — no height penalty or reject there
+                const bool posture = height_same_place_r_ > 0.0 && det_top < tr.top_z &&
+                                     std::hypot(c.x - tr.last_obs.x, c.y - tr.last_obs.y) <= height_same_place_r_;
+                if (posture && height_known && std::abs(det_top - tr.top_z) > max_top_diff_) ++posture_waived_;
+                const double topDiff = (height_known && !posture) ? std::abs(det_top - tr.top_z) : 0.0;
                 if (!in_shape && topDiff > max_top_diff_) { noteReject(ti, di, "height"); continue; }
                 // Classified-track baseline size gate (no v1 equivalent): the check above compares the
                 // candidate against tr.size, the LATEST matched size — which can drift gradually tick-by-tick,
@@ -3689,6 +3701,8 @@ private:
     int dynamic_confirm_ticks_unclassified_{8};
     int dynamic_confirm_ticks_unclassified_out_fov_{5};
     int person_size_confirm_ticks_{-1};
+    double height_same_place_r_{-1.0};
+    size_t posture_waived_ = 0;   // height rejects waived as a posture change (logged with the association stats)
     int motion_pd_min_dynamic_ticks_{20};
     int first_class_static_confirm_ticks_{5};
     double decay_fov_border_frac_{0.10};
