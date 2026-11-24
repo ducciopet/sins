@@ -1107,6 +1107,12 @@ public:
         // observed centre. Physical: a still object does not move; lab seq 1950 / CODa: a static neighbour track whose
         // object lost its cluster took over a passing person's cluster 1.3 m away (pre-existing-track takeovers 14 -> 27).
         static_anchor_r_ = declare_parameter<double>("track_static_anchor_radius", -1.0);
+        // >= 0 (default -1 = off, 24/11): a detection whose centre lies inside the predicted box (+ this margin [m]) of a
+        // confirmed MOVING track (published dynamic or dynamic class) and is smaller than it is a PIECE of that object:
+        // (1) it may associate to the track with the centre-based hard gates waived (like track_shape_assoc), and
+        // (2) if unmatched it spawns no new track. CODa seq 10 (24/11): a missed vehicle holds ~6 debug tracks of pieces
+        // (1.6 x 0.3 m, static or re-born every scan) while the whole-vehicle track coasts unmatched 27% of the time.
+        extent_assoc_margin_ = declare_parameter<double>("track_extent_assoc_margin", -1.0);
         // ...and the reject applies only when the candidate lies within this radius [m] of a moving confirmed track's
         // prediction (published dynamic or of a dynamic class): it blocks the takeover, not a still object's own sliding
         // centroid (first version without it, chain E 0_w1: -9 MOTA, static tracks re-born on every partial view).
@@ -1519,11 +1525,24 @@ private:
     // v1's isCloseToExistingTrack/isDetectionDuplicateOfPrediction — see the constructor's own comment on why
     // this matters. Checked before spawning a brand-new track for an unmatched detection: is it actually a
     // near-duplicate of some OTHER, already-existing track's own prediction this same tick?
+    // track_extent_assoc_margin: is detection d a PIECE of track tr's object? Its centre lies inside tr's box at the KF
+    // prediction (tr's last size and orientation, + margin), it is smaller than tr, and tr is a confirmed object that moves
+    // (published dynamic or of a dynamic class).
+    bool inTrackExtent(const Track& tr, const Eigen::Vector3d& pred, const vision_msgs::msg::Detection3D& d) const {
+        if (extent_assoc_margin_ < 0.0 || !tr.confirmed || !(tr.pub_dynamic || isDynamicClass(tr.best_class))) return false;
+        if (std::max(d.bbox.size.x, d.bbox.size.y) >= std::max(tr.size.x, tr.size.y)) return false;
+        const double yaw = yawOf(tr.orientation), cs = std::cos(yaw), sn = std::sin(yaw);
+        const double dx = d.bbox.center.position.x - pred.x(), dy = d.bbox.center.position.y - pred.y();
+        return std::abs(dx * cs + dy * sn) <= 0.5 * tr.size.x + extent_assoc_margin_ &&
+               std::abs(-dx * sn + dy * cs) <= 0.5 * tr.size.y + extent_assoc_margin_;
+    }
+
     bool isDuplicateOfExistingTrack(const vision_msgs::msg::Detection3D& d, const std::vector<int>& track_ids,
                                     const std::vector<Eigen::Vector3d>& predicted_pos) const {
         const auto& c = d.bbox.center.position;
         for (size_t ti = 0; ti < track_ids.size(); ++ti) {
             const Track& tr = tracks_.at(track_ids[ti]);
+            if (inTrackExtent(tr, predicted_pos[ti], d)) return true;   // a piece of a moving object: no new track
             const double centerDist = std::hypot(predicted_pos[ti].x() - c.x, predicted_pos[ti].y() - c.y);
             if (centerDist >= duplicate_track_dist_thresh_) continue;
             const Footprint predFp{predicted_pos[ti].x() - tr.size.x * 0.5, predicted_pos[ti].x() + tr.size.x * 0.5,
@@ -2281,6 +2300,8 @@ private:
         if (class_anchor_carrier_)
             RCLCPP_INFO(get_logger(), "class anchors: %zu, erased as the carrier left %zu, transfers blocked by a live carrier %zu (total)",
                         class_anchors_.size(), anchor_carrier_left_, anchor_carrier_blocked_);
+        if (extent_assoc_margin_ >= 0.0)
+            RCLCPP_INFO(get_logger(), "extent assoc: %zu candidate pairs inside a moving track's extent (total)", extent_matches_);
         if (static_anchor_r_ > 0.0)
             RCLCPP_INFO(get_logger(), "static anchor: %zu candidate pairs rejected (total)", static_anchor_rejects_);
         if (height_same_place_r_ > 0.0)
@@ -2386,7 +2407,9 @@ private:
                 const double gate_size = lidar_only_outside_fov ? outside_fov_max_size_diff_ : max_size_diff_;
 
                 const double predDist = std::hypot(c.x - predicted_pos[ti].x(), c.y - predicted_pos[ti].y());
-                const bool in_shape = inShape(tr, d.bbox);   // track_shape_assoc: centre-based hard gates do not apply
+                const bool in_extent = inTrackExtent(tr, predicted_pos[ti], d);   // track_extent_assoc_margin
+                if (in_extent) ++extent_matches_;
+                const bool in_shape = inShape(tr, d.bbox) || in_extent;   // track_shape_assoc: centre-based hard gates do not apply
                 if (in_shape) ++shape_in_matches_;
                 // partial-view jitter allowance (track_jitter_footprint_scale): see the parameter's own comment
                 const double jitter = jitter_fp_scale_ > 0.0
@@ -3739,6 +3762,8 @@ private:
     double height_same_place_r_{-1.0};
     double static_anchor_r_{-1.0};
     double static_anchor_claim_r_{1.0};
+    double extent_assoc_margin_{-1.0};
+    size_t extent_matches_ = 0;
     size_t static_anchor_rejects_ = 0;
     size_t posture_waived_ = 0;   // height rejects waived as a posture change (logged with the association stats)
     int motion_pd_min_dynamic_ticks_{20};
