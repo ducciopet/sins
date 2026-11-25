@@ -295,6 +295,17 @@ public:
         // with the ANCHOR's length (fragment_merge_gap_ratio x anchor, capped at fragment_merge_max_gap), not with the
         // smaller piece: two small objects side by side (pedestrians walking together) have no anchor and never merge.
         fragment_merge_anchor_min_length_ = declare_parameter<double>("fragment_merge_anchor_min_length", -1.0);
+        // VEHICLE-ANCHORED MODE (fragment_merge_vehicle_anchor, default off; needs fragment_merge_gap_ratio > 0): a merge needs a
+        // piece YOLO classed as a vehicle (car/truck/bus) on one side and an UNCLASSIFIED piece on the other. CODa seq 10 (25/11,
+        // eval/diagnostics/veh_leaf_cover.py): 52% of the missed vehicles in the camera FOV hold a vehicle-classed piece covering
+        // only ~46% of the vehicle length (30% for >= 6 m trucks) next to unclassified pieces of the same body (the leaf sees part of
+        // the body; the cut leaves the rest as separate pieces). Gap allowed: fragment_merge_max_gap (not the ratio x length: the
+        // classed piece is often a short slice); the in-line width test is replaced by an absolute vehicle width cap
+        // (fragment_merge_vehicle_max_width: an L-shaped side+rear view is wider than either piece); height overlap and the usual
+        // size filter as above. Unclassified+unclassified and classed+classed pairs never join. Counters: the object-scale
+        // merge line (merges/scan, ms/scan).
+        fragment_merge_vehicle_anchor_ = declare_parameter<bool>("fragment_merge_vehicle_anchor", false);
+        fragment_merge_vehicle_max_width_ = declare_parameter<double>("fragment_merge_vehicle_max_width", 2.8);
         // OCCLUSION EDGES (occlusion_edge_check, default off): for every published object, how many of its two visible
         // side edges (as seen from the robot, in azimuth) are occlusion boundaries: another object's points lie just past
         // that edge (within max(occlusion_edge_min_angle_deg, the LiDAR eps at that range)) and nearer than the edge by
@@ -805,6 +816,8 @@ private:
     double yolo_refine_merge_min_inside_{0.5};
     double fragment_merge_gap_ratio_{-1.0}, fragment_merge_max_gap_{1.0}, fragment_merge_min_z_overlap_{0.5}, fragment_merge_width_margin_{0.3};
     double fragment_merge_anchor_min_length_{-1.0};
+    bool fragment_merge_vehicle_anchor_{false};
+    double fragment_merge_vehicle_max_width_{2.8};
     size_t scale_merges_ = 0, scale_merge_ticks_ = 0;
     bool occlusion_edge_check_{false};
     double occlusion_edge_min_angle_deg_{1.0}, occlusion_edge_range_margin_{0.5};
@@ -944,6 +957,7 @@ private:
             }
         }
         auto vetoed = [&](size_t i) { return fused[i].yolo_class == "person"; };
+        auto isVeh = [](const std::string& c) { return c == "car" || c == "truck" || c == "bus"; };
         struct Pair { double gap; size_t i, j; };
         std::vector<Pair> pairs;
         for (size_t i = 0; i < n; ++i) {
@@ -951,12 +965,18 @@ private:
             for (size_t j = i + 1; j < n; ++j) {
                 if (vetoed(j) || fused[j].pts.empty()) continue;
                 if (!fused[i].yolo_class.empty() && !fused[j].yolo_class.empty() && fused[i].yolo_class != fused[j].yolo_class) continue;
+                if (fragment_merge_vehicle_anchor_) {   // see the parameter's own comment
+                    if (!fused[i].yolo_class.empty() && !fused[j].yolo_class.empty()) continue;   // classed + classed: never
+                    if (!fused[i].yolo_class.empty() && !isVeh(fused[i].yolo_class)) continue;    // a non-vehicle class never anchors
+                    if (!fused[j].yolo_class.empty() && !isVeh(fused[j].yolo_class)) continue;
+                }
                 double allow = std::min(fragment_merge_max_gap_, fragment_merge_gap_ratio_ * std::min(in[i].len, in[j].len));
                 if (fragment_merge_anchor_min_length_ > 0.0) {   // see the parameter's own comment
                     const Info& an = in[i].len >= in[j].len ? in[i] : in[j];
                     if (an.len < fragment_merge_anchor_min_length_ || an.len < 2.0 * an.wid) continue;
                     allow = std::min(fragment_merge_max_gap_, fragment_merge_gap_ratio_ * an.len);
                 }
+                if (fragment_merge_vehicle_anchor_) allow = fragment_merge_max_gap_;
                 if ((in[i].c - in[j].c).norm() > 0.5 * (in[i].len + in[j].len) + allow) continue;
                 const double ov = std::min(in[i].z1, in[j].z1) - std::max(in[i].z0, in[j].z0);
                 if (ov < fragment_merge_min_z_overlap_ * std::min(in[i].z1 - in[i].z0, in[j].z1 - in[j].z0)) continue;
@@ -974,11 +994,16 @@ private:
         std::vector<double> gwid(n);
         for (size_t i = 0; i < n; ++i) gwid[i] = in[i].wid;
         size_t merged = 0;
+        // vehicle-anchored mode: a pair of two unclassified pieces may only join once one side's group became a vehicle,
+        // so the (gap-sorted) list is passed again while merges happen (at most 3 passes)
+        for (int pass = 0, before = -1; pass < (fragment_merge_vehicle_anchor_ ? 3 : 1) && static_cast<int>(merged) != before; ++pass) {
+        before = static_cast<int>(merged);
         for (const auto& pr : pairs) {
             const size_t a = find(pr.i), b = find(pr.j);
             if (a == b) continue;
             auto& A = fused[a]; auto& B = fused[b];
             if (!A.yolo_class.empty() && !B.yolo_class.empty() && A.yolo_class != B.yolo_class) continue;
+            if (fragment_merge_vehicle_anchor_ && (isVeh(A.yolo_class) == isVeh(B.yolo_class) || (!A.yolo_class.empty() && !B.yolo_class.empty()))) continue;
             std::vector<Eigen::Vector3f> up = A.pts;
             up.insert(up.end(), B.pts.begin(), B.pts.end());
             std::vector<int> idx(up.size());
@@ -988,7 +1013,9 @@ private:
             uc /= static_cast<double>(up.size());
             const Obb ub = sins::computeObb(up, idx, yaw_only_, yaw_only_ ? localUp(floor_planes_, uc) : Eigen::Vector3d::UnitZ());
             const double uw = std::min(ub.size.x(), ub.size.y());
-            if (uw > std::max(gwid[a], gwid[b]) + fragment_merge_width_margin_ || !boxOk(ub, up)) continue;
+            if (fragment_merge_vehicle_anchor_ ? uw > fragment_merge_vehicle_max_width_
+                                               : uw > std::max(gwid[a], gwid[b]) + fragment_merge_width_margin_) continue;
+            if (!boxOk(ub, up)) continue;
             A.pts = std::move(up);
             A.box = ub;
             A.mask |= B.mask;
@@ -998,6 +1025,7 @@ private:
             gwid[a] = std::max(gwid[a], gwid[b]);
             root[b] = a;
             ++merged;
+        }
         }
         if (merged) fused.erase(std::remove_if(fused.begin(), fused.end(), [](const Fused& f) { return f.absorbed; }), fused.end());
         scale_merges_ += merged;
