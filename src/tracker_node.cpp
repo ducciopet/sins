@@ -1107,6 +1107,12 @@ public:
         // observed centre. Physical: a still object does not move; lab seq 1950 / CODa: a static neighbour track whose
         // object lost its cluster took over a passing person's cluster 1.3 m away (pre-existing-track takeovers 14 -> 27).
         static_anchor_r_ = declare_parameter<double>("track_static_anchor_radius", -1.0);
+        // ABLATION switches (default false, 25/11; for the paper's leave-one-out only, never in a profile):
+        // track_ablate_occlusion_explained: a miss is never excused by an occluder on the ray (isOcclusionExplained off);
+        // track_ablate_persistence: no persistence outside the camera FOV: classified tracks get the plain missed budget
+        // and the class decays everywhere as it does inside the FOV (with no YOLO outside, it is lost there).
+        ablate_occlusion_explained_ = declare_parameter<bool>("track_ablate_occlusion_explained", false);
+        ablate_persistence_ = declare_parameter<bool>("track_ablate_persistence", false);
         // >= 0 (default -1 = off, 24/11): a detection whose centre lies inside the predicted box (+ this margin [m]) of a
         // confirmed MOVING track (published dynamic or dynamic class) and is smaller than it is a PIECE of that object:
         // (1) it may associate to the track with the centre-based hard gates waived (like track_shape_assoc), and
@@ -1900,7 +1906,7 @@ private:
             return;
         }
         const Eigen::Vector3d v_img = tr.kf.vel();
-        const bool inside_fov = insideAnyCameraFov(tr.kf.pos(), 0.0, false, &v_img);
+        const bool inside_fov = ablate_persistence_ || insideAnyCameraFov(tr.kf.pos(), 0.0, false, &v_img);
         // Absence-of-evidence only counts away from the image border: a person crossing it is only partly
         // visible and routinely not detected for a few ticks, and with a short max_non_yolo_in_fov_frames_ that
         // used to strip the class right as they left the FOV. (A border margin on the CENTRE, not the object's
@@ -2796,7 +2802,7 @@ private:
                 const bool worth_protecting = isDynamicClass(tr.best_class) ||
                     std::any_of(tr.dynamic_hist.begin(), tr.dynamic_hist.end(), [](bool b) { return b; });
                 const bool occluded = worth_protecting &&
-                    isOcclusionExplained(predicted_pos[ti], tr.id, track_ids, track_to_det, msg);
+                    !ablate_occlusion_explained_ && isOcclusionExplained(predicted_pos[ti], tr.id, track_ids, track_to_det, msg);
                 if (occluded) {
                     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
                         "track #%d ('%s'): miss not counted against its budget — occluded by a closer, "
@@ -3332,7 +3338,7 @@ private:
         for (auto it = tracks_.begin(); it != tracks_.end();) {
             // Classified (whitelisted) tracks get more coasting patience — see max_missed_classified_'s own
             // comment (v1 parity: maxMissedFramesYolo_ vs maxMissedFrames_).
-            const int effective_max_missed = isDynamicClass(it->second.best_class) ? max_missed_classified_ : max_missed_;
+            const int effective_max_missed = (isDynamicClass(it->second.best_class) && !ablate_persistence_) ? max_missed_classified_ : max_missed_;
             const bool dead = it->second.missed_in_a_row > effective_max_missed ||
                               it->second.stationary_ticks > track_stationary_max_ticks_;
             if (dead && travel_proof_window_ > 0.0 && travel_proof_inherit_min_dist_ > 0.0 && it->second.proof_hist.size() >= 2)
@@ -3762,6 +3768,7 @@ private:
     double height_same_place_r_{-1.0};
     double static_anchor_r_{-1.0};
     double static_anchor_claim_r_{1.0};
+    bool ablate_occlusion_explained_{false}, ablate_persistence_{false};
     double extent_assoc_margin_{-1.0};
     size_t extent_matches_ = 0;
     size_t static_anchor_rejects_ = 0;

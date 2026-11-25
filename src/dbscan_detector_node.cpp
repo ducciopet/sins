@@ -232,6 +232,9 @@ public:
         yolo_refine_log_all_ = declare_parameter<bool>("yolo_refine_log_all", false);
         yolo_keep_rest_ = declare_parameter<bool>("yolo_refine_keep_rest", true);
         leaves_enabled_ = declare_parameter<bool>("leaves_enabled", true);
+        // ABLATION switch (default false, 25/11; for the paper's leave-one-out only): a refining leaf gives its class to
+        // the fused object but does not cut it to the leaf's points (and absorbs nothing).
+        yolo_refine_class_only_ = declare_parameter<bool>("yolo_refine_class_only", false);
         leaves_topic_template_ = declare_parameter<std::string>("leaves_topic_template", "/sins/{camera}/semantic_leaves");
         const auto fc = declare_parameter<std::vector<double>>("fused_color", {1.0, 1.0, 0.0});
         if (fc.size() == 3) fused_color_ = {static_cast<float>(fc[0]), static_cast<float>(fc[1]), static_cast<float>(fc[2])};
@@ -1670,6 +1673,13 @@ private:
                     if (const auto mh = yolo_class_min_height_.find(leaves.box_class[li]); mh != yolo_class_min_height_.end() &&
                         pbox.size.z() < mh->second)
                         continue;
+                    if (yolo_refine_class_only_) {   // ablation: the leaf labels the object but does not cut it (no absorb)
+                        o.yolo_refined = true;
+                        o.yolo_class = leaves.box_class[li];
+                        o.yolo_track_id = leaves.box_track_id[li];
+                        ++refined;
+                        continue;
+                    }
                     unsigned omask = o.mask;
                     for (size_t fj : absorb) omask |= fused[fj].mask;
                     // Re-clustered with the LiDAR's own radii/min-points — correct for any object that went
@@ -1906,7 +1916,7 @@ private:
     // fusion state
     double marker_lifetime_sec_{0.0};
     SplitParams split_;
-    bool yolo_refine_enabled_{true}, yolo_keep_rest_{true};
+    bool yolo_refine_enabled_{true}, yolo_keep_rest_{true}, yolo_refine_class_only_{false};
     std::map<std::string, double> yolo_class_min_height_;  // see yolo_class_min_height_classes
     bool yolo_refine_nested_{false};  // see the nested-leaf case in the refinement loop
     bool yolo_refine_points_{false};  // yolo_refine_assoc == "points"
