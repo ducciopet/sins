@@ -1350,6 +1350,13 @@ public:
         // "greedy_kuhn": v1-compatible max-CARDINALITY augmenting-path heuristic (tryAugment), kept for
         // the ablation. See this file's header and hungarianMinCost's own comment.
         assignment_method_ = declare_parameter<std::string>("track_assignment_method", "hungarian");
+        // Compute only, same optimum: solve the Hungarian separately on each connected component of the
+        // candidate graph (tracks and detections linked by a pair that passed the gates) instead of one dense
+        // max(nt, nd)^2 matrix. Pairs outside the candidates are forbidden anyway, so the max-weight matching
+        // decomposes over components; only exact score ties may resolve differently. Motivation: KITTI 0018
+        // (~370 detections, up to ~1700 live tracks) took 1-4.6 s per tick in the dense O(n^3) solve, so scans were
+        // skipped, predictions went stale and tracks piled up (lab_queue 48). Default off = paper-v1.
+        assignment_components_ = declare_parameter<bool>("track_assignment_components", false);
         pub_obstacles_ = create_publisher<jo_msgs::msg::ObstacleArray>(obstacles_topic_, rclcpp::QoS(10));
         // Point-cloud motion voting's own input (see the constructor's own comment above) — just the latest
         // message cached, matched against each tick's own detections by stamp (see parsePointsByDetection()).
@@ -2652,7 +2659,46 @@ private:
         // Global assignment (v1's own assignMatchesGlobally/tryAugmentDetectionMatch) — see
         // track_assignment_method's own comment in the constructor for the two methods below.
         std::vector<int> track_to_det(nt, -1), det_to_track(nd, -1);
-        if (assignment_method_ == "hungarian") {
+        if (assignment_method_ == "hungarian" && assignment_components_) {
+            // Per connected component of the candidate graph (see track_assignment_components).
+            std::vector<size_t> uf(nt + nd);
+            std::iota(uf.begin(), uf.end(), 0);
+            std::function<size_t(size_t)> root = [&](size_t x) { while (uf[x] != x) { uf[x] = uf[uf[x]]; x = uf[x]; } return x; };
+            for (const auto& c : candidates) uf[root(c.track)] = root(nt + c.det);
+            std::map<size_t, std::pair<std::vector<size_t>, std::vector<size_t>>> comp;   // root -> (tracks, dets)
+            std::vector<char> in_cand(nt + nd, 0);
+            for (const auto& c : candidates) { in_cand[c.track] = 1; in_cand[nt + c.det] = 1; }
+            for (size_t ti = 0; ti < nt; ++ti) if (in_cand[ti]) comp[root(ti)].first.push_back(ti);
+            for (size_t di = 0; di < nd; ++di) if (in_cand[nt + di]) comp[root(nt + di)].second.push_back(di);
+            std::vector<int> local(nt + nd, -1);
+            for (const auto& kv : comp) {
+                for (size_t k = 0; k < kv.second.first.size(); ++k) local[kv.second.first[k]] = static_cast<int>(k);
+                for (size_t k = 0; k < kv.second.second.size(); ++k) local[nt + kv.second.second[k]] = static_cast<int>(k);
+            }
+            const double FORBIDDEN = 1e6;
+            std::map<size_t, std::vector<std::vector<double>>> costs;
+            for (const auto& kv : comp) {
+                const size_t n = std::max(kv.second.first.size(), kv.second.second.size());
+                std::vector<std::vector<double>> cost(n, std::vector<double>(n, 0.0));
+                for (size_t r = 0; r < kv.second.first.size(); ++r)
+                    for (size_t q = 0; q < kv.second.second.size(); ++q) cost[r][q] = FORBIDDEN;
+                costs[kv.first] = std::move(cost);
+            }
+            for (const auto& c : candidates)
+                costs[root(c.track)][static_cast<size_t>(local[c.track])][static_cast<size_t>(local[nt + c.det])] = -c.score;
+            for (const auto& kv : comp) {
+                const auto& cost = costs[kv.first];
+                const std::vector<int> row_to_col = hungarianMinCost(cost);
+                for (size_t r = 0; r < kv.second.first.size(); ++r) {
+                    const int q = row_to_col[r];
+                    if (q < 0 || static_cast<size_t>(q) >= kv.second.second.size()) continue;
+                    if (cost[r][static_cast<size_t>(q)] >= FORBIDDEN) continue;
+                    const size_t ti = kv.second.first[r], di = kv.second.second[static_cast<size_t>(q)];
+                    track_to_det[ti] = static_cast<int>(di);
+                    det_to_track[di] = static_cast<int>(ti);
+                }
+            }
+        } else if (assignment_method_ == "hungarian") {
             // Default: TRUE max-weight bipartite matching over the same candidates (hungarianMinCost,
             // see its own comment). Build an (n x n) cost matrix, n = max(nt, nd): a real candidate pair
             // gets -score (Hungarian minimizes); every OTHER real-track/real-detection pair gets FORBIDDEN
@@ -3806,6 +3852,7 @@ private:
     std::string global_frame_;
     bool debug_lifecycle_{false};
     std::string assignment_method_{"hungarian"};
+    bool assignment_components_ = false;
     double veldir_gate_min_innovation_{0.30};
     double max_match_dist_{2.0}, max_match_speed_{8.0}, max_size_diff_{0.8}, min_size_diff_floor_{0.15};
     double w_pos_{1.0}, w_size_{0.35}, w_iou_{0.15}, w_prev_pos_{0.25}, w_prev_iou_{0.10}, min_match_score_{-2.5};
