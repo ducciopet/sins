@@ -993,6 +993,8 @@ public:
         reacquire_radius_ = declare_parameter<double>("track_reacquire_radius", -1.0);
         reacquire_speed_ = declare_parameter<double>("track_reacquire_speed", 1.5);
         reacquire_max_radius_ = declare_parameter<double>("track_reacquire_max_radius", 2.5);
+        // diagnostic only (27/11): tick-timing report every N ticks (default 50 = previous behaviour); 1 = every tick
+        tick_report_every_ = std::max<int64_t>(1, declare_parameter<int64_t>("tick_report_every", 50));
         disocclusion_travel_window_ = declare_parameter<double>("track_disocclusion_travel_window", -1.0);
         disocclusion_travel_min_dist_ = declare_parameter<double>("track_disocclusion_travel_min_dist", 1.5);
         disocclusion_travel_min_straightness_ = declare_parameter<double>("track_disocclusion_travel_min_straightness", 0.8);
@@ -2305,7 +2307,7 @@ private:
         v[6] = static_cast<double>(ntracks);
         tick_ms_.push_back(v);
         tick_ages_.push_back(tick_age_ms_);
-        if (tick_ms_.size() < 50) return;
+        if (tick_ms_.size() < static_cast<size_t>(tick_report_every_)) return;
         std::nth_element(tick_ages_.begin(), tick_ages_.begin() + tick_ages_.size() / 2, tick_ages_.end());
         RCLCPP_INFO(get_logger(), "tick timing: detections age at callback start %.1f ms (median)", tick_ages_[tick_ages_.size() / 2]);
         tick_ages_.clear();
@@ -4017,6 +4019,7 @@ private:
     double absorb_lateral_margin_{0.3};
     size_t absorbed_total_ = 0;
     double reacquire_radius_ = -1.0, reacquire_speed_ = 1.5, reacquire_max_radius_ = 2.5;
+    int64_t tick_report_every_ = 50;
     size_t reacquired_total_ = 0;
     double motion_cons_window_{-1.0}, motion_cons_ratio_{0.5};
     double inherit_motion_dist_{-1.0}, inherit_motion_age_{1.0};

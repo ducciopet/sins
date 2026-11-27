@@ -1,0 +1,37 @@
+calibration_icp_node:
+  ros__parameters:
+    depth_topic: /front_camera/camera/depth/image_rect_raw
+    depth_transport: compressedDepth       # override to 'zstd' against bags/*_validation_lab, 'raw' against jo_sim
+    # depth_cloud_topic / depth_to_color_extrinsics_topic: unset here on
+    # purpose — see cfg/indoor/calibration_icp.yaml's own comment on these
+    # two. Currently a no-op for outdoor: preprocessing.yaml's own
+    # <name>.aligned_depth_cloud_topic is still commented out there too, so
+    # every outdoor camera falls back to deprojection either way.
+    velodyne_topic: /velodyne_points
+    lidar_frame: velodyne                         # TF frame of the LiDAR
+    urdf_camera_frame: camera                     # logical camera frame name (used in output TF/logs)
+    camera_frame_initial_guess: camera_initial_guess  # TF frame providing the initial LiDAR->camera transform guess
+    refined_camera_frame: camera_refined          # name of the TF frame published after ICP refinement
+    icp_max_correspondence_distance: 0.35  # [m] max point-to-point distance considered an ICP correspondence
+    icp_max_iteration: 100                 # max ICP iterations per run
+    icp_voxel_size: 0.08                   # [m] voxel down-sampling before ICP (larger = smoother, better for sparse outdoor clouds)
+    icp_use_point_to_plane: true           # true = GICP (per-point covariances); false = point-to-point ICP
+    icp_normal_radius: 0.25                # [m] unused by the gtsam_points/GICP backend, kept for reference
+    icp_normal_max_nn: 50                  # unused by the gtsam_points/GICP backend, kept for reference
+    icp_num_threads: 4                     # threads used by the GICP/ICP correspondence search
+    min_overlap_points: 50                 # min LiDAR points in camera FOV; if fewer, full cloud is used as target
+    overlap_fov_margin_px: 120             # [px] margin added around image boundary when computing FOV overlap
+    icp_max_runs: 3                        # number of independent ICP scenes to collect before averaging
+    icp_fitness_threshold: 0.15            # min ICP fitness score to accept a result (0-1, higher = better fit)
+    icp_timeout_sec: 7.0                   # [s] outdoor fallback: average valid results (or initial guess if none) after this delay
+    is_indoor: false                       # outdoor: fall back after icp_timeout_sec if ICP not done
+    recalibration_period_sec: 0.0          # 0 = one-shot calibration only (default). >0 = after the initial
+                                            # one-shot calibration, re-run registration every N seconds and
+                                            # replace camera_refined only when the new result is VALID.
+    depth_intrinsics: [436.9647521972656, 436.9647521972656, 431.9205627441406, 240.13380432128906] # [fx, fy, cx, cy]
+                                            # bootstrap only now — overwritten live from camera_info_topic
+                                            # (see cfg/indoor/calibration_icp.yaml's own comment on this)
+    depth_scale_factor: 1000.0           # raw_value / scale = meters
+    depth_min_value: 0.5                 # [m]
+    depth_max_value: 5.0                 # [m] slightly larger than the aligned-depth cloud's crop to include edge points during calibration
+    depth_skip_pixel: 2                  # subsample every N pixels
