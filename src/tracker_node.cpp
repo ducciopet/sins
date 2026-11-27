@@ -979,6 +979,20 @@ public:
         inherit_size_check_ = declare_parameter<bool>("track_inherit_motion_size_check", false);
         inherit_probation_ = declare_parameter<double>("track_inherit_motion_probation", -1.0);
         inherit_probation_ratio_ = declare_parameter<double>("track_inherit_motion_probation_ratio", 0.5);
+        // OUT-OF-FOV RE-ACQUISITION (track_reacquire_radius, < 0 = off; 27/11, post paper-v1). After the global
+        // assignment, a track worth keeping (confirmed, and classified with a movable class or published dynamic)
+        // that is unmatched this tick and predicted OUTSIDE every camera FOV gets a second chance on the detections
+        // nobody took: the nearest one within track_reacquire_radius + track_reacquire_speed x (time since its last
+        // observation), capped at track_reacquire_max_radius, measured from the closer of its KF prediction and its
+        // last observation (the object may have stopped), with the outside-FOV size gate. Without this, on the
+        // unseen CODa windows 72% of the losses after a camera exit happened with the object still there: a new
+        // unclassified track born on it (38%), a detection left without a track (16%), the old track unpublished or
+        // pulled > 1 m away (19%); the new track restarts with no class and no history and is not published.
+        // Class-agnostic: one radius and one reach speed for every object; physical meaning: how far an object
+        // can have moved while unseen. Outside the FOV only (inside, YOLO re-establishes identity).
+        reacquire_radius_ = declare_parameter<double>("track_reacquire_radius", -1.0);
+        reacquire_speed_ = declare_parameter<double>("track_reacquire_speed", 1.5);
+        reacquire_max_radius_ = declare_parameter<double>("track_reacquire_max_radius", 2.5);
         disocclusion_travel_window_ = declare_parameter<double>("track_disocclusion_travel_window", -1.0);
         disocclusion_travel_min_dist_ = declare_parameter<double>("track_disocclusion_travel_min_dist", 1.5);
         disocclusion_travel_min_straightness_ = declare_parameter<double>("track_disocclusion_travel_min_straightness", 0.8);
@@ -2687,6 +2701,42 @@ private:
             }
         }
 
+        if (reacquire_radius_ >= 0.0) {   // see track_reacquire_radius's own comment
+            struct RC { double d; size_t ti, di; };
+            std::vector<RC> rc;
+            for (size_t ti = 0; ti < nt; ++ti) {
+                if (track_to_det[ti] >= 0) continue;
+                const Track& o = tracks_.at(track_ids[ti]);
+                if (!o.confirmed || o.retired || !(isDynamicClass(o.best_class) || o.pub_dynamic)) continue;
+                if (insideAnyCameraFov(predicted_pos[ti])) continue;
+                const double dt = std::max(0.0, stamp - o.last_obs_stamp);
+                const double r = std::min(reacquire_max_radius_, reacquire_radius_ + reacquire_speed_ * dt);
+                for (size_t di = 0; di < nd; ++di) {
+                    if (det_to_track[di] >= 0) continue;
+                    const auto& d = msg->detections[di];
+                    const auto& c = d.bbox.center.position;
+                    const double dist = std::min(std::hypot(predicted_pos[ti].x() - c.x, predicted_pos[ti].y() - c.y),
+                                                 std::hypot(o.last_obs.x - c.x, o.last_obs.y - c.y));
+                    if (dist > r) continue;
+                    if (relSizeDiff(o.size, d.bbox.size, min_size_diff_floor_) >= outside_fov_max_size_diff_) continue;
+                    rc.push_back({dist, ti, di});
+                }
+            }
+            std::sort(rc.begin(), rc.end(), [](const RC& x, const RC& y) { return x.d < y.d; });
+            size_t n = 0;
+            for (const auto& c : rc) {
+                if (track_to_det[c.ti] >= 0 || det_to_track[c.di] >= 0) continue;
+                track_to_det[c.ti] = static_cast<int>(c.di);
+                det_to_track[c.di] = static_cast<int>(c.ti);
+                ++n;
+                if (debug_lifecycle_)
+                    RCLCPP_INFO(get_logger(), "[lifecycle] reacquire #%d cls='%s' d=%.2f t=%.3f", tracks_.at(track_ids[c.ti]).id,
+                                tracks_.at(track_ids[c.ti]).best_class.c_str(), c.d, stamp);
+            }
+            reacquired_total_ += n;
+            if (n) RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 10000, "reacquire: %zu out-of-FOV re-acquisitions so far", reacquired_total_);
+        }
+
         std::vector<char> absorbed(nd, 0);
         if (absorb_pieces_) {
             const size_t n = absorbPieces(msg, points_by_det, track_ids, track_to_det, det_to_track, absorbed);
@@ -3966,6 +4016,8 @@ private:
     bool absorb_pieces_{false};
     double absorb_lateral_margin_{0.3};
     size_t absorbed_total_ = 0;
+    double reacquire_radius_ = -1.0, reacquire_speed_ = 1.5, reacquire_max_radius_ = 2.5;
+    size_t reacquired_total_ = 0;
     double motion_cons_window_{-1.0}, motion_cons_ratio_{0.5};
     double inherit_motion_dist_{-1.0}, inherit_motion_age_{1.0};
     bool inherit_size_check_{false};
